@@ -13,6 +13,18 @@ export interface PromptBuildOptions {
   maxLength: number;
 }
 
+export const MAX_VISUAL_CONTEXT_LENGTH = 20_000;
+
+type VisualContextPart = "observations" | "interpretation" | "uncertainty";
+
+const VISUAL_CONTEXT_MARKERS: Array<{ part: VisualContextPart; pattern: RegExp }> = [
+  { part: "observations", pattern: /^[ \t]*(?:direct\s+)?observations\s*:/im },
+  { part: "interpretation", pattern: /^[ \t]*interpretation\s*:/im },
+  { part: "uncertainty", pattern: /^[ \t]*uncertainty\s*:/im },
+];
+
+export type WorkerPromptInput = SpawnInput | { task: string; relation?: string; visualContext?: string };
+
 export const GRACEFUL_FINALIZE_PROMPT = [
   "Pare de expandir esta tarefa.",
   "",
@@ -35,7 +47,7 @@ export const GRACEFUL_FINALIZE_PROMPT = [
 ].join("\n");
 
 export async function buildWorkerPrompt(
-  input: SpawnInput | { task: string; relation?: string },
+  input: WorkerPromptInput,
   workspacePath: string,
   options: PromptBuildOptions,
 ): Promise<string> {
@@ -49,6 +61,7 @@ export async function buildWorkerPrompt(
     ? "No additional context files were supplied."
     : await readContextFiles(absoluteContext);
   const relation = "relation" in input && input.relation ? input.relation : "new task";
+  const visualContextText = visualContextSection(input.visualContext);
 
   return [
     "You are a local DeepSeek sub-agent orchestrated by Codex.",
@@ -75,9 +88,63 @@ export async function buildWorkerPrompt(
     "Context files:",
     contextText,
     "",
+    ...(visualContextText ? ["Visual context from the orchestrator:", "", visualContextText, ""] : []),
     "Task:",
     task,
   ].join("\n");
+}
+
+function visualContextSection(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  const safe = redactSecrets(trimmed);
+  const exceeded = safe.length > MAX_VISUAL_CONTEXT_LENGTH;
+  const limited = exceeded ? truncate(safe, MAX_VISUAL_CONTEXT_LENGTH) : safe;
+  const parts = parseVisualContext(limited);
+  const block = [
+    "VISUAL CONTEXT FROM CODEX",
+    "This is textual interpretation supplied by the orchestrator; the original pixels are not available.",
+    "Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from this context.",
+    "",
+    "Direct observations:",
+    parts.observations,
+    "",
+    "Interpretation:",
+    parts.interpretation,
+    "",
+    "Uncertainty:",
+    parts.uncertainty,
+  ].join("\n");
+  return exceeded ? block + "\n\n[visual context was truncated at the configured limit]" : block;
+}
+
+function parseVisualContext(text: string): Record<VisualContextPart, string> {
+  const parts: Record<VisualContextPart, string> = {
+    observations: "None provided.",
+    interpretation: "None provided.",
+    uncertainty: "None provided.",
+  };
+  const boundaries: Array<{ index: number; part: VisualContextPart; labelLength: number }> = [];
+  for (const { part, pattern } of VISUAL_CONTEXT_MARKERS) {
+    const match = pattern.exec(text);
+    if (match && typeof match.index === "number") {
+      boundaries.push({ index: match.index, part, labelLength: match[0].length });
+    }
+  }
+  if (boundaries.length === 0) {
+    parts.observations = text;
+    return parts;
+  }
+  boundaries.sort((a, b) => a.index - b.index);
+  for (let index = 0; index < boundaries.length; index += 1) {
+    const boundary = boundaries[index];
+    if (!boundary) continue;
+    const start = boundary.index + boundary.labelLength;
+    const end = index + 1 < boundaries.length ? boundaries[index + 1]?.index ?? text.length : text.length;
+    const content = text.slice(start, end).trim();
+    if (content) parts[boundary.part] = content;
+  }
+  return parts;
 }
 
 async function readContextFiles(files: string[]): Promise<string> {

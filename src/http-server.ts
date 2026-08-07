@@ -246,6 +246,7 @@ function toSpawnInput(body: unknown): SpawnInput {
     ? undefined
     : enumValue(workspaceStrategyValue, ["shared", "worktree"], "workspaceStrategy") as WorkspaceStrategy;
   const contextFiles = optionalArray(value.contextFiles ?? value.context_files);
+  const visualContext = optionalString(value.visualContext ?? value.visual_context);
   const threadId = optionalString(value.threadId ?? value.thread_id);
   const turnId = optionalString(value.turnId ?? value.turn_id);
   return {
@@ -256,6 +257,7 @@ function toSpawnInput(body: unknown): SpawnInput {
     ...(mode ? { mode } : {}),
     ...(workspaceStrategy ? { workspaceStrategy } : {}),
     ...(contextFiles ? { contextFiles } : {}),
+    ...(visualContext ? { visualContext } : {}),
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
   };
@@ -271,11 +273,13 @@ function toContinueInput(body: unknown): ContinueInput {
     ? undefined
     : enumValue(permissionReplyValue, ["once", "always", "reject"], "permissionReply") as ContinueInput["permissionReply"];
   const permissionMessage = optionalString(value.permissionMessage ?? value.permission_message);
+  const visualContext = optionalString(value.visualContext ?? value.visual_context);
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
     relation: enumValue(value.relation ?? "continuation", ["clarification", "correction", "review", "continuation"], "relation") as ContinueInput["relation"],
     task: requiredString(value.task, "task"),
+    ...(visualContext ? { visualContext } : {}),
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
     ...(permissionId ? { permissionId } : {}),

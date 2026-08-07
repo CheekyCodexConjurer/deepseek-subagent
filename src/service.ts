@@ -363,6 +363,7 @@ export class BridgeService {
       const prompt = await buildWorkerPrompt({
         task: input.task,
         relation: input.relation,
+        ...(input.visualContext ? { visualContext: input.visualContext } : {}),
       }, agent.workspacePath, { maxLength: this.config.maxTaskLength });
       if (active?.status === "needs_approval") {
         if (input.permissionId || input.permissionReply || input.permissionMessage) {

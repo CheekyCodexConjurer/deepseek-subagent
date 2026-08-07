@@ -1841,3 +1841,114 @@ test("daemon restart rehydrates approval without duplicating the notice", async 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("visual context is embedded only when supplied, for spawn and continue", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-visual-context-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const spawnPlain = await service.spawn({
+      requestId: "request_visual_spawn_plain",
+      topic: "Visual context",
+      task: "Inspect without visual context",
+      cwd: directory,
+    });
+    assert.doesNotMatch(client.promptCalls[0]?.task ?? "", /VISUAL CONTEXT FROM CODEX/);
+
+    const spawnWith = await service.spawn({
+      requestId: "request_visual_spawn_with",
+      topic: "Visual context",
+      task: "Inspect with visual context",
+      cwd: directory,
+      visualContext: [
+        "Direct observations: the dialog shows a red error banner",
+        "Interpretation: the build failed on the parser step",
+        "Uncertainty: the stack trace is partially cut off",
+      ].join("\n"),
+    });
+    const spawnPrompt = client.promptCalls[1]?.task ?? "";
+    assert.match(spawnPrompt, /VISUAL CONTEXT FROM CODEX/);
+    assert.match(spawnPrompt, /original pixels are not available/);
+    assert.match(spawnPrompt, /interpretation as a hypothesis/);
+    assert.match(spawnPrompt, /Direct observations:\nthe dialog shows a red error banner/);
+    assert.match(spawnPrompt, /Interpretation:\nthe build failed on the parser step/);
+    assert.match(spawnPrompt, /Uncertainty:\nthe stack trace is partially cut off/);
+    assert.doesNotMatch(spawnPrompt, /data:image|image data|base64/i);
+
+    client.messages = [{
+      info: { id: "assistant_visual_plain", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+
+    const continuePlain = await service.continueJob({
+      requestId: "request_visual_continue_plain",
+      agentId: spawnPlain.agentId,
+      relation: "continuation",
+      task: "Continue without visual context",
+    });
+    assert.doesNotMatch(client.promptCalls[2]?.task ?? "", /VISUAL CONTEXT FROM CODEX/);
+
+    client.messages = [{
+      info: { id: "assistant_visual_continue_plain", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: continue seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+
+    const continueWith = await service.continueJob({
+      requestId: "request_visual_continue_with",
+      agentId: spawnPlain.agentId,
+      relation: "continuation",
+      task: "Continue with visual context",
+      visualContext: "Direct observations: the chart shows a spike\nInterpretation: the spike is a cache miss\nUncertainty: the axis scale is unclear",
+    });
+    const continuePrompt = client.promptCalls[3]?.task ?? "";
+    assert.match(continuePrompt, /VISUAL CONTEXT FROM CODEX/);
+    assert.match(continuePrompt, /Direct observations:\nthe chart shows a spike/);
+    assert.match(continuePrompt, /Interpretation:\nthe spike is a cache miss/);
+    assert.match(continuePrompt, /Uncertainty:\nthe axis scale is unclear/);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("visual context is redacted and truncated deterministically before dispatch", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-visual-context-limit-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    await service.spawn({
+      requestId: "request_visual_limit",
+      topic: "Visual context limit",
+      task: "Bound the visual context",
+      cwd: directory,
+      visualContext: "Direct observations: api_key=supersecret " + "x".repeat(25_000) + "\nInterpretation: beyond the limit",
+    });
+    const prompt = client.promptCalls[0]?.task ?? "";
+    assert.doesNotMatch(prompt, /supersecret/);
+    assert.match(prompt, /api_key=\[REDACTED\]/);
+    const block = prompt.split("VISUAL CONTEXT FROM CODEX")[1] ?? "";
+    assert.ok(block.length < 20_500);
+    assert.match(prompt, /\[visual context was truncated at the configured limit\]/);
+    assert.match(prompt, /Direct observations:/);
+    assert.match(prompt, /Interpretation:\nNone provided\./);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

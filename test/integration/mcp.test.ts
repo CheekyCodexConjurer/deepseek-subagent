@@ -74,3 +74,36 @@ test("MCP startup recovers an offline local daemon before exposing tools", async
   assert.equal(starts, 1);
   assert.equal(healthCalls, 2);
 });
+
+test("MCP exposes visual_context as an optional string on spawn and continue", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const bridgeClient = new BridgeHttpClient(config);
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.listTools();
+    const tools = result.tools;
+    const spawn = tools.find((tool) => tool.name === "deepseek_spawn");
+    const continueTool = tools.find((tool) => tool.name === "deepseek_continue");
+    const spawnProperties = (spawn?.inputSchema as { properties?: Record<string, { type?: string; default?: unknown }> } | undefined)?.properties ?? {};
+    const continueProperties = (continueTool?.inputSchema as { properties?: Record<string, { type?: string; default?: unknown }> } | undefined)?.properties ?? {};
+    assert.equal(spawnProperties.visual_context?.type, "string");
+    assert.equal(spawnProperties.visual_context?.default, undefined);
+    assert.equal(continueProperties.visual_context?.type, "string");
+    assert.equal(continueProperties.visual_context?.default, undefined);
+    assert.match(spawn?.description ?? "", /visual_context/);
+    assert.match(spawn?.description ?? "", /Direct observations/);
+    assert.match(spawn?.description ?? "", /Uncertainty/);
+    assert.match(continueTool?.description ?? "", /visual_context/);
+    assert.match(continueTool?.description ?? "", /never receives pixels/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});

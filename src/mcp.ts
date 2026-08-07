@@ -101,7 +101,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_spawn", {
     title: DISPLAY_NAME + " · Spawn",
-    description: "Start one asynchronous DeepSeek V4 Flash task in a new OpenCode session. Return immediately after acceptance; do not poll for completion. The daemon delivers the result to the originating Codex thread when a configured App Server correlation exists, otherwise it writes a private inbox result.",
+    description: "Start one asynchronous DeepSeek V4 Flash task in a new OpenCode session. Return immediately after acceptance; do not poll for completion. The daemon delivers the result to the originating Codex thread when a configured App Server correlation exists, otherwise it writes a private inbox result. When the task depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       request_id: z.string().min(1).optional(),
@@ -111,6 +111,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
       mode: z.enum(["analyze", "edit", "test"]).optional(),
       workspace_strategy: z.enum(["shared", "worktree"]).optional(),
       context_files: z.array(z.string()).optional(),
+      visual_context: z.string().optional(),
       thread_id: z.string().optional(),
       turn_id: z.string().optional(),
     },
@@ -134,13 +135,14 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_continue", {
     title: DISPLAY_NAME + " · Continue",
-    description: "Continue an existing DeepSeek agent in the same OpenCode session after reviewing its delivered result. This is asynchronous and returns immediately. Do not poll. Reject or wait if the agent is busy; use deepseek_abort to stop it. For an explicit OpenCode permission response, also provide permission_id and permission_reply (once, always, or reject).",
+    description: "Continue an existing DeepSeek agent in the same OpenCode session after reviewing its delivered result. This is asynchronous and returns immediately. Do not poll. Reject or wait if the agent is busy; use deepseek_abort to stop it. For an explicit OpenCode permission response, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       request_id: z.string().min(1).optional(),
       agent_id: z.string().min(1),
       relation: z.enum(["clarification", "correction", "review", "continuation"]).default("continuation"),
       task: z.string().min(1),
+      visual_context: z.string().optional(),
       thread_id: z.string().optional(),
       turn_id: z.string().optional(),
       permission_id: z.string().optional(),

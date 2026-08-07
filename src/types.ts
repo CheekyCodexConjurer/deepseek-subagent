@@ -38,6 +38,7 @@ export interface SpawnInput {
   mode?: AgentMode;
   workspaceStrategy?: WorkspaceStrategy;
   contextFiles?: string[];
+  visualContext?: string;
   threadId?: string;
   turnId?: string;
 }
@@ -47,6 +48,7 @@ export interface ContinueInput {
   agentId: string;
   relation: "clarification" | "correction" | "review" | "continuation";
   task: string;
+  visualContext?: string;
   threadId?: string;
   turnId?: string;
   permissionId?: string;
