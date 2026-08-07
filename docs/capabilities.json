@@ -1,0 +1,22 @@
+{
+  "displayName": "DeepSeek Sub-Agent",
+  "technicalName": "deepseek-subagent",
+  "tools": [
+    "deepseek_spawn",
+    "deepseek_continue",
+    "deepseek_abort",
+    "deepseek_close",
+    "deepseek_recover_result"
+  ],
+  "defaultModel": {
+    "provider": "opencode-go",
+    "model": "deepseek-v4-flash",
+    "variant": "max",
+    "display": "DeepSeek V4 Flash · Max"
+  },
+  "delivery": {
+    "primary": "codex-app-server",
+    "fallback": "private-inbox",
+    "polling": false
+  }
+}
