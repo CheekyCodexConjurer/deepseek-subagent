@@ -21,6 +21,25 @@ export function redactSecrets(value: string): string {
   return output;
 }
 
+export function redactUnknown(value: unknown): unknown {
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown): unknown => {
+    if (typeof current === "string") return redactSecrets(current);
+    if (current === null || typeof current !== "object") return current;
+    if (seen.has(current)) return "[REDACTED_CIRCULAR]";
+    seen.add(current);
+    if (Array.isArray(current)) return current.map((item) => visit(item));
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(current as Record<string, unknown>)) {
+      output[key] = /authorization|api[_-]?key|token|password|secret|credential/i.test(key)
+        ? "[REDACTED]"
+        : visit(child);
+    }
+    return output;
+  };
+  return visit(value);
+}
+
 export function hashPrompt(prompt: string): string {
   return createHash("sha256").update(prompt, "utf8").digest("hex");
 }
@@ -97,6 +116,22 @@ export async function writePrivateFile(filePath: string, contents: string): Prom
   } catch {
     // Windows ACLs are managed by the installer; chmod is best effort.
   }
+}
+
+export async function writePrivateFileExclusive(filePath: string, contents: string): Promise<boolean> {
+  await ensurePrivateDir(path.dirname(filePath));
+  try {
+    await writeFile(filePath, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await chmod(filePath, 0o600);
+  } catch {
+    // Windows ACLs are managed by the installer; chmod is best effort.
+  }
+  return true;
 }
 
 export async function canRead(filePath: string): Promise<boolean> {

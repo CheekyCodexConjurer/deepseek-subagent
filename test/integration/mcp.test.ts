@@ -6,7 +6,7 @@ import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpClient } from "../../src/http-server.js";
 import { createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
 
-test("MCP exposes the stable DeepSeek Sub-Agent identity and five tools", async () => {
+test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
     configPath: "C:\\\\deepseek-test-data\\\\config.json",
@@ -23,6 +23,8 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and five tools", async 
     assert.deepEqual(tools.map((tool) => tool.name), [
       "deepseek_spawn",
       "deepseek_continue",
+      "deepseek_consult",
+      "deepseek_follow",
       "deepseek_abort",
       "deepseek_close",
       "deepseek_recover_result",
@@ -30,6 +32,16 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and five tools", async 
     assert.equal(tools[0]?.title, "DeepSeek Sub-Agent · Spawn");
     assert.match(tools[0]?.description ?? "", /asynchronous/i);
     assert.match(tools[0]?.description ?? "", /do not poll/i);
+    const consult = tools.find((tool) => tool.name === "deepseek_consult");
+    const follow = tools.find((tool) => tool.name === "deepseek_follow");
+    assert.equal(consult?.title, "DeepSeek Sub-Agent · Consult");
+    assert.match(consult?.description ?? "", /observable/i);
+    assert.match(consult?.description ?? "", /never exposes private reasoning/i);
+    assert.equal(follow?.title, "DeepSeek Sub-Agent · Follow");
+    assert.match(follow?.description ?? "", /without polling/i);
+    const followProperties = (follow?.inputSchema as { properties?: Record<string, { default?: number }> } | undefined)?.properties ?? {};
+    assert.equal(followProperties.wait_minutes?.default, undefined);
+    assert.equal(followProperties.grace_minutes?.default, undefined);
   } finally {
     await client.close();
     await server.close();

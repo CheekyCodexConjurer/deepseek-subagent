@@ -2,7 +2,9 @@
 
 codex-opencode-bridge is a local, event-driven bridge that lets Codex delegate an independent task to an authenticated OpenCode session. The human-facing MCP identity is **DeepSeek Sub-Agent**.
 
-The bridge keeps the Codex provider unchanged, never reads OpenCode auth.json, and binds OpenCode to loopback. deepseek_spawn returns an accepted job immediately; the daemon listens for OpenCode SSE events and persists a complete result. The Codex App Server adapter is separate and fail-closed: when a supported App Server control connection is not configured and proven, results go to the durable inbox and can be recovered with deepseek_recover_result or the CLI.
+The bridge keeps the Codex provider unchanged, never reads OpenCode auth.json, and binds OpenCode to loopback. The main flow is event-driven: `deepseek_spawn` returns immediately, Codex continues useful independent work, `deepseek_consult` provides one observable snapshot when needed, and `deepseek_follow` waits on the daemon's completion event. Results are persisted before delivery.
+
+Automatic same-chat push is experimental and disabled by default because Codex Desktop currently does not expose a reliable supported external attachment path. This does not prevent normal operation: the durable result file and private inbox remain available.
 
 ## Development
 
@@ -28,8 +30,10 @@ It backs up Codex configuration before registration, creates only the bridge-own
 
 - deepseek_spawn: new topic, new agent and new OpenCode session.
 - deepseek_continue: direct follow-up on the same agent/session; returns busy instead of looping.
+- deepseek_consult: one immediate snapshot of observable activity; it never exposes private reasoning and is not a wait loop.
+- deepseek_follow: event-driven wait for an existing agent after independent work is exhausted; it handles deadline and graceful finalization.
 - deepseek_abort: abort active work.
 - deepseek_close: close the logical agent without deleting its session or report.
 - deepseek_recover_result: explicit recovery only; it is not a status/polling tool.
 
-The normal CLI hides UUIDs. Use --json for machine-readable details, --verbose for technical IDs in list views, or `agent show <id>` for a full agent diagnostic.
+The normal CLI hides UUIDs. Use --json for machine-readable details, --verbose for technical IDs in list views, or `agent show <id>` for a full agent diagnostic. The installer configures a 75-minute Codex MCP tool timeout, which is longer than the 60-minute follow deadline plus its 10-minute grace maximum.

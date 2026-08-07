@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
-import { BridgeBusyError, BridgeService } from "./service.js";
-import type { AgentMode, ContinueInput, SpawnInput, WorkspaceStrategy } from "./types.js";
+import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
+import type { AgentMode, ConsultInput, ContinueInput, FollowInput, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
 
 export class BridgeHttpServer {
@@ -18,6 +18,7 @@ export class BridgeHttpServer {
     if (!isLoopbackHost(this.config.daemonHost)) throw new Error("Bridge daemon must bind to loopback");
     const server = createServer((request, response) => {
       void this.handle(request, response).catch((error: unknown) => {
+        if (error instanceof FollowCancelledError || response.destroyed || response.writableEnded) return;
         const status = error instanceof BridgeBusyError ? 409 : 500;
         writeJson(response, status, {
           error: redactSecrets(String(error)),
@@ -70,6 +71,27 @@ export class BridgeHttpServer {
     if (method === "POST" && url.pathname === "/v1/jobs/continue") {
       const result = await this.service.continueJob(toContinueInput(body));
       writeJson(response, 202, result);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/v1/jobs/consult") {
+      const result = await this.service.consult(toConsultInput(body));
+      writeJson(response, 200, result);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/v1/jobs/follow") {
+      const cancellation = new AbortController();
+      const onClose = () => {
+        if (!response.writableEnded) cancellation.abort();
+      };
+      response.once("close", onClose);
+      try {
+        const result = await this.service.follow(toFollowInput(body), cancellation.signal);
+        if (!response.writableEnded) writeJson(response, 200, result);
+      } catch (error) {
+        if (!(error instanceof FollowCancelledError)) throw error;
+      } finally {
+        response.off("close", onClose);
+      }
       return;
     }
     if (method === "POST" && url.pathname === "/v1/jobs/abort") {
@@ -262,7 +284,36 @@ function toContinueInput(body: unknown): ContinueInput {
   };
 }
 
+function toConsultInput(body: unknown): ConsultInput {
+  const value = asRecord(body);
+  const activityLimitValue = value.activityLimit ?? value.activity_limit;
+  const jobId = optionalString(value.jobId ?? value.job_id);
+  return {
+    agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
+    ...(jobId ? { jobId } : {}),
+    ...(activityLimitValue === undefined ? {} : { activityLimit: integerInRange(activityLimitValue, 1, 20, "activityLimit") }),
+  };
+}
+
+function toFollowInput(body: unknown): FollowInput {
+  const value = asRecord(body);
+  const waitValue = value.waitMinutes ?? value.wait_minutes;
+  const graceValue = value.graceMinutes ?? value.grace_minutes;
+  const jobId = optionalString(value.jobId ?? value.job_id);
+  return {
+    agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
+    ...(jobId ? { jobId } : {}),
+    ...(waitValue === undefined ? {} : { waitMinutes: integerInRange(waitValue, 1, 60, "waitMinutes") }),
+    ...(graceValue === undefined ? {} : { graceMinutes: integerInRange(graceValue, 1, 10, "graceMinutes") }),
+  };
+}
+
 function enumValue(value: unknown, allowed: string[], name: string): string {
   if (typeof value === "string" && allowed.includes(value)) return value;
   throw new Error(name + " must be one of: " + allowed.join(", "));
+}
+
+function integerInRange(value: unknown, minimum: number, maximum: number, name: string): number {
+  if (typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum) return value;
+  throw new Error(name + " must be an integer between " + minimum + " and " + maximum);
 }

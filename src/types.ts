@@ -5,8 +5,12 @@ export type JobStatus =
   | "created"
   | "dispatching"
   | "running"
+  | "following"
+  | "finalizing"
   | "needs_approval"
   | "completed"
+  | "completed_partial"
+  | "timed_out"
   | "delivery_pending"
   | "delivered"
   | "failed"
@@ -17,6 +21,8 @@ export type AgentStatus =
   | "working"
   | "needs_approval"
   | "completed"
+  | "completed_partial"
+  | "timed_out"
   | "failed"
   | "aborted"
   | "closed";
@@ -46,6 +52,19 @@ export interface ContinueInput {
   permissionId?: string;
   permissionReply?: "once" | "always" | "reject";
   permissionMessage?: string;
+}
+
+export interface ConsultInput {
+  agentId: string;
+  jobId?: string;
+  activityLimit?: number;
+}
+
+export interface FollowInput {
+  agentId: string;
+  jobId?: string;
+  waitMinutes?: number;
+  graceMinutes?: number;
 }
 
 export interface AbortInput {
@@ -89,6 +108,68 @@ export interface JobRecord {
   resultPath: string | null;
   resultSummary: string | null;
   error: string | null;
+  followStartedAt: string | null;
+  followDeadlineAt: string | null;
+  followGraceMinutes: number | null;
+  graceDeadlineAt: string | null;
+  gracefulFinalizeAttempted: boolean;
+  approvalDeadlineAt: string | null;
+}
+
+export type ActivityType =
+  | "dispatch"
+  | "event"
+  | "approval"
+  | "result"
+  | "deadline"
+  | "finalize"
+  | "abort"
+  | "error";
+
+export interface AgentActivity {
+  id: string;
+  agentId: string;
+  jobId: string | null;
+  sessionId: string | null;
+  activityType: ActivityType;
+  summary: string;
+  createdAt: string;
+}
+
+export interface ProgressActivity {
+  type: ActivityType;
+  summary: string;
+  timestamp: string;
+}
+
+export interface ProgressSnapshot {
+  agentId: string;
+  jobId: string | null;
+  topic: string;
+  status: string;
+  elapsedSeconds: number;
+  lastActivityAgoSeconds: number | null;
+  currentActivity: string;
+  recentActivity: ProgressActivity[];
+  filesTouched: string[];
+  testSummary: string;
+  resultAvailable: boolean;
+}
+
+export interface FollowResult {
+  agentId: string;
+  jobId: string;
+  status: "completed" | "completed_partial" | "timed_out" | "failed" | "aborted" | "needs_approval";
+  deadlineReached: boolean;
+  gracefulFinalize: boolean;
+  partial: boolean;
+  workerAborted: boolean;
+  resultAvailable: boolean;
+  result?: { envelope: ResultEnvelope };
+  progress: ProgressSnapshot;
+  error?: string;
+  permissionId?: string | null;
+  message?: string;
 }
 
 export interface CodexBinding {
@@ -169,7 +250,7 @@ export interface ResultEnvelope {
   agentId: string;
   jobId: string;
   topic: string;
-  status: "completed" | "failed" | "aborted";
+  status: "completed" | "completed_partial" | "timed_out" | "failed" | "aborted";
   opencodeSessionId: string;
   model: string;
   modelDisplayName: string;
@@ -181,6 +262,10 @@ export interface ResultEnvelope {
   diffSummary: string;
   fullResultPath: string;
   orchestratorInstruction: string;
+  deadlineReached?: boolean;
+  gracefulFinalize?: boolean;
+  partial?: boolean;
+  workerAborted?: boolean;
 }
 
 export interface BridgeConfig {
@@ -202,6 +287,9 @@ export interface BridgeConfig {
   opencodeEventReconnectMaxMs: number;
   approvalTimeoutMs: number;
   codexCorrelationWindowMs: number;
+  experimentalSameChatDelivery: boolean;
+  followDefaultWaitMinutes: number;
+  followDefaultGraceMinutes: number;
   codexAppServerSocket: string | null;
   codexAppServerCommand: string | null;
   codexAppServerArgs: string[];

@@ -13,6 +13,27 @@ export interface PromptBuildOptions {
   maxLength: number;
 }
 
+export const GRACEFUL_FINALIZE_PROMPT = [
+  "Pare de expandir esta tarefa.",
+  "",
+  "Finalize agora utilizando somente o trabalho e as evidências já obtidas.",
+  "Não inicie novas investigações, refactors ou testes demorados.",
+  "Preserve as alterações já realizadas.",
+  "",
+  "Retorne imediatamente um relatório com:",
+  "- o que foi concluído;",
+  "- o que foi descoberto;",
+  "- arquivos alterados;",
+  "- comandos/testes executados;",
+  "- resultados dos testes;",
+  "- problemas encontrados;",
+  "- trabalho ainda incompleto;",
+  "- riscos e próximos passos.",
+  "",
+  "Não esconda que a execução foi interrompida por deadline.",
+  "Use os headings STATUS, SUMMARY, ASSUMPTIONS, CHANGES, FILES, TESTS, RISKS e UNRESOLVED.",
+].join("\n");
+
 export async function buildWorkerPrompt(
   input: SpawnInput | { task: string; relation?: string },
   workspacePath: string,

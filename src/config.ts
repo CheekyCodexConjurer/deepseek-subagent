@@ -4,6 +4,11 @@ import path from "node:path";
 import { defaultUserDataRoot, ensurePrivateDir, isLoopbackHost, writePrivateFile } from "./security.js";
 import type { BridgeConfig } from "./types.js";
 
+export const FOLLOW_MAX_WAIT_MINUTES = 60;
+export const FOLLOW_MAX_GRACE_MINUTES = 10;
+export const FOLLOW_MAX_TOTAL_MINUTES = FOLLOW_MAX_WAIT_MINUTES + FOLLOW_MAX_GRACE_MINUTES;
+export const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 4_500;
+
 export function defaultConfigPath(): string {
   return path.join(defaultUserDataRoot(), "config.json");
 }
@@ -18,6 +23,17 @@ function asNullableString(value: unknown): string | null {
 
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : fallback;
+}
+
+export function isValidFollowDefaults(config: Pick<BridgeConfig, "followDefaultWaitMinutes" | "followDefaultGraceMinutes">): boolean {
+  return boundedInteger(config.followDefaultWaitMinutes, Number.NaN, 1, FOLLOW_MAX_WAIT_MINUTES) === config.followDefaultWaitMinutes &&
+    boundedInteger(config.followDefaultGraceMinutes, Number.NaN, 1, FOLLOW_MAX_GRACE_MINUTES) === config.followDefaultGraceMinutes;
 }
 
 export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
@@ -42,6 +58,9 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     opencodeEventReconnectMaxMs: overrides.opencodeEventReconnectMaxMs ?? 30_000,
     approvalTimeoutMs: overrides.approvalTimeoutMs ?? 300_000,
     codexCorrelationWindowMs: overrides.codexCorrelationWindowMs ?? 10_000,
+    experimentalSameChatDelivery: overrides.experimentalSameChatDelivery ?? false,
+    followDefaultWaitMinutes: boundedInteger(overrides.followDefaultWaitMinutes, 20, 1, FOLLOW_MAX_WAIT_MINUTES),
+    followDefaultGraceMinutes: boundedInteger(overrides.followDefaultGraceMinutes, 5, 1, FOLLOW_MAX_GRACE_MINUTES),
     codexAppServerSocket: overrides.codexAppServerSocket ?? null,
     codexAppServerCommand: overrides.codexAppServerCommand ?? null,
     codexAppServerArgs: overrides.codexAppServerArgs ?? [],
@@ -78,6 +97,9 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       opencodeEventReconnectMaxMs: asNumber(raw.opencodeEventReconnectMaxMs, defaults.opencodeEventReconnectMaxMs),
       approvalTimeoutMs: asNumber(raw.approvalTimeoutMs, defaults.approvalTimeoutMs),
       codexCorrelationWindowMs: asNumber(raw.codexCorrelationWindowMs, defaults.codexCorrelationWindowMs),
+      experimentalSameChatDelivery: raw.experimentalSameChatDelivery === true,
+      followDefaultWaitMinutes: boundedInteger(raw.followDefaultWaitMinutes, defaults.followDefaultWaitMinutes, 1, FOLLOW_MAX_WAIT_MINUTES),
+      followDefaultGraceMinutes: boundedInteger(raw.followDefaultGraceMinutes, defaults.followDefaultGraceMinutes, 1, FOLLOW_MAX_GRACE_MINUTES),
       codexAppServerSocket: asNullableString(raw.codexAppServerSocket),
       codexAppServerCommand: asNullableString(raw.codexAppServerCommand),
       codexAppServerArgs: Array.isArray(raw.codexAppServerArgs)

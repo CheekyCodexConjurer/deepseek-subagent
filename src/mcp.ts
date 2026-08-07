@@ -165,6 +165,49 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     }
   });
 
+  server.registerTool("deepseek_consult", {
+    title: DISPLAY_NAME + " · Consult",
+    description: "Get one immediate observable progress snapshot for an existing DeepSeek agent. Use only when the user asks for progress, a task is taking unusually long, or the snapshot materially changes the orchestrator's next decision. Do not use repeatedly to wait for completion. Never exposes private reasoning.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: {
+      agent_id: z.string().min(1),
+      job_id: z.string().min(1).optional(),
+      activity_limit: z.number().int().min(1).max(20).default(10),
+    },
+  }, async (args) => {
+    try {
+      const result = await client.call<Record<string, unknown>>("/v1/jobs/consult", args);
+      return {
+        content: [{ type: "text", text: "Observable DeepSeek progress snapshot returned." }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("deepseek_follow", {
+    title: DISPLAY_NAME + " · Follow",
+    description: "Wait for an existing DeepSeek agent only when no useful independent work remains. This call stays open efficiently until completion, deadline, graceful finalization, approval or error, using internal events and one deadline timer without polling. Omit wait_minutes and grace_minutes to use the daemon-configured defaults. When there is no more independent work, use this instead of repeated consult calls.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: {
+      agent_id: z.string().min(1),
+      job_id: z.string().min(1).optional(),
+      wait_minutes: z.number().int().min(1).max(60).optional(),
+      grace_minutes: z.number().int().min(1).max(10).optional(),
+    },
+  }, async (args) => {
+    try {
+      const result = await client.call<Record<string, unknown>>("/v1/jobs/follow", args);
+      return {
+        content: [{ type: "text", text: "DeepSeek Sub-Agent follow completed with an event-driven result." }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
   server.registerTool("deepseek_abort", {
     title: DISPLAY_NAME + " · Abort",
     description: "Stop the active DeepSeek task for an agent. This is a control action, not a polling operation.",

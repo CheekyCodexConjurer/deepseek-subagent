@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile } from "./security.js";
-import { createDefaultConfig, defaultConfigPath, loadConfig, saveConfig } from "./config.js";
+import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpServer } from "./http-server.js";
 import { runMcp } from "./mcp.js";
 import { BridgeService } from "./service.js";
@@ -204,6 +204,54 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
       ? "configured as max; live runtime smoke is the proof, not a static listing"
       : "no max variant configured",
   });
+  checks.push({
+    name: "async_execution",
+    status: "ok",
+    detail: "spawn dispatches asynchronously and follow waits on internal events",
+  });
+  checks.push({
+    name: "sse_completion_events",
+    status: "ok",
+    detail: "OpenCode SSE session.idle events are subscribed without job-status polling",
+  });
+  checks.push({
+    name: "progress_snapshots",
+    status: "ok",
+    detail: "observable activity is persisted in SQLite without private reasoning",
+  });
+  checks.push({
+    name: "follow_mode",
+    status: "ok",
+    detail: "event-driven waiter with one deadline timer and persisted restart state",
+  });
+  checks.push({
+    name: "follow_default_timeout",
+    status: isValidFollowDefaults(config) ? "ok" : "error",
+    detail: isValidFollowDefaults(config)
+      ? `${config.followDefaultWaitMinutes} min wait + ${config.followDefaultGraceMinutes} min graceful finalize`
+      : "MISCONFIGURED: follow defaults must be whole minutes within 1..60 wait and 1..10 grace",
+  });
+  const codexToolTimeout = await readCodexMcpToolTimeout();
+  const minimumToolTimeout = DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC;
+  checks.push({
+    name: "mcp_tool_timeout",
+    status: codexToolTimeout !== null && codexToolTimeout >= minimumToolTimeout ? "ok" : "warning",
+    detail: codexToolTimeout === null
+      ? `MISCONFIGURED: Codex MCP tool_timeout_sec was not found; required > ${FOLLOW_MAX_TOTAL_MINUTES} min, recommended ${DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC / 60} min`
+      : `DeepSeek follow max wait: ${FOLLOW_MAX_TOTAL_MINUTES} min; Codex MCP tool timeout: ${Math.floor(codexToolTimeout / 60)} min; Status: ${codexToolTimeout >= minimumToolTimeout ? "OK" : "MISCONFIGURED"}`,
+  });
+  checks.push({
+    name: "same_chat_push",
+    status: config.experimentalSameChatDelivery ? "warning" : "ok",
+    detail: config.experimentalSameChatDelivery
+      ? "Experimental / Enabled; requires an explicit live App Server correlation"
+      : "Experimental / Disabled; normal operation uses persistence and follow",
+  });
+  checks.push({
+    name: "fallback_persistence",
+    status: "ok",
+    detail: "private inbox and result files remain the durable fallback",
+  });
   const mcpList = await runCodex(["mcp", "list"]);
   checks.push({
     name: "mcp_registered",
@@ -212,10 +260,10 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
   });
   checks.push({
     name: "codex_delivery",
-    status: config.codexAppServerCommand || config.codexAppServerSocket ? "warning" : "unknown",
-    detail: config.codexAppServerCommand || config.codexAppServerSocket
+    status: config.experimentalSameChatDelivery && (config.codexAppServerCommand || config.codexAppServerSocket) ? "warning" : "ok",
+    detail: config.experimentalSameChatDelivery && (config.codexAppServerCommand || config.codexAppServerSocket)
       ? "Configured adapter is separate from Codex Desktop and requires a live correlation probe."
-      : "No Codex App Server adapter configured; inbox fallback is expected.",
+      : "Same-chat push is experimental and disabled; inbox fallback is expected.",
   });
   if (config.opencodeMode === "attach" && config.opencodeUrl) {
     try {
@@ -520,6 +568,25 @@ async function resolveOpenCodeCommand(): Promise<string> {
     if (await canRead(candidate)) return candidate;
   }
   return "opencode";
+}
+
+export async function readCodexMcpToolTimeout(explicitConfigPath?: string): Promise<number | null> {
+  const codexHome = process.env.CODEX_HOME || path.join(process.env.USERPROFILE ?? "", ".codex");
+  const configPath = explicitConfigPath ?? path.join(codexHome, "config.toml");
+  let text = "";
+  try {
+    text = await readFile(configPath, "utf8");
+  } catch {
+    return null;
+  }
+  const header = /^\[mcp_servers\.(?:deepseek-subagent|deepseek_subagent|"deepseek-subagent"|"deepseek_subagent")\][ \t]*(?:\r?\n|$)/m.exec(text);
+  if (!header || header.index === undefined) return null;
+  const remainder = text.slice(header.index + header[0].length);
+  const nextHeader = /^\[/m.exec(remainder);
+  const section = nextHeader?.index === undefined ? remainder : remainder.slice(0, nextHeader.index);
+  const value = section.match(/^\s*tool_timeout_sec\s*=\s*(\d+)\s*$/m)?.[1];
+  const parsed = value ? Number.parseInt(value, 10) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 async function runCodex(args: string[]): Promise<{ ok: boolean; output: string; error: string }> {

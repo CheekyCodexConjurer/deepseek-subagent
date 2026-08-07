@@ -62,6 +62,35 @@ test("persists agents, jobs, bindings and idempotent events", async () => {
       sessionId: "session_test",
       jobId: job.id,
     }), false);
+    store.recordActivity({
+      agentId: "agent_test",
+      jobId: job.id,
+      sessionId: "session_test",
+      activityType: "event",
+      summary: "Read src/example.ts",
+      metadata: { privateReasoning: "must never be returned" },
+    });
+    const activities = store.listActivity("agent_test", 1);
+    assert.equal(activities.length, 1);
+    assert.equal(activities[0]?.summary, "Read src/example.ts");
+    assert.doesNotMatch(JSON.stringify(activities[0]), /privateReasoning|reasoning/);
+    store.recordActivity({
+      agentId: "agent_test",
+      jobId: job.id,
+      sessionId: "session_test",
+      activityType: "approval",
+      summary: "Approval requested",
+    });
+    for (let index = 0; index < 25; index += 1) {
+      store.recordActivity({
+        agentId: "agent_test",
+        jobId: job.id,
+        sessionId: "session_test",
+        activityType: "event",
+        summary: "Event " + index,
+      });
+    }
+    assert.equal(store.hasActivity({ agentId: "agent_test", jobId: job.id, activityType: "approval" }), true);
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });

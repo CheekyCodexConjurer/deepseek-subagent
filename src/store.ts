@@ -2,8 +2,10 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { assertAgentTransition, assertJobTransition } from "./state.js";
-import { newId } from "./security.js";
+import { newId, redactSecrets, truncate } from "./security.js";
 import type {
+  ActivityType,
+  AgentActivity,
   AgentRecord,
   AgentStatus,
   CodexBinding,
@@ -62,15 +64,18 @@ export class BridgeStore {
     const schema = [
       "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
       "CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, title TEXT NOT NULL, topic TEXT NOT NULL, repository_root TEXT NOT NULL, workspace_path TEXT NOT NULL, workspace_strategy TEXT NOT NULL CHECK (workspace_strategy IN ('shared','worktree')), opencode_server_id TEXT NOT NULL, opencode_session_id TEXT NOT NULL UNIQUE, model_provider_id TEXT NOT NULL, model_id TEXT NOT NULL, model_variant TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT, last_error TEXT);",
-      "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), sequence INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('spawn','continue')), request_id TEXT NOT NULL UNIQUE, prompt_hash TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, last_user_message_id TEXT, last_assistant_message_id TEXT, permission_id TEXT, result_path TEXT, result_summary TEXT, error TEXT, UNIQUE(agent_id, sequence));",
+      "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), sequence INTEGER NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('spawn','continue')), request_id TEXT NOT NULL UNIQUE, prompt_hash TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, last_user_message_id TEXT, last_assistant_message_id TEXT, permission_id TEXT, result_path TEXT, result_summary TEXT, error TEXT, follow_started_at TEXT, follow_deadline_at TEXT, follow_grace_minutes REAL, grace_deadline_at TEXT, graceful_finalize_attempted INTEGER NOT NULL DEFAULT 0, approval_deadline_at TEXT, UNIQUE(agent_id, sequence));",
       "CREATE TABLE IF NOT EXISTS codex_bindings (job_id TEXT PRIMARY KEY REFERENCES jobs(id), thread_id TEXT NOT NULL, originating_turn_id TEXT, originating_item_id TEXT, bound_at TEXT NOT NULL);",
       "CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id), thread_id TEXT NOT NULL, expected_turn_id TEXT, delivery_method TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);",
       "CREATE TABLE IF NOT EXISTS servers (id TEXT PRIMARY KEY, workspace_root TEXT NOT NULL, base_url TEXT NOT NULL, process_id INTEGER, status TEXT NOT NULL, started_at TEXT NOT NULL, stopped_at TEXT);",
       "CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, source TEXT NOT NULL, source_event_id TEXT NOT NULL, event_type TEXT NOT NULL, session_id TEXT, job_id TEXT REFERENCES jobs(id), received_at TEXT NOT NULL, processed_at TEXT, UNIQUE(source, source_event_id));",
+      "CREATE TABLE IF NOT EXISTS agent_activity (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), job_id TEXT REFERENCES jobs(id), session_id TEXT, activity_type TEXT NOT NULL, summary TEXT NOT NULL, metadata_json TEXT, created_at TEXT NOT NULL);",
       "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);",
       "CREATE INDEX IF NOT EXISTS idx_jobs_agent ON jobs(agent_id);",
       "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, received_at);",
       "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON deliveries(status);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_activity_agent ON agent_activity(agent_id, created_at DESC);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_activity_job ON agent_activity(job_id, created_at DESC);",
     ].join("\n");
     this.db.exec(schema);
     const applied = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 1").get() as Row | undefined;
@@ -97,6 +102,23 @@ export class BridgeStore {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)").run(new Date().toISOString());
     } else {
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_bindings_correlation ON codex_bindings(thread_id, originating_turn_id, originating_item_id) WHERE originating_turn_id IS NOT NULL AND originating_item_id IS NOT NULL");
+    }
+    const followColumns = this.db.prepare("PRAGMA table_info(jobs)").all() as Row[];
+    for (const [name, definition] of [
+      ["follow_started_at", "TEXT"],
+      ["follow_deadline_at", "TEXT"],
+      ["follow_grace_minutes", "REAL"],
+      ["grace_deadline_at", "TEXT"],
+      ["graceful_finalize_attempted", "INTEGER NOT NULL DEFAULT 0"],
+      ["approval_deadline_at", "TEXT"],
+    ] as const) {
+      if (!followColumns.some((column) => column.name === name)) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition);
+      }
+    }
+    const followMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 4").get() as Row | undefined;
+    if (!followMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)").run(new Date().toISOString());
     }
   }
 
@@ -192,7 +214,7 @@ export class BridgeStore {
     assertJobTransition(current.status, status);
     const now = new Date().toISOString();
     const startedAt = status === "running" && current.startedAt === null ? now : current.startedAt;
-    const completedAt = ["completed", "failed", "aborted"].includes(status) ? now : current.completedAt;
+    const completedAt = ["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) ? now : current.completedAt;
     this.db.prepare("UPDATE jobs SET status = ?, started_at = ?, completed_at = ?, error = ? WHERE id = ?").run(
       status,
       startedAt,
@@ -217,11 +239,98 @@ export class BridgeStore {
     this.db.prepare("UPDATE jobs SET permission_id = ? WHERE id = ?").run(permissionId, id);
   }
 
+  setFollowWindow(id: string, input: {
+    startedAt: string;
+    deadlineAt: string;
+    graceMinutes?: number | null;
+    graceDeadlineAt?: string | null;
+    gracefulFinalizeAttempted?: boolean;
+  }): JobRecord {
+    this.db.prepare("UPDATE jobs SET follow_started_at = ?, follow_deadline_at = ?, follow_grace_minutes = ?, grace_deadline_at = ?, graceful_finalize_attempted = ? WHERE id = ?").run(
+      input.startedAt,
+      input.deadlineAt,
+      input.graceMinutes ?? null,
+      input.graceDeadlineAt ?? null,
+      input.gracefulFinalizeAttempted === true ? 1 : 0,
+      id,
+    );
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  markGracefulFinalize(id: string, graceDeadlineAt: string): JobRecord {
+    this.db.prepare("UPDATE jobs SET grace_deadline_at = ?, graceful_finalize_attempted = 1 WHERE id = ?").run(
+      graceDeadlineAt,
+      id,
+    );
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  clearFollowWindow(id: string): JobRecord {
+    this.db.prepare("UPDATE jobs SET follow_started_at = NULL, follow_deadline_at = NULL, follow_grace_minutes = NULL, grace_deadline_at = NULL, graceful_finalize_attempted = 0 WHERE id = ?").run(id);
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  setApprovalDeadline(id: string, deadlineAt: string | null): JobRecord {
+    this.db.prepare("UPDATE jobs SET approval_deadline_at = ? WHERE id = ?").run(deadlineAt, id);
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  hasActivity(input: { agentId: string; jobId: string; activityType: ActivityType }): boolean {
+    const row = this.db.prepare("SELECT 1 AS found FROM agent_activity WHERE agent_id = ? AND job_id = ? AND activity_type = ? LIMIT 1").get(
+      input.agentId,
+      input.jobId,
+      input.activityType,
+    ) as Row | undefined;
+    return row !== undefined;
+  }
+
   setJobResult(id: string, resultPath: string, summary: string): JobRecord {
     this.db.prepare("UPDATE jobs SET result_path = ?, result_summary = ? WHERE id = ?").run(resultPath, summary, id);
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
+  }
+
+  recordActivity(input: {
+    agentId: string;
+    jobId?: string | null;
+    sessionId?: string | null;
+    activityType: ActivityType;
+    summary: string;
+    metadata?: Record<string, unknown>;
+  }): AgentActivity {
+    const createdAt = new Date().toISOString();
+    const summary = truncate(redactSecrets(input.summary.replace(/[\r\n]+/g, " ").trim()), 500);
+    const metadataJson = input.metadata
+      ? truncate(redactSecrets(JSON.stringify(input.metadata)), 2_000)
+      : null;
+    this.db.prepare("INSERT INTO agent_activity(id,agent_id,job_id,session_id,activity_type,summary,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)").run(
+      newId("activity"),
+      input.agentId,
+      input.jobId ?? null,
+      input.sessionId ?? null,
+      input.activityType,
+      summary || "Observable activity recorded",
+      metadataJson,
+      createdAt,
+    );
+    const row = this.db.prepare("SELECT * FROM agent_activity WHERE agent_id = ? AND created_at = ? ORDER BY id DESC LIMIT 1").get(input.agentId, createdAt) as Row | undefined;
+    if (!row) throw new Error("Activity was not persisted");
+    return this.toActivity(row);
+  }
+
+  listActivity(agentId: string, limit = 20): AgentActivity[] {
+    const bounded = Math.max(1, Math.min(20, Math.trunc(limit)));
+    const rows = this.db.prepare("SELECT * FROM agent_activity WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(agentId, bounded) as Row[];
+    return rows.map((row) => this.toActivity(row));
   }
 
   updateAgentStatus(id: string, status: AgentStatus, error: string | null = null): AgentRecord {
@@ -389,12 +498,17 @@ export class BridgeStore {
     );
   }
 
+  isEventProcessed(source: string, sourceEventId: string): boolean {
+    const row = this.db.prepare("SELECT processed_at FROM events WHERE source = ? AND source_event_id = ?").get(source, sourceEventId) as Row | undefined;
+    return typeof row?.processed_at === "string" && row.processed_at.length > 0;
+  }
+
   listInbox(): JobRecord[] {
     return this.listJobs().filter((job) => job.resultPath !== null && job.status !== "delivered");
   }
 
   recoverPendingJobs(): JobRecord[] {
-    return this.listJobs().filter((job) => ["dispatching", "running", "needs_approval", "completed", "delivery_pending"].includes(job.status));
+    return this.listJobs().filter((job) => ["dispatching", "running", "following", "finalizing", "needs_approval", "completed", "completed_partial", "timed_out", "delivery_pending"].includes(job.status));
   }
 
   registerServer(input: { id: string; workspaceRoot: string; baseUrl: string; processId: number | null }): void {
@@ -451,6 +565,24 @@ export class BridgeStore {
       resultPath: nullableString(row, "result_path"),
       resultSummary: nullableString(row, "result_summary"),
       error: nullableString(row, "error"),
+      followStartedAt: nullableString(row, "follow_started_at"),
+      followDeadlineAt: nullableString(row, "follow_deadline_at"),
+      followGraceMinutes: row.follow_grace_minutes === null || row.follow_grace_minutes === undefined ? null : Number(row.follow_grace_minutes),
+      graceDeadlineAt: nullableString(row, "grace_deadline_at"),
+      gracefulFinalizeAttempted: numberValue(row, "graceful_finalize_attempted") === 1,
+      approvalDeadlineAt: nullableString(row, "approval_deadline_at"),
+    };
+  }
+
+  private toActivity(row: Row): AgentActivity {
+    return {
+      id: stringValue(row, "id"),
+      agentId: stringValue(row, "agent_id"),
+      jobId: nullableString(row, "job_id"),
+      sessionId: nullableString(row, "session_id"),
+      activityType: stringValue(row, "activity_type") as ActivityType,
+      summary: stringValue(row, "summary"),
+      createdAt: stringValue(row, "created_at"),
     };
   }
 

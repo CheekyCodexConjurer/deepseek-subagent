@@ -4,6 +4,8 @@
   "tools": [
     "deepseek_spawn",
     "deepseek_continue",
+    "deepseek_consult",
+    "deepseek_follow",
     "deepseek_abort",
     "deepseek_close",
     "deepseek_recover_result"
@@ -15,10 +17,18 @@
     "display": "DeepSeek V4 Flash · Max"
   },
   "delivery": {
-    "primary": "codex-app-server",
+    "primary": "event-driven-follow-and-persistence",
     "fallback": "private-inbox",
     "polling": false,
     "configuredTransports": ["stdio", "loopback-ws"],
-    "desktopWindowsProven": false
+    "desktopWindowsProven": false,
+    "sameChat": "experimental-disabled-by-default",
+    "follow": {
+      "defaultWaitMinutes": 20,
+      "defaultGraceMinutes": 5,
+      "maxWaitMinutes": 60,
+      "maxGraceMinutes": 10,
+      "mcpToolTimeoutSec": 4500
+    }
   }
 }
