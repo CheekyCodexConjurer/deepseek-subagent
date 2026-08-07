@@ -41,6 +41,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     opencodeStartupTimeoutMs: overrides.opencodeStartupTimeoutMs ?? 30_000,
     opencodeEventReconnectMaxMs: overrides.opencodeEventReconnectMaxMs ?? 30_000,
     approvalTimeoutMs: overrides.approvalTimeoutMs ?? 300_000,
+    codexCorrelationWindowMs: overrides.codexCorrelationWindowMs ?? 10_000,
     codexAppServerSocket: overrides.codexAppServerSocket ?? null,
     codexAppServerCommand: overrides.codexAppServerCommand ?? null,
     codexAppServerArgs: overrides.codexAppServerArgs ?? [],
@@ -76,6 +77,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       opencodeStartupTimeoutMs: asNumber(raw.opencodeStartupTimeoutMs, defaults.opencodeStartupTimeoutMs),
       opencodeEventReconnectMaxMs: asNumber(raw.opencodeEventReconnectMaxMs, defaults.opencodeEventReconnectMaxMs),
       approvalTimeoutMs: asNumber(raw.approvalTimeoutMs, defaults.approvalTimeoutMs),
+      codexCorrelationWindowMs: asNumber(raw.codexCorrelationWindowMs, defaults.codexCorrelationWindowMs),
       codexAppServerSocket: asNullableString(raw.codexAppServerSocket),
       codexAppServerCommand: asNullableString(raw.codexAppServerCommand),
       codexAppServerArgs: Array.isArray(raw.codexAppServerArgs)

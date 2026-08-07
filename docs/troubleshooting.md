@@ -30,4 +30,6 @@ The bridge uses the configured opencode-go provider, deepseek-v4-flash model and
 
 ## Codex delivery is unavailable
 
-This is expected until a compatible Codex App Server connection is explicitly configured and live-tested. The generated app-server protocol can support thread/start and turn/steer, but schema availability does not prove that the current Desktop conversation can be correlated. Keep using the inbox until the probe proves both sides.
+This is expected until a compatible Codex App Server connection is explicitly configured and live-tested. On Windows, the bridge accepts a local WebSocket endpoint in `codexAppServerSocket`, for example `ws://127.0.0.1:PORT`; the endpoint must be started separately with the installed Codex App Server. That server is not automatically the current Desktop process. The generated protocol can support thread/start and turn/steer, but schema availability does not prove that the current Desktop conversation can be correlated. Keep using the inbox until the probe proves both sides.
+
+The WebSocket option is intentionally restricted to loopback and assumes the same-user local trust boundary. Do not bind it to a non-loopback host, expose it through port forwarding, or treat it as an authenticated remote endpoint. When configured, a completed result waits briefly for its `item/completed` correlation; if no valid event arrives, it falls back to the private inbox.

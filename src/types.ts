@@ -201,6 +201,7 @@ export interface BridgeConfig {
   opencodeStartupTimeoutMs: number;
   opencodeEventReconnectMaxMs: number;
   approvalTimeoutMs: number;
+  codexCorrelationWindowMs: number;
   codexAppServerSocket: string | null;
   codexAppServerCommand: string | null;
   codexAppServerArgs: string[];

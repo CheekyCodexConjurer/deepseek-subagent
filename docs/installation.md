@@ -30,6 +30,14 @@ Detached:
 
 The registered MCP now starts the detached local daemon automatically when it connects and the daemon is offline, then waits for the bridge health endpoint before exposing tools. `-StartDaemon` is still available to prewarm it after installation. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. Attach mode can be selected in config for an already running loopback OpenCode server.
 
+## Optional Codex App Server endpoint
+
+The bridge can connect to an explicitly configured local Codex WebSocket endpoint:
+
+    "codexAppServerSocket": "ws://127.0.0.1:PORT"
+
+This requires a separately launched App Server (`codex app-server --listen ws://127.0.0.1:PORT`). It does not attach to the current Windows Desktop App Server automatically; leave this field `null` to keep the inbox fallback.
+
 ## Uninstall
 
     .\scripts\uninstall.ps1

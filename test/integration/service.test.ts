@@ -6,10 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createDefaultConfig } from "../../src/config.js";
+import type { CodexCorrelation, CodexDeliveryAdapter } from "../../src/codex/adapter.js";
 import { InboxDelivery } from "../../src/delivery/inbox.js";
 import { BridgeStore } from "../../src/store.js";
 import { BridgeService, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
-import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage } from "../../src/types.js";
+import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -83,6 +84,122 @@ class FakeInbox extends InboxDelivery {
     this.delivered.push(envelope.jobId);
     return "fake://" + envelope.jobId;
   }
+}
+
+class BlockingInbox extends FakeInbox {
+  private readonly startedPromise: Promise<void>;
+  private readonly releasePromise: Promise<void>;
+  private resolveStarted!: () => void;
+  private resolveRelease!: () => void;
+
+  constructor(directory: string) {
+    super(directory);
+    this.startedPromise = new Promise<void>((resolve) => {
+      this.resolveStarted = resolve;
+    });
+    this.releasePromise = new Promise<void>((resolve) => {
+      this.resolveRelease = resolve;
+    });
+  }
+
+  override async deliver(envelope: { jobId: string }, humanText: string): Promise<string> {
+    this.resolveStarted();
+    await this.releasePromise;
+    return super.deliver(envelope, humanText);
+  }
+
+  async waitUntilStarted(): Promise<void> {
+    return this.startedPromise;
+  }
+
+  release(): void {
+    this.resolveRelease();
+  }
+}
+
+class FakeCodex implements CodexDeliveryAdapter {
+  readonly available = true;
+  readonly reason = null;
+  readonly delivered: Array<{ jobId: string; threadId: string }> = [];
+  private listener: ((correlation: CodexCorrelation) => void) | null = null;
+
+  async start(): Promise<void> {}
+  async close(): Promise<void> {}
+  async deliver(job: JobRecord, binding: CodexBinding, _text: string): Promise<"codex-steer" | "codex-start"> {
+    this.delivered.push({ jobId: job.id, threadId: binding.threadId });
+    return "codex-start";
+  }
+  onCorrelation(listener: (correlation: CodexCorrelation) => void): () => void {
+    this.listener = listener;
+    return () => {
+      this.listener = null;
+    };
+  }
+  emit(correlation: CodexCorrelation): void {
+    this.listener?.(correlation);
+  }
+}
+
+class BlockingCodex extends FakeCodex {
+  readonly startedJobs: string[] = [];
+  active = 0;
+  maxActive = 0;
+  private readonly startedPromise: Promise<void>;
+  private readonly releasePromise: Promise<void>;
+  private resolveStarted!: () => void;
+  private resolveRelease!: () => void;
+
+  constructor() {
+    super();
+    this.startedPromise = new Promise<void>((resolve) => {
+      this.resolveStarted = resolve;
+    });
+    this.releasePromise = new Promise<void>((resolve) => {
+      this.resolveRelease = resolve;
+    });
+  }
+
+  override async deliver(job: JobRecord, binding: CodexBinding, text: string): Promise<"codex-steer" | "codex-start"> {
+    this.startedJobs.push(job.id);
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    this.resolveStarted();
+    try {
+      await this.releasePromise;
+      return await super.deliver(job, binding, text);
+    } finally {
+      this.active -= 1;
+    }
+  }
+
+  async waitUntilStarted(): Promise<void> {
+    return this.startedPromise;
+  }
+
+  release(): void {
+    this.resolveRelease();
+  }
+}
+
+function deliveryEnvelope(job: JobRecord): ResultEnvelope {
+  return {
+    version: 1,
+    agentId: job.agentId,
+    jobId: job.id,
+    topic: job.id,
+    status: "completed",
+    opencodeSessionId: "session_delivery",
+    model: "opencode-go/deepseek-v4-flash · max",
+    modelDisplayName: "DeepSeek V4 Flash (max)",
+    workspace: "E:/Repositories/deepseek-subagent",
+    summary: "delivery fixture",
+    files: [],
+    tests: [],
+    risks: [],
+    diffSummary: "none",
+    fullResultPath: "fixture.json",
+    orchestratorInstruction: "fixture",
+  };
 }
 
 test("spawn returns after dispatch, completes on idle, deduplicates, and continues same session", async () => {
@@ -271,6 +388,180 @@ test("explicit deepseek_continue permission fields reply through the OpenCode pe
     }]);
     assert.equal(service.getJob(accepted.jobId)?.status, "running");
   } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("completed result waits for a late Codex correlation before using inbox", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-window-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  const codex = new FakeCodex();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox,
+    codex,
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_correlation_window",
+      topic: "Correlation window fixture",
+      task: "Wait for the Codex item correlation",
+      cwd: directory,
+    });
+    client.messages = [{
+      info: { id: "assistant_window", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: correlation window" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivery_pending");
+    assert.deepEqual(inbox.delivered, []);
+    codex.emit({ jobId: accepted.jobId, threadId: "thread_late", turnId: "turn_late", itemId: "item_late" });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(codex.delivered, [{ jobId: accepted.jobId, threadId: "thread_late" }]);
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
+    assert.equal(store.getBinding(accepted.jobId)?.originatingItemId, "item_late");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serializes a late correlation against an in-flight inbox fallback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-race-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new BlockingInbox(directory);
+  const codex = new FakeCodex();
+  const service = new BridgeService(createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    codexCorrelationWindowMs: 25,
+  }), {
+    store,
+    manager: new FakeManager(client),
+    inbox,
+    codex,
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_correlation_race",
+      topic: "Correlation race fixture",
+      task: "Exercise one delivery channel",
+      cwd: directory,
+    });
+    client.messages = [{
+      info: { id: "assistant_race", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: correlation race" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    await inbox.waitUntilStarted();
+    codex.emit({ jobId: accepted.jobId, threadId: "thread_race", turnId: "turn_race", itemId: "item_race" });
+    inbox.release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(inbox.delivered, [accepted.jobId]);
+    assert.deepEqual(codex.delivered, []);
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    inbox.release();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serializes two jobs that converge on one Codex thread after a late binding", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-thread-race-"));
+  const store = await BridgeStore.open(directory);
+  const codex = new BlockingCodex();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(new FakeClient()),
+    inbox: new FakeInbox(directory),
+    codex,
+  });
+  const internal = service as unknown as {
+    deliverEnvelope(envelope: ResultEnvelope, job: JobRecord): Promise<void>;
+    deliveryLocks: Map<string, Promise<void>>;
+  };
+  try {
+    for (const [agentId, sessionId] of [["agent_thread_one", "session_thread_one"], ["agent_thread_two", "session_thread_two"]]) {
+      store.createAgent({
+        id: agentId,
+        title: agentId,
+        topic: "Thread race fixture",
+        repositoryRoot: directory,
+        workspacePath: directory,
+        workspaceStrategy: "shared",
+        opencodeServerId: "server_" + agentId,
+        opencodeSessionId: sessionId,
+        modelProviderId: "opencode-go",
+        modelId: "deepseek-v4-flash",
+        modelVariant: "max",
+      });
+    }
+    const first = store.createJob({
+      id: "job_thread_one",
+      agentId: "agent_thread_one",
+      kind: "spawn",
+      requestId: "request_thread_one",
+      promptHash: "hash_thread_one",
+    });
+    const second = store.createJob({
+      id: "job_thread_two",
+      agentId: "agent_thread_two",
+      kind: "spawn",
+      requestId: "request_thread_two",
+      promptHash: "hash_thread_two",
+    });
+    for (const job of [first, second]) {
+      store.updateJobStatus(job.id, "dispatching");
+      store.updateJobStatus(job.id, "running");
+      store.updateJobStatus(job.id, "completed");
+      store.updateJobStatus(job.id, "delivery_pending");
+    }
+
+    let releaseSeed!: () => void;
+    const seed = new Promise<void>((resolve) => {
+      releaseSeed = resolve;
+    });
+    internal.deliveryLocks.set("job:" + first.id, seed);
+    const firstDelivery = internal.deliverEnvelope(deliveryEnvelope(first), first);
+
+    store.bindJob({
+      jobId: first.id,
+      threadId: "thread_shared",
+      originatingTurnId: "turn_one",
+      originatingItemId: "item_one",
+    });
+    store.bindJob({
+      jobId: second.id,
+      threadId: "thread_shared",
+      originatingTurnId: "turn_two",
+      originatingItemId: "item_two",
+    });
+    const secondDelivery = internal.deliverEnvelope(deliveryEnvelope(second), second);
+    await codex.waitUntilStarted();
+
+    releaseSeed();
+    await Promise.resolve();
+    assert.deepEqual(codex.startedJobs, [second.id]);
+    assert.equal(codex.maxActive, 1);
+
+    codex.release();
+    await Promise.all([firstDelivery, secondDelivery]);
+    assert.deepEqual(codex.startedJobs, [second.id, first.id]);
+    assert.equal(codex.maxActive, 1);
+  } finally {
+    codex.release();
     await service.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });

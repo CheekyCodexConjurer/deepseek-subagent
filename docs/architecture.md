@@ -21,7 +21,9 @@ There is no status polling loop. Startup recovery performs a bounded one-time re
 - src/opencode/client.ts owns REST and SSE.
 - src/opencode/manager.ts owns only bridge-started OpenCode children.
 - src/service.ts owns state transitions, job identity, result persistence and delivery selection.
-- src/codex/adapter.ts is an optional fail-closed integration. It never assumes that a separate app-server is the current Desktop thread.
+- src/codex/adapter.ts is an optional fail-closed integration. It can launch a separate stdio App Server or connect to an explicitly configured local `ws://` endpoint; it never assumes that either is the current Desktop thread.
+- src/codex/websocket.ts owns the opt-in WebSocket JSON-RPC transport. It rejects non-loopback endpoints and does not accept Unix socket paths on Windows.
+- When the Codex adapter is initialized but an MCP correlation has not arrived yet, a completed result waits up to the configured correlation window (10 seconds by default) before using the inbox. The WebSocket endpoint is a same-user local trust boundary, not an authenticated remote service; it must not be exposed or forwarded off-host.
 - src/delivery/inbox.ts is the durable fallback.
 - src/mcp.ts exposes only the five stable tools required by the contract.
 

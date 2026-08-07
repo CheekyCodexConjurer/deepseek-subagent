@@ -78,6 +78,73 @@ export interface ServiceStatus {
 
 const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "needs_approval"]);
 
+type DeliveryAdmissionMode = "read" | "write";
+
+interface DeliveryAdmissionWaiter {
+  mode: DeliveryAdmissionMode;
+  resolve: () => void;
+}
+
+class DeliveryAdmission {
+  private readers = 0;
+  private writer = false;
+  private readonly waiters: DeliveryAdmissionWaiter[] = [];
+
+  async withRead<T>(operation: () => Promise<T>): Promise<T> {
+    await this.acquire("read");
+    try {
+      return await operation();
+    } finally {
+      this.release("read");
+    }
+  }
+
+  async withWrite<T>(operation: () => Promise<T>): Promise<T> {
+    await this.acquire("write");
+    try {
+      return await operation();
+    } finally {
+      this.release("write");
+    }
+  }
+
+  private acquire(mode: DeliveryAdmissionMode): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.waiters.push({ mode, resolve });
+      this.drain();
+    });
+  }
+
+  private release(mode: DeliveryAdmissionMode): void {
+    if (mode === "write") this.writer = false;
+    else this.readers -= 1;
+    this.drain();
+  }
+
+  private drain(): void {
+    if (this.writer) return;
+    if (this.readers > 0) {
+      while (this.waiters[0]?.mode === "read") this.grantRead();
+      return;
+    }
+    if (this.waiters[0]?.mode === "write") {
+      const waiter = this.waiters.shift();
+      if (!waiter) return;
+      this.writer = true;
+      waiter.resolve();
+      return;
+    }
+    while (this.waiters[0]?.mode === "read") this.grantRead();
+  }
+
+  private grantRead(): void {
+    const waiter = this.waiters.shift();
+    if (!waiter) return;
+    this.readers += 1;
+    waiter.resolve();
+  }
+}
+
 export class BridgeService {
   private readonly store: BridgeStore;
   private readonly manager: OpenCodeManagerLike;
@@ -92,6 +159,9 @@ export class BridgeService {
   private ownedStore = false;
   private lastStreamError: string | null = null;
   private readonly deliveryLocks = new Map<string, Promise<void>>();
+  private readonly deliveryAdmission = new DeliveryAdmission();
+  private readonly correlationFallbackTimers = new Map<string, NodeJS.Timeout>();
+  private readonly inboxFallbackJobs = new Set<string>();
   private readonly approvalTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly config: BridgeConfig, dependencies: ServiceDependencies = {}) {
@@ -142,6 +212,9 @@ export class BridgeService {
     this.running = false;
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
+    for (const timer of this.correlationFallbackTimers.values()) clearTimeout(timer);
+    this.correlationFallbackTimers.clear();
+    this.inboxFallbackJobs.clear();
     this.streamAbort?.abort();
     this.streamAbort = null;
     if (this.streamTask) {
@@ -211,14 +284,8 @@ export class BridgeService {
       requestId: input.requestId,
       promptHash: hashPrompt(prompt),
     });
-    if (input.threadId) {
-      this.store.bindJob({
-        jobId: job.id,
-        threadId: input.threadId,
-        originatingTurnId: input.turnId ?? null,
-        originatingItemId: null,
-      });
-    }
+    // MCP arguments are not proof of origin. A new binding is accepted only
+    // after the configured App Server reports this job in item/completed.
     return this.dispatch(agent, job, prompt);
   }
 
@@ -254,16 +321,6 @@ export class BridgeService {
       requestId: input.requestId,
       promptHash: hashPrompt(prompt),
     });
-    const priorBinding = this.store.getLatestBindingForAgent(agent.id);
-    const threadId = input.threadId ?? priorBinding?.threadId;
-    if (threadId) {
-      this.store.bindJob({
-        jobId: job.id,
-        threadId,
-        originatingTurnId: input.turnId ?? priorBinding?.originatingTurnId ?? null,
-        originatingItemId: null,
-      });
-    }
     if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
     return this.dispatch(agent, job, prompt);
   }
@@ -463,26 +520,49 @@ export class BridgeService {
   }
 
   private async deliverEnvelope(envelope: ResultEnvelope, job: JobRecord): Promise<void> {
-    const binding = this.store.getBinding(job.id);
-    const lockKey = binding?.threadId ?? "inbox";
-    const previous = this.deliveryLocks.get(lockKey) ?? Promise.resolve();
+    await this.withDeliveryLock("job:" + job.id, async () => {
+      const initialBinding = this.store.getBinding(job.id);
+      const deliverWithCurrentBinding = async (): Promise<void> => {
+        const binding = this.store.getBinding(job.id);
+        if (binding) {
+          await this.withDeliveryLock("thread:" + binding.threadId, () => this.deliverEnvelopeNow(envelope, job));
+        } else {
+          await this.deliverEnvelopeNow(envelope, job);
+        }
+      };
+      if (initialBinding) {
+        await this.deliveryAdmission.withRead(deliverWithCurrentBinding);
+      } else {
+        // An unbound result could later correlate to any Codex thread. Keep
+        // it exclusive so a late binding cannot overlap another delivery.
+        await this.deliveryAdmission.withWrite(deliverWithCurrentBinding);
+      }
+    });
+  }
+
+  private async withDeliveryLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.deliveryLocks.get(key) ?? Promise.resolve();
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const chain = previous.then(() => gate);
-    this.deliveryLocks.set(lockKey, chain);
+    this.deliveryLocks.set(key, chain);
     await previous;
     try {
-      await this.deliverEnvelopeNow(envelope, job);
+      return await operation();
     } finally {
       release?.();
-      if (this.deliveryLocks.get(lockKey) === chain) this.deliveryLocks.delete(lockKey);
+      if (this.deliveryLocks.get(key) === chain) this.deliveryLocks.delete(key);
     }
   }
 
   private async deliverEnvelopeNow(envelope: ResultEnvelope, job: JobRecord): Promise<void> {
     const binding = this.store.getBinding(job.id);
+    if (this.codex.available && !binding && !this.inboxFallbackJobs.has(job.id)) {
+      this.scheduleInboxFallback(job.id);
+      return;
+    }
     const humanText = formatHumanResult(envelope);
     const method = binding && this.codex.available ? "codex-start" : "inbox";
     const delivery = this.store.createDelivery({
@@ -579,11 +659,37 @@ export class BridgeService {
       originatingTurnId: correlation.turnId,
       originatingItemId: correlation.itemId,
     });
+    const fallbackTimer = this.correlationFallbackTimers.get(job.id);
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    this.correlationFallbackTimers.delete(job.id);
+    this.inboxFallbackJobs.delete(job.id);
+    const delivery = this.store.getDeliveryByJob(job.id);
+    if (delivery?.status === "delivered") return;
     if (job.status === "completed") {
       this.store.updateJobStatus(job.id, "delivery_pending");
-      const refreshed = this.store.getJob(job.id);
-      if (refreshed) await this.deliverPersistedJob(refreshed);
     }
+    const refreshed = this.store.getJob(job.id);
+    if (refreshed?.status === "delivery_pending") await this.deliverPersistedJob(refreshed);
+  }
+
+  private scheduleInboxFallback(jobId: string): void {
+    if (this.correlationFallbackTimers.has(jobId)) return;
+    const timer = setTimeout(() => {
+      this.correlationFallbackTimers.delete(jobId);
+      this.inboxFallbackJobs.add(jobId);
+      const job = this.store.getJob(jobId);
+      if (job) {
+        void this.deliverPersistedJob(job)
+          .catch((error: unknown) => {
+            this.lastStreamError = redactSecrets(String(error));
+          })
+          .finally(() => {
+            this.inboxFallbackJobs.delete(jobId);
+          });
+      }
+    }, this.config.codexCorrelationWindowMs);
+    timer.unref?.();
+    this.correlationFallbackTimers.set(jobId, timer);
   }
 
   private async failActive(agent: AgentRecord, error: string): Promise<void> {

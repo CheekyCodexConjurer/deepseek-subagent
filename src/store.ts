@@ -85,6 +85,19 @@ export class BridgeStore {
     if (!permissionMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)").run(new Date().toISOString());
     }
+    const bindingUniquenessMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 3").get() as Row | undefined;
+    if (!bindingUniquenessMigration) {
+      const duplicate = this.db.prepare(
+        "SELECT thread_id, originating_turn_id, originating_item_id, COUNT(*) AS count FROM codex_bindings WHERE originating_turn_id IS NOT NULL AND originating_item_id IS NOT NULL GROUP BY thread_id, originating_turn_id, originating_item_id HAVING COUNT(*) > 1 LIMIT 1",
+      ).get() as Row | undefined;
+      if (duplicate) {
+        throw new Error("Cannot enforce unique Codex correlation: existing duplicate binding tuple requires manual review");
+      }
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_bindings_correlation ON codex_bindings(thread_id, originating_turn_id, originating_item_id) WHERE originating_turn_id IS NOT NULL AND originating_item_id IS NOT NULL");
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)").run(new Date().toISOString());
+    } else {
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_bindings_correlation ON codex_bindings(thread_id, originating_turn_id, originating_item_id) WHERE originating_turn_id IS NOT NULL AND originating_item_id IS NOT NULL");
+    }
   }
 
   createAgent(input: {
@@ -230,14 +243,40 @@ export class BridgeStore {
   }
 
   bindJob(binding: Omit<CodexBinding, "boundAt"> & { boundAt?: string }): CodexBinding {
+    const existing = this.getBinding(binding.jobId);
+    if (existing) {
+      const matches = existing.threadId === binding.threadId &&
+        existing.originatingTurnId === binding.originatingTurnId &&
+        existing.originatingItemId === binding.originatingItemId;
+      if (!matches) {
+        throw new Error("Conflicting Codex binding for job " + binding.jobId);
+      }
+      return existing;
+    }
+    if (binding.originatingTurnId !== null && binding.originatingItemId !== null) {
+      const owner = this.getBindingByCorrelation(binding.threadId, binding.originatingTurnId, binding.originatingItemId);
+      if (owner && owner.jobId !== binding.jobId) {
+        throw new Error("Codex correlation tuple is already bound to job " + owner.jobId);
+      }
+    }
     const boundAt = binding.boundAt ?? new Date().toISOString();
-    this.db.prepare("INSERT INTO codex_bindings(job_id,thread_id,originating_turn_id,originating_item_id,bound_at) VALUES(?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET thread_id=excluded.thread_id, originating_turn_id=excluded.originating_turn_id, originating_item_id=excluded.originating_item_id, bound_at=excluded.bound_at").run(
-      binding.jobId,
-      binding.threadId,
-      binding.originatingTurnId,
-      binding.originatingItemId,
-      boundAt,
-    );
+    try {
+      this.db.prepare("INSERT INTO codex_bindings(job_id,thread_id,originating_turn_id,originating_item_id,bound_at) VALUES(?,?,?,?,?)").run(
+        binding.jobId,
+        binding.threadId,
+        binding.originatingTurnId,
+        binding.originatingItemId,
+        boundAt,
+      );
+    } catch (error) {
+      const owner = binding.originatingTurnId !== null && binding.originatingItemId !== null
+        ? this.getBindingByCorrelation(binding.threadId, binding.originatingTurnId, binding.originatingItemId)
+        : null;
+      if (owner && owner.jobId !== binding.jobId) {
+        throw new Error("Codex correlation tuple is already bound to job " + owner.jobId);
+      }
+      throw error;
+    }
     const result = this.getBinding(binding.jobId);
     if (!result) throw new Error("Binding was not persisted");
     return result;
@@ -245,6 +284,20 @@ export class BridgeStore {
 
   getBinding(jobId: string): CodexBinding | null {
     const row = this.db.prepare("SELECT * FROM codex_bindings WHERE job_id = ?").get(jobId) as Row | undefined;
+    if (!row) return null;
+    return {
+      jobId: stringValue(row, "job_id"),
+      threadId: stringValue(row, "thread_id"),
+      originatingTurnId: nullableString(row, "originating_turn_id"),
+      originatingItemId: nullableString(row, "originating_item_id"),
+      boundAt: stringValue(row, "bound_at"),
+    };
+  }
+
+  getBindingByCorrelation(threadId: string, originatingTurnId: string, originatingItemId: string): CodexBinding | null {
+    const row = this.db.prepare(
+      "SELECT * FROM codex_bindings WHERE thread_id = ? AND originating_turn_id = ? AND originating_item_id = ?",
+    ).get(threadId, originatingTurnId, originatingItemId) as Row | undefined;
     if (!row) return null;
     return {
       jobId: stringValue(row, "job_id"),

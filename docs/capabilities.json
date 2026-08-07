@@ -17,6 +17,8 @@
   "delivery": {
     "primary": "codex-app-server",
     "fallback": "private-inbox",
-    "polling": false
+    "polling": false,
+    "configuredTransports": ["stdio", "loopback-ws"],
+    "desktopWindowsProven": false
   }
 }

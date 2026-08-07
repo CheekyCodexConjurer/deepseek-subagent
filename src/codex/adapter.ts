@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import { JsonRpcStdioClient, type JsonRpcNotification } from "./jsonrpc.js";
+import { JsonRpcWebSocketClient } from "./websocket.js";
 import { redactSecrets } from "../security.js";
 import type { BridgeConfig, CodexBinding, JobRecord } from "../types.js";
 
@@ -13,8 +13,8 @@ export interface CodexRpcTransport {
 export interface CodexCorrelation {
   jobId: string;
   threadId: string;
-  turnId: string | null;
-  itemId: string | null;
+  turnId: string;
+  itemId: string;
 }
 
 export interface CodexDeliveryAdapter {
@@ -44,22 +44,30 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
   readonly reason = null;
   private readonly rpc: CodexRpcTransport;
   private readonly correlationListeners = new Set<(correlation: CodexCorrelation) => void>();
+  private readonly correlations = new Map<string, CodexCorrelation>();
+  private readonly itemCorrelations = new Map<string, CodexCorrelation>();
   private readonly turnWaiters = new Set<TurnWaiter>();
   private unsubscribe: (() => void) | null = null;
   private started = false;
 
   constructor(private readonly config: BridgeConfig, rpc?: CodexRpcTransport) {
-    this.rpc = rpc ?? new JsonRpcStdioClient();
+    this.rpc = rpc ?? (isWebSocketEndpoint(config.codexAppServerSocket)
+      ? new JsonRpcWebSocketClient()
+      : new JsonRpcStdioClient());
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     if (this.config.codexAppServerSocket) {
-      throw new Error("Configured Codex app-server socket is not supported by this Windows-safe stdio adapter");
+      if (!isWebSocketEndpoint(this.config.codexAppServerSocket)) {
+        throw new Error("Configured Codex app-server socket is not a supported local ws:// endpoint");
+      }
+      await this.rpc.start(this.config.codexAppServerSocket, []);
+    } else {
+      const command = this.config.codexAppServerCommand ?? "codex";
+      const args = this.config.codexAppServerArgs.length > 0 ? this.config.codexAppServerArgs : ["app-server"];
+      await this.rpc.start(command, args);
     }
-    const command = this.config.codexAppServerCommand ?? "codex";
-    const args = this.config.codexAppServerArgs.length > 0 ? this.config.codexAppServerArgs : ["app-server"];
-    await this.rpc.start(command, args);
     this.unsubscribe = this.rpc.onNotification((notification) => this.handleNotification(notification));
     this.started = true;
   }
@@ -68,6 +76,8 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     this.unsubscribe?.();
     this.unsubscribe = null;
     await this.rpc.close();
+    this.correlations.clear();
+    this.itemCorrelations.clear();
     this.started = false;
   }
 
@@ -109,15 +119,34 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     const params = asRecord(notification.params);
     const item = asRecord(params.item);
     if (item.type !== "mcpToolCall") return;
+    if (item.status !== "completed") return;
     const tool = typeof item.tool === "string" ? item.tool : "";
-    if (!["deepseek_spawn", "deepseek_continue", "deepseek_abort", "deepseek_close", "deepseek_recover_result"].includes(tool)) return;
-    const jobId = findJobId(item.result) ?? findJobId(item);
+    if (!["deepseek_spawn", "deepseek_continue"].includes(tool)) return;
+    if (item.server !== "deepseek-subagent") return;
+    const result = asRecord(item.result);
+    const structuredContent = asRecord(result.structuredContent);
+    if (structuredContent.accepted !== true || structuredContent.status !== "accepted") return;
+    const jobId = asString(structuredContent.jobId);
     if (!jobId) return;
-    const threadId = asString(params.threadId) ?? asString(item.threadId);
+    const threadId = asString(params.threadId);
     if (!threadId) return;
-    const turnId = asString(params.turnId) ?? asString(item.turnId);
+    const turnId = asString(params.turnId);
+    if (!turnId) return;
     const itemId = asString(item.id);
+    if (!itemId) return;
     const correlation = { jobId, threadId, turnId, itemId };
+    const previousItem = this.itemCorrelations.get(itemId);
+    if (previousItem) {
+      if (!sameCorrelation(previousItem, correlation)) return;
+      return;
+    }
+    const previous = this.correlations.get(jobId);
+    if (previous) {
+      if (!sameCorrelation(previous, correlation)) return;
+      return;
+    }
+    this.correlations.set(jobId, correlation);
+    this.itemCorrelations.set(itemId, correlation);
     for (const listener of this.correlationListeners) listener(correlation);
   }
 
@@ -170,30 +199,15 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function findJobId(value: unknown): string | null {
-  if (!value) return null;
-  if (typeof value === "string") {
-    try {
-      return findJobId(JSON.parse(value));
-    } catch {
-      const match = value.match(/(?:jobId|job_id)\s*["'=:\s]+([A-Za-z0-9_-]+)/i);
-      return match?.[1] ?? null;
-    }
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findJobId(item);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  if (typeof record.jobId === "string") return record.jobId;
-  if (typeof record.job_id === "string") return record.job_id;
-  if (record.structuredContent) return findJobId(record.structuredContent);
-  if (record.content) return findJobId(record.content);
-  return null;
+function isWebSocketEndpoint(value: string | null): value is string {
+  return typeof value === "string" && value.startsWith("ws://");
+}
+
+function sameCorrelation(left: CodexCorrelation, right: CodexCorrelation): boolean {
+  return left.jobId === right.jobId &&
+    left.threadId === right.threadId &&
+    left.turnId === right.turnId &&
+    left.itemId === right.itemId;
 }
 
 function isRecoverableTurnError(error: unknown): boolean {
