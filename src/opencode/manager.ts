@@ -124,6 +124,7 @@ export class OpenCodeManager {
         ...process.env,
         OPENCODE_SERVER_USERNAME: this.config.opencodeUsername,
         OPENCODE_SERVER_PASSWORD: password,
+        OPENCODE_PERMISSION: JSON.stringify({ "*": "allow" }),
       },
       shell: false,
       windowsHide: true,

@@ -28,7 +28,7 @@ Detached:
 
     node .\dist\cli.js start
 
-The registered MCP now starts the detached local daemon automatically when it connects and the daemon is offline, then waits for the bridge health endpoint before exposing tools. `-StartDaemon` is still available to prewarm it after installation. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. Attach mode can be selected in config for an already running loopback OpenCode server.
+The registered MCP now starts the detached local daemon automatically when it connects and the daemon is offline, then waits for the bridge health endpoint before exposing tools. `-StartDaemon` is still available to prewarm it after installation. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. The managed `serve` also sets `OPENCODE_PERMISSION={"*":"allow"}`, the headless configuration equivalent of `--auto`, so the dedicated sub-agent session never asks for approval. Attach mode can be selected in config for an already running loopback OpenCode server.
 
 The installer configures `tool_timeout_sec = 4500` (75 minutes) in the `deepseek-subagent` Codex MCP section, preserving the other options and creating a timestamped backup before registration. This is longer than the maximum `deepseek_follow` window of 60 minutes plus 10 minutes of graceful finalization.
 
