@@ -704,7 +704,9 @@ function findPermissionId(properties: Record<string, unknown>): string | null {
   for (const key of ["permission", "request"]) {
     const nested = properties[key];
     if (nested && typeof nested === "object") {
-      const found = findPermissionId(nested as Record<string, unknown>);
+      const nestedRecord = nested as Record<string, unknown>;
+      if (typeof nestedRecord.id === "string" && nestedRecord.id) return nestedRecord.id;
+      const found = findPermissionId(nestedRecord);
       if (found) return found;
     }
   }

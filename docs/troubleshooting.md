@@ -16,6 +16,10 @@ The daemon should have created data/inbox/{job id}.json below the configured dat
 
 Recovery is an explicit action, not a polling loop.
 
+## MCP cannot connect to the local daemon
+
+The MCP performs a one-time readiness bootstrap and starts the detached daemon automatically when it is offline. If startup still times out, inspect `data/daemon.log` below the configured data directory and run `node dist/cli.js doctor --json`. The MCP only waits for daemon readiness; it does not poll job status.
+
 ## OpenCode startup failure
 
 Check the configured binary and run the same-user OpenCode CLI. Managed mode searches the installed executable path and does not execute .cmd or .ps1 shims. Attach mode requires a loopback URL and a matching optional password.

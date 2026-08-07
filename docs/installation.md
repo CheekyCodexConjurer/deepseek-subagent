@@ -28,7 +28,7 @@ Detached:
 
     node .\dist\cli.js start
 
-With -StartDaemon, the installer starts the detached daemon after building. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. Attach mode can be selected in config for an already running loopback OpenCode server.
+The registered MCP now starts the detached local daemon automatically when it connects and the daemon is offline, then waits for the bridge health endpoint before exposing tools. `-StartDaemon` is still available to prewarm it after installation. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. Attach mode can be selected in config for an already running loopback OpenCode server.
 
 ## Uninstall
 

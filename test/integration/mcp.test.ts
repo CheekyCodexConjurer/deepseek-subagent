@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpClient } from "../../src/http-server.js";
-import { createMcpServer } from "../../src/mcp.js";
+import { createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
 
 test("MCP exposes the stable DeepSeek Sub-Agent identity and five tools", async () => {
   const config = createDefaultConfig({
@@ -34,4 +34,31 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and five tools", async 
     await client.close();
     await server.close();
   }
+});
+
+test("MCP startup recovers an offline local daemon before exposing tools", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = false;
+  let healthCalls = 0;
+  let starts = 0;
+  const client = {
+    async health(): Promise<unknown> {
+      healthCalls += 1;
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  await ensureDaemonRunning(config, client, {
+    start: async () => {
+      starts += 1;
+      ready = true;
+    },
+    timeoutMs: 100,
+    retryMs: 1,
+  });
+  assert.equal(starts, 1);
+  assert.equal(healthCalls, 2);
 });

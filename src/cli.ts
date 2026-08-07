@@ -25,7 +25,7 @@ interface CliArgs {
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const parsed = parseArgs(argv);
   if (parsed.command === "mcp") {
-    await runMcp();
+    await runMcp(parsed.configPath);
     return;
   }
   if (parsed.command === "uninstall") {

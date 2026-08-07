@@ -251,7 +251,7 @@ test("explicit deepseek_continue permission fields reply through the OpenCode pe
       task: "Wait for an explicit permission response",
       cwd: directory,
     });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permissionID: "per_fixture" } });
+    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "per_fixture" } } });
     assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
     const continued = await service.continueJob({
       requestId: "request_permission_reply",

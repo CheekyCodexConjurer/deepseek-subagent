@@ -1,20 +1,95 @@
+import { open } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadConfig } from "./config.js";
+import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient } from "./http-server.js";
-import { redactSecrets } from "./security.js";
+import { canRead, ensurePrivateDir, redactSecrets } from "./security.js";
+import type { BridgeConfig } from "./types.js";
 
 const DISPLAY_NAME = "DeepSeek Sub-Agent";
 const MODEL_DISPLAY = "DeepSeek V4 Flash · Max";
 
-export async function runMcp(): Promise<void> {
-  const config = await loadConfig();
+export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
+  const config = await loadConfig(configPath);
+  await ensureMcpConfig(config);
   const client = new BridgeHttpClient(config);
+  await ensureDaemonRunning(config, client);
   const server = createMcpServer(client);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(DISPLAY_NAME + " MCP server connected to the local daemon.");
+}
+
+export interface DaemonHealthClient {
+  health(): Promise<unknown>;
+}
+
+export interface DaemonBootstrapOptions {
+  start?: (config: BridgeConfig) => Promise<void>;
+  timeoutMs?: number;
+  retryMs?: number;
+}
+
+/**
+ * MCP startup is allowed to recover the local daemon once. This is readiness
+ * handling, not a job-status polling loop: the MCP process only waits for the
+ * bridge HTTP endpoint before exposing tools.
+ */
+export async function ensureDaemonRunning(
+  config: BridgeConfig,
+  client: DaemonHealthClient,
+  options: DaemonBootstrapOptions = {},
+): Promise<void> {
+  try {
+    await client.health();
+    return;
+  } catch (error) {
+    // Start below and retain the first failure for a useful timeout message.
+    var lastError: unknown = error;
+  }
+
+  await (options.start ?? startDetachedDaemon)(config);
+  const timeoutMs = options.timeoutMs ?? Math.max(10_000, Math.min(45_000, config.opencodeStartupTimeoutMs + 5_000));
+  const retryMs = options.retryMs ?? 100;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await client.health();
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(Math.min(retryMs, Math.max(1, deadline - Date.now())));
+  }
+  throw new Error("DeepSeek Sub-Agent daemon did not become ready: " + redactSecrets(String(lastError)));
+}
+
+async function ensureMcpConfig(config: BridgeConfig): Promise<void> {
+  await ensurePrivateDir(config.dataDir);
+  if (!(await canRead(config.configPath))) await saveConfig(config);
+}
+
+async function startDetachedDaemon(config: BridgeConfig): Promise<void> {
+  const script = process.argv[1];
+  if (!script) throw new Error("Unable to resolve CLI script for daemon startup");
+  await ensurePrivateDir(config.dataDir);
+  const logHandle = await open(path.join(config.dataDir, "daemon.log"), "a");
+  try {
+    const child = spawn(process.execPath, [script, "daemon", "--config", config.configPath], {
+      detached: true,
+      stdio: ["ignore", logHandle.fd, logHandle.fd],
+      windowsHide: true,
+      shell: false,
+    });
+    child.once("error", () => undefined);
+    child.unref();
+  } finally {
+    await logHandle.close();
+  }
 }
 
 export function createMcpServer(client: BridgeHttpClient): McpServer {
