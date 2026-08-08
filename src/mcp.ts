@@ -101,7 +101,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_spawn", {
     title: DISPLAY_NAME + " · Spawn",
-    description: "Start one asynchronous DeepSeek V4 Flash task in a new OpenCode session. Return immediately after acceptance; do not poll for completion. The daemon delivers the result to the originating Codex thread when a configured App Server correlation exists, otherwise it writes a private inbox result. When the task depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
+    description: "Start one asynchronous DeepSeek V4 Flash task in a new OpenCode session. Return immediately after acceptance; do not poll for completion. Acceptance creates a pending obligation: consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close; a pending job is not a result. The daemon delivers the result to the originating Codex thread when a configured App Server correlation exists, otherwise it writes a private inbox result. When the task depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       request_id: z.string().min(1).optional(),
@@ -123,6 +123,8 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
       agentId: z.string(),
       jobId: z.string(),
       state: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("deepseek_follow"),
     },
   }, async (args) => {
     try {
@@ -135,7 +137,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_continue", {
     title: DISPLAY_NAME + " · Continue",
-    description: "Continue an existing DeepSeek agent in the same OpenCode session after reviewing its delivered result. This is asynchronous and returns immediately. Do not poll. Reject or wait if the agent is busy; use deepseek_abort to stop it. For an explicit OpenCode permission response, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
+    description: "Continue an existing DeepSeek agent in the same OpenCode session after reviewing its delivered result. This is asynchronous and returns immediately. Do not poll. Acceptance creates a pending obligation: consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close; a pending job is not a result. Reject or wait if the agent is busy; use deepseek_abort to stop it. For an explicit OpenCode permission response, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material (images, screenshots, diagrams, UI layouts), inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default): a structured summary with three labeled parts, 'Direct observations:', 'Interpretation:', and 'Uncertainty:'. Send only the orchestrator's textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, respect stated uncertainty, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       request_id: z.string().min(1).optional(),
@@ -157,6 +159,8 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
       agentId: z.string(),
       jobId: z.string(),
       state: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("deepseek_follow"),
     },
   }, async (args) => {
     try {
@@ -190,21 +194,28 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_follow", {
     title: DISPLAY_NAME + " · Follow",
-    description: "Wait for an existing DeepSeek agent only when no useful independent work remains. This call stays open efficiently until completion, deadline, graceful finalization, approval or error, using internal events and one deadline timer without polling. The daemon-configured defaults are the worker's minimum window when the follow window is created or recovered: wait_minutes and grace_minutes below them are raised to the defaults, so a short follow never shortens the worker's deadline, and only larger values extend the window at that creation or recovery. Once a follow window is active, subsequent followers share the existing persisted window and these arguments are ignored. Omit wait_minutes and grace_minutes to use the daemon-configured defaults. When there is no more independent work, use this instead of repeated consult calls.",
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    description: "Wait for a DeepSeek job until it reaches a terminal result, creating a follow window and graceful finalization for that job. This call stays open efficiently until completion, deadline, graceful finalization, approval or error, using internal events and one deadline timer without polling. The daemon-configured defaults are the worker's minimum window when the follow window is created or recovered: wait_minutes and grace_minutes below them are raised to the defaults, so a short follow never shortens the worker's deadline, and only larger values extend the window at that creation or recovery. Once a follow window is active, subsequent followers share the existing persisted window and these arguments are ignored. Omit wait_minutes and grace_minutes to use the daemon-configured defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period. Consume every job your next decision depends on with this tool before a dependent gate or a final response: a pending job is not a result, and an unconsumed job leaves an open obligation.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       agent_id: z.string().min(1),
       job_id: z.string().min(1).optional(),
       wait_minutes: z.number().int().min(1).max(60).optional(),
       grace_minutes: z.number().int().min(1).max(10).optional(),
     },
+    outputSchema: {
+      agentId: z.string(),
+      jobId: z.string(),
+      status: z.string(),
+      resultAvailable: z.boolean(),
+      permissionId: z.string().nullable().optional(),
+      message: z.string().optional(),
+      obligationState: z.union([z.literal("pending"), z.literal("closed")]),
+      nextRequiredAction: z.literal("deepseek_continue").optional(),
+    },
   }, async (args) => {
     try {
       const result = await client.call<Record<string, unknown>>("/v1/jobs/follow", args);
-      return {
-        content: [{ type: "text", text: "DeepSeek Sub-Agent follow completed with an event-driven result." }],
-        structuredContent: result,
-      };
+      return followResult(result);
     } catch (error) {
       return errorResult(error);
     }
@@ -212,11 +223,18 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_abort", {
     title: DISPLAY_NAME + " · Abort",
-    description: "Stop the active DeepSeek task for an agent. This is a control action, not a polling operation.",
+    description: "Stop the active DeepSeek task for an agent and end its pending obligation. This is a control action, not a polling operation.",
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       agent_id: z.string().min(1),
       reason: z.string().max(500).optional(),
+    },
+    outputSchema: {
+      agentId: z.string(),
+      jobId: z.string().nullable().optional(),
+      status: z.string(),
+      state: z.string(),
+      obligationState: z.literal("closed"),
     },
   }, async (args) => {
     try {
@@ -229,10 +247,16 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_close", {
     title: DISPLAY_NAME + " · Close",
-    description: "Close a DeepSeek agent after its work is complete or stopped. It does not delete result history.",
+    description: "Close a DeepSeek agent after its work is complete or stopped, ending any pending obligation. It does not delete result history.",
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       agent_id: z.string().min(1),
+    },
+    outputSchema: {
+      agentId: z.string(),
+      status: z.string(),
+      state: z.string(),
+      obligationState: z.literal("closed"),
     },
   }, async (args) => {
     try {
@@ -267,11 +291,26 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
 function acceptedResult(result: Record<string, unknown>): {
   content: [{ type: "text"; text: string }];
-  structuredContent: Record<string, unknown>;
+  structuredContent: {
+    accepted: true;
+    status: "accepted";
+    topic: unknown;
+    modelDisplayName: unknown;
+    agentId: unknown;
+    jobId: unknown;
+    state: "Starting";
+    obligationState: "pending";
+    nextRequiredAction: "deepseek_follow";
+  };
   _meta: Record<string, unknown>;
 } {
+  const jobId = String(result.jobId ?? "");
   return {
-    content: [{ type: "text", text: "DeepSeek Sub-Agent accepted the task. Result delivery is asynchronous." }],
+    content: [{
+      type: "text",
+      text: "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
+        + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.",
+    }],
     structuredContent: {
       accepted: true,
       status: "accepted",
@@ -280,6 +319,8 @@ function acceptedResult(result: Record<string, unknown>): {
       agentId: result.agentId,
       jobId: result.jobId,
       state: "Starting",
+      obligationState: "pending",
+      nextRequiredAction: "deepseek_follow",
     },
     _meta: {
       technical: {
@@ -288,6 +329,29 @@ function acceptedResult(result: Record<string, unknown>): {
         state: "Starting",
       },
     },
+  };
+}
+
+function followResult(result: Record<string, unknown>): {
+  content: [{ type: "text"; text: string }];
+  structuredContent: Record<string, unknown>;
+} {
+  if (result.status === "needs_approval") {
+    return {
+      content: [{
+        type: "text",
+        text: "DeepSeek Sub-Agent follow requires explicit approval before continuing. Answer with deepseek_continue, providing permission_id and permission_reply, or end the obligation with deepseek_abort or deepseek_close.",
+      }],
+      structuredContent: {
+        ...result,
+        obligationState: "pending",
+        nextRequiredAction: "deepseek_continue",
+      },
+    };
+  }
+  return {
+    content: [{ type: "text", text: "DeepSeek Sub-Agent follow returned a terminal result." }],
+    structuredContent: { ...result, obligationState: "closed" },
   };
 }
 
@@ -300,6 +364,7 @@ function technicalResult(result: Record<string, unknown>, text: string): {
     structuredContent: {
       ...result,
       state: humanState(typeof result.status === "string" ? result.status : ""),
+      obligationState: "closed",
     },
   };
 }
