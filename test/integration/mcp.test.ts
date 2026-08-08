@@ -363,6 +363,8 @@ test("MCP obligation metadata: descriptions, readOnlyHint and output schemas", a
     assert.equal(consult?.annotations?.readOnlyHint, true);
     assert.match(abort?.description ?? "", /end its pending obligation/);
     assert.match(close?.description ?? "", /ending any pending obligation/);
+    assert.equal(abort?.annotations?.destructiveHint, true);
+    assert.equal(close?.annotations?.destructiveHint, false);
     assert.equal(spawn?.annotations?.readOnlyHint, false);
     assert.equal(continueTool?.annotations?.readOnlyHint, false);
     assert.match(spawn?.description ?? "", /pending obligation/);
