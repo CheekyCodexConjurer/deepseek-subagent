@@ -1532,6 +1532,40 @@ test("cancelling follow removes only the waiter and does not abort DeepSeek", as
   }
 });
 
+test("follow floors short wait/grace values at the configured defaults", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-minimum-window-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    followDefaultWaitMinutes: 12,
+    followDefaultGraceMinutes: 4,
+  }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_follow_minimum_window", topic: "Minimum follow window", task: "Keep the default worker budget", cwd: directory });
+    const controller = new AbortController();
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 }, controller.signal);
+    await waitForCondition(() => service.getJob(accepted.jobId)?.status === "following");
+    const following = service.getJob(accepted.jobId);
+    assert.ok(following);
+    assert.ok(Math.abs(Date.parse(following.followDeadlineAt ?? "") - Date.parse(following.followStartedAt ?? "") - 12 * 60_000) < 1_000);
+    assert.equal(following.followGraceMinutes, 4);
+    controller.abort();
+    await assert.rejects(follow, (error: unknown) => error instanceof FollowCancelledError);
+    assert.deepEqual(client.aborted, []);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("approval and session errors resolve follow immediately", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-terminal-"));
   const store = await BridgeStore.open(directory);
@@ -1790,6 +1824,48 @@ test("restart derives the remaining grace window when its marker was not persist
       assert.equal(recovered?.status, "finalizing");
       assert.equal(recovered?.followGraceMinutes, 0.2);
       assert.equal(Date.parse(recovered?.graceDeadlineAt ?? ""), Date.parse(followDeadline) + 0.2 * 60_000);
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart raises a pre-fix short follow window to the configured defaults", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-short-window-restart-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    followDefaultWaitMinutes: 12,
+    followDefaultGraceMinutes: 4,
+  });
+  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await first.start();
+    const accepted = await first.spawn({ requestId: "request_follow_short_window_restart", topic: "Pre-fix window", task: "Persist a pre-fix short window", cwd: directory });
+    const now = Date.now();
+    store.updateJobStatus(accepted.jobId, "following");
+    store.setFollowWindow(accepted.jobId, {
+      startedAt: new Date(now - 60_000).toISOString(),
+      deadlineAt: new Date(now - 1_000).toISOString(),
+      graceMinutes: 1,
+      graceDeadlineAt: null,
+      gracefulFinalizeAttempted: false,
+    });
+    await first.stop();
+
+    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+    try {
+      await second.start();
+      const recovered = second.getJob(accepted.jobId);
+      assert.ok(recovered);
+      assert.equal(recovered.status, "following");
+      assert.ok(Math.abs(Date.parse(recovered.followDeadlineAt ?? "") - Date.parse(recovered.followStartedAt ?? "") - 12 * 60_000) < 1_000);
+      assert.equal(recovered.followGraceMinutes, 4);
     } finally {
       await second.stop();
     }

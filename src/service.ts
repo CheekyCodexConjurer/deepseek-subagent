@@ -417,8 +417,8 @@ export class BridgeService {
 
     const lifecycle = this.ensureFollowLifecycle(
       job,
-      normalizeFollowMinutes(input.waitMinutes, 1, 60, this.config.followDefaultWaitMinutes),
-      normalizeFollowMinutes(input.graceMinutes, 1, 10, this.config.followDefaultGraceMinutes),
+      this.followWindowMinutes(input.waitMinutes, 1, 60, this.config.followDefaultWaitMinutes),
+      this.followWindowMinutes(input.graceMinutes, 1, 10, this.config.followDefaultGraceMinutes),
     );
     const waiter = Symbol("follow-waiter");
     lifecycle.waiters.add(waiter);
@@ -525,15 +525,24 @@ export class BridgeService {
       ?? null;
   }
 
+  private followWindowMinutes(value: number | undefined, minimum: number, maximum: number, fallback: number): number {
+    return Math.max(normalizeFollowMinutes(value, minimum, maximum, fallback), fallback);
+  }
+
   private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): FollowLifecycle {
     const existing = this.followLifecycles.get(job.id);
     if (existing) return existing;
     const now = Date.now();
     const current = this.store.getJob(job.id) ?? job;
     const startedAt = parseTimestamp(current.followStartedAt) ?? now;
-    const deadlineAt = parseTimestamp(current.followDeadlineAt) ?? startedAt + waitMinutes * 60_000;
-    const effectiveGraceMinutes = current.followGraceMinutes ?? graceMinutes;
     const isGracefulFinalization = current.status === "finalizing" || current.gracefulFinalizeAttempted;
+    const requestedDeadlineAt = startedAt + waitMinutes * 60_000;
+    const deadlineAt = isGracefulFinalization
+      ? (parseTimestamp(current.followDeadlineAt) ?? requestedDeadlineAt)
+      : Math.max(parseTimestamp(current.followDeadlineAt) ?? requestedDeadlineAt, requestedDeadlineAt);
+    const effectiveGraceMinutes = isGracefulFinalization
+      ? (current.followGraceMinutes ?? graceMinutes)
+      : Math.max(current.followGraceMinutes ?? graceMinutes, graceMinutes);
     const graceDeadlineAt = parseTimestamp(current.graceDeadlineAt)
       ?? (isGracefulFinalization ? deadlineAt + effectiveGraceMinutes * 60_000 : null);
     if (["dispatching", "running"].includes(current.status)) {

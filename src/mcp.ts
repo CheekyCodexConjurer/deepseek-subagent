@@ -190,7 +190,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_follow", {
     title: DISPLAY_NAME + " · Follow",
-    description: "Wait for an existing DeepSeek agent only when no useful independent work remains. This call stays open efficiently until completion, deadline, graceful finalization, approval or error, using internal events and one deadline timer without polling. Omit wait_minutes and grace_minutes to use the daemon-configured defaults. When there is no more independent work, use this instead of repeated consult calls.",
+    description: "Wait for an existing DeepSeek agent only when no useful independent work remains. This call stays open efficiently until completion, deadline, graceful finalization, approval or error, using internal events and one deadline timer without polling. The daemon-configured defaults are the worker's minimum window when the follow window is created or recovered: wait_minutes and grace_minutes below them are raised to the defaults, so a short follow never shortens the worker's deadline, and only larger values extend the window at that creation or recovery. Once a follow window is active, subsequent followers share the existing persisted window and these arguments are ignored. Omit wait_minutes and grace_minutes to use the daemon-configured defaults. When there is no more independent work, use this instead of repeated consult calls.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       agent_id: z.string().min(1),
