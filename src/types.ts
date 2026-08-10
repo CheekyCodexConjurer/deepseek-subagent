@@ -230,6 +230,7 @@ export interface OpenCodeEvent {
   id?: string;
   type: string;
   properties: Record<string, unknown>;
+  raw?: unknown;
 }
 
 export interface OpenCodeClientLike {

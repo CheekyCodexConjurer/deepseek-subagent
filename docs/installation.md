@@ -18,6 +18,8 @@ Registration is opt-in because it changes the user’s Codex MCP configuration:
 
 The script makes a timestamped backup before invoking codex mcp add. The MCP process is stdio-only; logs go to stderr so stdout remains protocol-clean.
 
+Registration exposes the DeepSeek tools but does not by itself make them the default delegation route. To route unqualified delegation requests to DeepSeek Sub-Agent, merge the canonical routing block from docs/orchestrator-instructions.md into `%USERPROFILE%\.codex\AGENTS.md`.
+
 ## Start the daemon
 
 Foreground:

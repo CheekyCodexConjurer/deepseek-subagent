@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { assertLoopbackUrl, redactSecrets } from "../security.js";
-import { SseParser, parseJsonSseEvent } from "../sse.js";
+import { SseParser, parseJsonSseEvent, type ParsedSseEvent } from "../sse.js";
 import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, OpenCodeSession } from "../types.js";
 
 export interface OpenCodeClientOptions {
@@ -9,6 +9,7 @@ export interface OpenCodeClientOptions {
   password?: string | null;
   reconnectMaxMs?: number;
   requestTimeoutMs?: number;
+  streamInactivityMs?: number;
 }
 
 function encodePath(value: string): string {
@@ -32,6 +33,7 @@ export class OpenCodeClient implements OpenCodeClientLike {
   private readonly headers: Record<string, string>;
   private readonly reconnectMaxMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly streamInactivityMs: number;
 
   constructor(options: OpenCodeClientOptions) {
     const url = assertLoopbackUrl(options.baseUrl);
@@ -42,6 +44,7 @@ export class OpenCodeClient implements OpenCodeClientLike {
     }
     this.reconnectMaxMs = options.reconnectMaxMs ?? 30_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.streamInactivityMs = options.streamInactivityMs ?? 60_000;
   }
 
   async health(): Promise<{ healthy: boolean; version?: string }> {
@@ -135,50 +138,77 @@ export class OpenCodeClient implements OpenCodeClientLike {
     onEvent: (event: OpenCodeEvent) => Promise<void> | void,
     signal?: AbortSignal,
   ): Promise<void> {
-    const response = await fetch(this.baseUrl + "/event", {
-      method: "GET",
-      headers: { ...this.headers, accept: "text/event-stream" },
-      ...(signal ? { signal } : {}),
-    });
-    if (!response.ok) {
-      throw new OpenCodeHttpError(response.status, "GET", this.baseUrl + "/event", await response.text());
-    }
-    if (!response.body) throw new Error("OpenCode event stream returned no body");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    const parser = new SseParser();
+    const connection = new AbortController();
+    const onAbort = () => connection.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      while (true) {
-        const next = await reader.read();
-        if (next.done) break;
-        const frames = parser.feed(decoder.decode(next.value, { stream: true }));
-        for (const frame of frames) {
-          const value = parseJsonSseEvent(frame);
-          if (!value) continue;
-          const type = typeof value.type === "string" ? value.type : frame.event ?? "unknown";
-          const properties = isRecord(value.properties) ? value.properties : value;
-          await onEvent({
-            type,
-            properties,
-            ...(frame.id ? { id: frame.id } : {}),
-          });
+      const response = await fetch(this.baseUrl + "/global/event", {
+        method: "GET",
+        headers: { ...this.headers, accept: "text/event-stream" },
+        signal: connection.signal,
+      });
+      if (!response.ok) {
+        throw new OpenCodeHttpError(response.status, "GET", this.baseUrl + "/global/event", await response.text());
+      }
+      if (!response.body) throw new Error("OpenCode event stream returned no body");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const parser = new SseParser();
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
+      const armWatchdog = () => {
+        if (watchdog) clearTimeout(watchdog);
+        if (connection.signal.aborted) return;
+        watchdog = setTimeout(() => {
+          if (!connection.signal.aborted) connection.abort();
+        }, this.streamInactivityMs);
+        watchdog.unref?.();
+      };
+      try {
+        armWatchdog();
+        while (true) {
+          const next = await reader.read();
+          if (next.done) break;
+          armWatchdog();
+          const frames = parser.feed(decoder.decode(next.value, { stream: true }));
+          for (const frame of frames) {
+            await this.dispatchEventFrame(frame, onEvent);
+          }
         }
+        for (const frame of parser.flush()) {
+          await this.dispatchEventFrame(frame, onEvent);
+        }
+        throw new Error("OpenCode event stream ended");
+      } finally {
+        if (watchdog) clearTimeout(watchdog);
+        reader.releaseLock();
       }
-      for (const frame of parser.flush()) {
-        const value = parseJsonSseEvent(frame);
-        if (!value) continue;
-        const type = typeof value.type === "string" ? value.type : frame.event ?? "unknown";
-        const properties = isRecord(value.properties) ? value.properties : value;
-        await onEvent({
-          type,
-          properties,
-          ...(frame.id ? { id: frame.id } : {}),
-        });
+    } catch (error) {
+      if (connection.signal.aborted && !signal?.aborted) {
+        throw new Error("OpenCode event stream received no data for " + this.streamInactivityMs + "ms");
       }
-      throw new Error("OpenCode event stream ended");
+      throw error;
     } finally {
-      reader.releaseLock();
+      signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  private async dispatchEventFrame(
+    frame: ParsedSseEvent,
+    onEvent: (event: OpenCodeEvent) => Promise<void> | void,
+  ): Promise<void> {
+    const value = parseJsonSseEvent(frame);
+    if (!value) return;
+    const payload = isRecord(value.payload) ? value.payload : null;
+    const source = payload ?? value;
+    const type = typeof source.type === "string" ? source.type : frame.event ?? "unknown";
+    const properties = isRecord(source.properties) ? source.properties : source;
+    const id = typeof source.id === "string" ? source.id : frame.id;
+    await onEvent({
+      type,
+      properties,
+      ...(id ? { id } : {}),
+      raw: value,
+    });
   }
 
   private async request<T>(

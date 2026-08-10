@@ -53,7 +53,7 @@ export async function buildWorkerPrompt(
 ): Promise<string> {
   const task = truncate(redactSecrets(input.task.trim()), options.maxLength);
   if (!task) throw new Error("Task must not be empty");
-  const mode = "mode" in input ? input.mode ?? "analyze" : "analyze";
+  const mode = "mode" in input ? input.mode ?? "analyze" : undefined;
   const workspaceStrategy = "workspaceStrategy" in input ? input.workspaceStrategy ?? "shared" : "shared";
   const context = "contextFiles" in input ? input.contextFiles ?? [] : [];
   const absoluteContext = validateContextFiles(workspacePath, context);
@@ -62,6 +62,12 @@ export async function buildWorkerPrompt(
     : await readContextFiles(absoluteContext);
   const relation = "relation" in input && input.relation ? input.relation : "new task";
   const visualContextText = visualContextSection(input.visualContext);
+  const operatingRuleLines = mode
+    ? ["Operating rule: " + MODE_RULES[mode]]
+    : [
+        "Operating rule: Continue under the operating mode already established in this OpenCode session.",
+        "Any prior GRACEFUL_FINALIZE_PROMPT stop was scoped to the expired job; this accepted continuation authorizes the current task without broadening the session's original permissions.",
+      ];
 
   return [
     "You are a local DeepSeek sub-agent orchestrated by Codex.",
@@ -70,7 +76,7 @@ export async function buildWorkerPrompt(
     "Workspace: " + workspacePath,
     "Workspace strategy: " + workspaceStrategy,
     "Request relation: " + relation,
-    "Operating rule: " + MODE_RULES[mode],
+    ...operatingRuleLines,
     "",
     "At completion, use these exact headings in your final response:",
     "STATUS: completed|failed|needs_approval",

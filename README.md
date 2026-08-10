@@ -26,6 +26,10 @@ Run the idempotent installer from PowerShell after building:
 
 It backs up Codex configuration before registration, creates only the bridge-owned data directory, and does not delete result history during uninstall. See docs/installation.md and docs/discovery.md for the detected local capabilities.
 
+## Route delegation to DeepSeek
+
+MCP registration exposes the DeepSeek tools but does not by itself make them the default delegation route. Codex App users merge the canonical routing block from docs/orchestrator-instructions.md into `%USERPROFILE%\.codex\AGENTS.md`.
+
 ## Tools
 
 - deepseek_spawn: new topic, new agent and new OpenCode session.

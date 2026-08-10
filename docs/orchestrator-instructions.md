@@ -1,5 +1,19 @@
 # Orchestrator contract
 
+## Canonical routing block
+
+MCP registration exposes the DeepSeek tools but does not by itself make them the default delegation route. Codex App users merge the block below into `%USERPROFILE%\.codex\AGENTS.md`:
+
+```text
+## DeepSeek Sub-Agent routing
+
+- With or without $workflows, unqualified requests/terms such as sub-agent(s), agents, workers, readers, writers, explorers, reviewers or delegation mean the DeepSeek Sub-Agent MCP (`deepseek_spawn`, `deepseek_continue`, `deepseek_follow`).
+- Do not use Codex native sub-agents (`multi_agent_v1__spawn_agent`, `spawn_agent`, `wait_agent`) unless the user explicitly requests them.
+- If DeepSeek MCP tools are unavailable, fail closed and report the blocker; never silently fall back to native Codex sub-agents or local repository work.
+- Every accepted DeepSeek job must be followed to a terminal result before dependent synthesis or final response.
+- $workflows adds the formal mode/lifecycle contract but is not required for selecting the DeepSeek MCP backend.
+```
+
 When delegating work to DeepSeek:
 
 1. Start the independent task with `deepseek_spawn`. Provide a concise topic, the complete task, the intended mode and an explicit workspace when it matters.
