@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import path from "node:path";
 import { canRead, ensurePrivateDir, redactSecrets, truncate, writePrivateFileExclusive } from "../security.js";
 import type { ResultEnvelope } from "../types.js";
@@ -10,7 +9,7 @@ export type UserNotifier = (title: string, message: string) => Promise<void>;
 export class InboxDelivery {
   constructor(
     private readonly dataDir: string,
-    private readonly notify: UserNotifier = notifyUser,
+    private readonly notify: UserNotifier = noopNotifier,
   ) {}
 
   async deliver(envelope: ResultEnvelope, humanText: string): Promise<string> {
@@ -68,27 +67,6 @@ function noticeFilePath(dataDir: string, jobId: string, kind: string, permission
   return path.join(dataDir, "inbox", jobId + "-" + kind + permissionSuffix + ".json");
 }
 
-async function notifyUser(title: string, message: string): Promise<void> {
-  const safeTitle = truncate(redactSecrets(title).replace(/[\r\n]/g, " "), 80);
-  const safeMessage = truncate(redactSecrets(message).replace(/[\r\n]/g, " "), 240);
-  if (process.platform === "win32") {
-    const child = spawn("msg.exe", ["*", safeTitle + ": " + safeMessage], {
-      shell: false,
-      windowsHide: true,
-      stdio: "ignore",
-    });
-    child.on("error", () => undefined);
-    child.unref();
-    return;
-  }
-  if (process.platform === "darwin") {
-    const script = "display notification " + JSON.stringify(safeMessage) + " with title " + JSON.stringify(safeTitle);
-    const child = spawn("osascript", ["-e", script], { shell: false, stdio: "ignore" });
-    child.on("error", () => undefined);
-    child.unref();
-    return;
-  }
-  const child = spawn("notify-send", [safeTitle, safeMessage], { shell: false, stdio: "ignore" });
-  child.on("error", () => undefined);
-  child.unref();
+async function noopNotifier(): Promise<void> {
+  return undefined;
 }
