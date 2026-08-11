@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { OpenCodeClient } from "../../src/opencode/client.js";
+import { OpenCodeClient, OpenCodeHttpError, OpenCodeTransportError } from "../../src/opencode/client.js";
 import type { OpenCodeEvent } from "../../src/types.js";
 
 const GLOBAL_EVENT_PATH = "/global/event";
@@ -219,6 +219,45 @@ test(
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test("OpenCodeClient wraps pre-response transport failures in OpenCodeTransportError", async () => {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = probe.address();
+  assert.ok(address && typeof address === "object");
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const client = new OpenCodeClient({ baseUrl: "http://127.0.0.1:" + address.port });
+  await assert.rejects(() => client.listMessages("session_refused"), (error: unknown) => {
+    assert.ok(error instanceof OpenCodeTransportError, "transport failures must not be definite HTTP rejections");
+    assert.match(error.message, /before an HTTP response/);
+    assert.ok((error as Error).cause !== undefined);
+    return true;
+  });
+});
+
+test("definite HTTP rejections remain OpenCodeHttpError", async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "not found" }));
+  });
+  await listen(server);
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new OpenCodeClient({ baseUrl: "http://127.0.0.1:" + address.port });
+    await assert.rejects(() => client.listMessages("session_missing"), (error: unknown) => {
+      assert.ok(error instanceof OpenCodeHttpError);
+      assert.equal(error.status, 404);
+      assert.match(error.message, /HTTP 404/);
+      return true;
+    });
+  } finally {
+    await close(server);
+  }
+});
 
 async function listen(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {

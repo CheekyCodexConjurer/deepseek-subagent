@@ -28,6 +28,25 @@ export class OpenCodeHttpError extends Error {
   }
 }
 
+/**
+ * A request failed before an HTTP status was received (timeout, connection or
+ * transport failure). The prompt may still have been accepted server-side, so
+ * callers must not treat this as a definite rejection.
+ */
+export class OpenCodeTransportError extends Error {
+  constructor(
+    readonly method: string,
+    readonly url: string,
+    reason: string,
+    cause?: unknown,
+  ) {
+    const causeText = cause !== undefined ? "; cause: " + redactSecrets(String(cause)) : "";
+    super(method + " " + url + " failed before an HTTP response: " + reason + causeText);
+    this.name = "OpenCodeTransportError";
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
 export class OpenCodeClient implements OpenCodeClientLike {
   readonly baseUrl: string;
   private readonly headers: Record<string, string>;
@@ -74,7 +93,7 @@ export class OpenCodeClient implements OpenCodeClientLike {
     await this.request<void>("POST", "/session/" + encodePath(sessionId) + "/prompt_async", {
       body,
       acceptedStatus: [200, 201, 202, 204],
-      timeoutMs: 30_000,
+      timeoutMs: 60_000,
     });
   }
 
@@ -230,8 +249,10 @@ export class OpenCodeClient implements OpenCodeClientLike {
         signal: controller.signal,
       });
     } catch (error) {
-      if (controller.signal.aborted) throw new Error(method + " " + pathname + " timed out");
-      throw error;
+      if (controller.signal.aborted) {
+        throw new OpenCodeTransportError(method, pathname, "timed out", error);
+      }
+      throw new OpenCodeTransportError(method, pathname, String(error), error);
     } finally {
       clearTimeout(timeout);
     }

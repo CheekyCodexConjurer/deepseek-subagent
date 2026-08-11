@@ -17,11 +17,51 @@ export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   const config = await loadConfig(configPath);
   await ensureMcpConfig(config);
   const client = new BridgeHttpClient(config);
-  await ensureDaemonRunning(config, client);
-  const server = createMcpServer(client);
+  // The MCP handshake and tool listing must never wait for daemon or OpenCode
+  // startup. Daemon readiness is bootstrapped lazily on the first tool call,
+  // memoized, and shared by concurrent first operations.
+  const server = createMcpServer(client, {
+    ensureReady: createLazyDaemonBootstrap(config, client),
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(DISPLAY_NAME + " MCP server connected to the local daemon.");
+  console.error(DISPLAY_NAME + " MCP server connected; daemon readiness is bootstrapped on the first tool call.");
+}
+
+/**
+ * Returns a memoized single-flight daemon readiness bootstrap. The first tool
+ * operation triggers the daemon health check and, if offline, the one-time
+ * recovery start. Concurrent first operations share the same bootstrap.
+ * A failure resets the memo so a later operation can retry, and each tool call
+ * surfaces a clear readiness error.
+ */
+export function createLazyDaemonBootstrap(
+  config: BridgeConfig,
+  client: DaemonHealthClient,
+  options: DaemonBootstrapOptions = {},
+): () => Promise<void> {
+  let readyPromise: Promise<void> | null = null;
+  return () => {
+    if (!readyPromise) {
+      readyPromise = ensureDaemonRunning(config, client, options).catch((error) => {
+        readyPromise = null;
+        throw new Error("DeepSeek Sub-Agent daemon is not ready: " + redactSecrets(String(error)));
+      });
+    }
+    return readyPromise;
+  };
+}
+
+class LazyReadyClient {
+  constructor(
+    private readonly client: Pick<BridgeHttpClient, "call">,
+    private readonly ensureReady: () => Promise<void>,
+  ) {}
+
+  async call<T>(pathname: string, body?: unknown): Promise<T> {
+    await this.ensureReady();
+    return this.client.call<T>(pathname, body);
+  }
 }
 
 export interface DaemonHealthClient {
@@ -92,12 +132,16 @@ async function startDetachedDaemon(config: BridgeConfig): Promise<void> {
   }
 }
 
-export function createMcpServer(client: BridgeHttpClient): McpServer {
+export function createMcpServer(
+  client: BridgeHttpClient,
+  options: { ensureReady?: () => Promise<void> } = {},
+): McpServer {
   const server = new McpServer({
     name: "deepseek-subagent",
     title: DISPLAY_NAME,
     version: "0.1.0",
   });
+  const readyClient = options.ensureReady ? new LazyReadyClient(client, options.ensureReady) : client;
 
   server.registerTool("deepseek_spawn", {
     title: DISPLAY_NAME + " · Spawn",
@@ -128,7 +172,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/spawn", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", args);
       return acceptedResult(result);
     } catch (error) {
       return errorResult(error);
@@ -164,7 +208,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/continue", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", args);
       return acceptedResult(result);
     } catch (error) {
       return errorResult(error);
@@ -182,7 +226,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/consult", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args);
       return {
         content: [{ type: "text", text: "Observable DeepSeek progress snapshot returned." }],
         structuredContent: result,
@@ -194,7 +238,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
 
   server.registerTool("deepseek_follow", {
     title: DISPLAY_NAME + " · Follow",
-    description: "Wait for a DeepSeek job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period. Terminal results close the obligation; needs_approval keeps it pending and requires deepseek_continue with permission_id and permission_reply.",
+    description: "Wait for a DeepSeek job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. A terminal follow result closes the job obligation only: the DeepSeek agent stays open and continuable until you close it with deepseek_close after reviewing. Completed, failed and timed-out agents remain continuable with deepseek_continue. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period. Terminal results close the obligation; needs_approval keeps it pending and requires deepseek_continue with permission_id and permission_reply.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       agent_id: z.string().min(1),
@@ -214,7 +258,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/follow", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args);
       return followResult(result);
     } catch (error) {
       return errorResult(error);
@@ -238,7 +282,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/abort", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args);
       return technicalResult(result, "DeepSeek task stopped.");
     } catch (error) {
       return errorResult(error);
@@ -260,7 +304,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<Record<string, unknown>>("/v1/jobs/close", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args);
       return technicalResult(result, "DeepSeek agent closed.");
     } catch (error) {
       return errorResult(error);
@@ -277,7 +321,7 @@ export function createMcpServer(client: BridgeHttpClient): McpServer {
     },
   }, async (args) => {
     try {
-      const result = await client.call<unknown>("/v1/jobs/recover", args);
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", args);
       return {
         content: [{ type: "text", text: "Persisted DeepSeek result recovered." }],
         structuredContent: { result },
@@ -305,12 +349,14 @@ function acceptedResult(result: Record<string, unknown>): {
   _meta: Record<string, unknown>;
 } {
   const jobId = String(result.jobId ?? "");
+  const uncertain = result.outcome === "dispatch_unknown";
+  const text = uncertain
+    ? "DeepSeek Sub-Agent accepted the task; OpenCode dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: " + jobId
+      + ". Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with deepseek_follow, or explicitly abort/close it, before a dependent gate or a final response."
+    : "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
+      + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.";
   return {
-    content: [{
-      type: "text",
-      text: "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
-        + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.",
-    }],
+    content: [{ type: "text", text }],
     structuredContent: {
       accepted: true,
       status: "accepted",
@@ -350,7 +396,7 @@ function followResult(result: Record<string, unknown>): {
     };
   }
   return {
-    content: [{ type: "text", text: "DeepSeek Sub-Agent follow returned a terminal result." }],
+    content: [{ type: "text", text: "DeepSeek Sub-Agent follow returned a terminal result. The job obligation is closed; the DeepSeek agent itself remains open and continuable. Close it with deepseek_close after reviewing the result." }],
     structuredContent: { ...result, obligationState: "closed" },
   };
 }

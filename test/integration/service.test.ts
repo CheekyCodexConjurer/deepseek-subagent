@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { createDefaultConfig } from "../../src/config.js";
 import type { CodexCorrelation, CodexDeliveryAdapter } from "../../src/codex/adapter.js";
 import { InboxDelivery } from "../../src/delivery/inbox.js";
+import { OpenCodeHttpError, OpenCodeTransportError } from "../../src/opencode/client.js";
 import { BridgeStore } from "../../src/store.js";
 import { BridgeBusyError, BridgeService, FollowCancelledError, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
 import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
@@ -529,6 +530,9 @@ test("identical idle events are deduplicated per job, not per session", async ()
     await client.emit(idle);
     const second = await service.continueJob({ requestId: "request_event_scope_second", agentId: first.agentId, relation: "continuation", task: "Complete second turn" });
     client.messages = [{
+      info: { id: "assistant_event_scope", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: first turn" }],
+    }, {
       info: { id: "assistant_event_scope_second", role: "assistant", sessionID: "session_1" },
       parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: second turn" }],
     }];
@@ -723,6 +727,9 @@ test("restart does not reconcile a continuation from the prior assistant message
       assert.equal(second.getJob(continued.jobId)?.status, "running");
       assert.equal(inbox.delivered.filter((jobId) => jobId === continued.jobId).length, 0);
       client.messages = [{
+        info: { id: "assistant_continuation_previous", role: "assistant", sessionID: "session_1" },
+        parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: previous turn" }],
+      }, {
         info: { id: "assistant_continuation_current", role: "assistant", sessionID: "session_1" },
         parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: current turn" }],
       }];
@@ -1972,6 +1979,9 @@ test("visual context is embedded only when supplied, for spawn and continue", as
     assert.doesNotMatch(client.promptCalls[2]?.task ?? "", /VISUAL CONTEXT FROM CODEX/);
 
     client.messages = [{
+      info: { id: "assistant_visual_plain", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
+    }, {
       info: { id: "assistant_visual_continue_plain", role: "assistant", sessionID: "session_1" },
       parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: continue seed turn" }],
     }];
@@ -2023,6 +2033,684 @@ test("visual context is redacted and truncated deterministically before dispatch
     assert.match(prompt, /Direct observations:/);
     assert.match(prompt, /Interpretation:\nNone provided\./);
   } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("transport-failed spawn dispatch resolves accepted with followable IDs and no duplicate dispatch", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  client.blockPrompt();
+  client.promptErrors.push(new OpenCodeTransportError("POST", "/session/session_1/prompt_async", "timed out"));
+  try {
+    await service.start();
+    const spawn = service.spawn({ requestId: "request_dispatch_unknown", topic: "Unknown dispatch", task: "Transport may have accepted", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 1);
+    client.releasePrompt();
+    const accepted = await spawn;
+    assert.equal(accepted.accepted, true, "an unknown transport outcome must resolve as an accepted bridge obligation");
+    assert.equal(accepted.outcome, "dispatch_unknown");
+    assert.equal(accepted.agentId, store.listAgents()[0]?.id);
+    assert.equal(accepted.jobId, store.listJobs()[0]?.id);
+    const job = service.getJob(accepted.jobId);
+    assert.ok(job);
+    assert.equal(job.status, "following", "mandatory follow must arm the deadline for an unaccepted prompt");
+    assert.ok(Math.abs(Date.parse(job.followDeadlineAt ?? "") - Date.parse(job.followStartedAt ?? "") - 20 * 60_000) < 1_000);
+    assert.equal(job.followGraceMinutes, 5);
+    assert.equal(service.getAgent(accepted.agentId)?.status, "working", "the agent must not be marked failed");
+    assert.match(job.error ?? "", /outcome unknown/i);
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_dispatch_unknown_duplicate",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Must not create a duplicate continuation",
+    }), /busy/);
+    assert.equal(client.promptCalls.length, 1, "no second prompt dispatch may occur");
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    const aborted = await service.abort(accepted.agentId, "settle by abort");
+    assert.equal(aborted.jobId, accepted.jobId);
+    assert.equal((await follow).status, "aborted");
+    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
+    assert.equal(client.promptCalls.length, 1);
+  } finally {
+    client.releasePrompt();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("transport-failed continue dispatch resolves accepted and settles through the armed follow deadline", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-continue-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const internal = service as unknown as {
+    timeoutFollow(jobId: string): Promise<void>;
+  };
+  try {
+    await service.start();
+    const seed = await service.spawn({ requestId: "request_dispatch_unknown_seed", topic: "Unknown continue", task: "Seed the session", cwd: directory });
+    client.messages = [{
+      info: { id: "assistant_unknown_continue_seed", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(service.getJob(seed.jobId)?.status, "delivered");
+    client.blockPrompt();
+    client.promptErrors.push(new OpenCodeTransportError("POST", "/session/session_1/prompt_async", "connection reset"));
+    const continuation = service.continueJob({
+      requestId: "request_dispatch_unknown_continue",
+      agentId: seed.agentId,
+      relation: "continuation",
+      task: "Transport may have accepted",
+    });
+    await waitForCondition(() => client.promptCalls.length === 2);
+    client.releasePrompt();
+    const accepted = await continuation;
+    assert.equal(accepted.accepted, true, "an unknown continue outcome must resolve as an accepted bridge obligation");
+    assert.equal(accepted.outcome, "dispatch_unknown");
+    assert.equal(accepted.jobId, store.listJobs()[0]?.id);
+    const job = service.getJob(accepted.jobId);
+    assert.ok(job);
+    assert.equal(job.status, "following");
+    assert.ok(job.followDeadlineAt);
+    assert.equal(job.lastAssistantMessageId, "assistant_unknown_continue_seed", "the continuation baseline must be preserved");
+    assert.equal(client.promptCalls.length, 2, "seed plus the single uncertain continuation, no duplicates");
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    store.updateJobStatus(accepted.jobId, "finalizing");
+    await internal.timeoutFollow(accepted.jobId);
+    const result = await follow;
+    assert.equal(result.status, "timed_out", "the armed follow deadline must settle an unaccepted prompt");
+    assert.equal(service.getAgent(accepted.agentId)?.status, "timed_out");
+    assert.equal(client.promptCalls.length, 2, "settlement must not dispatch the task a second time");
+  } finally {
+    client.releasePrompt();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("definite HTTP dispatch rejection still fails the job and agent", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-definite-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  client.promptErrors.push(new OpenCodeHttpError(400, "POST", "http://127.0.0.1:1/session/session_1/prompt_async", "bad request"));
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({ requestId: "request_dispatch_definite", topic: "Definite dispatch", task: "Fail loudly", cwd: directory }), /HTTP 400/);
+    const job = store.listJobs()[0];
+    assert.ok(job);
+    assert.equal(job.status, "failed");
+    assert.equal(service.getAgent(job.agentId)?.status, "failed");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery keeps an unknown-outcome job under its armed follow and settles on events", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-recovery-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  client.blockPrompt();
+  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "connection reset"));
+  try {
+    await first.start();
+    const spawn = first.spawn({ requestId: "request_dispatch_unknown_recovery", topic: "Unknown recovery", task: "Survive restart", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 1);
+    client.releasePrompt();
+    const accepted = await spawn;
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.outcome, "dispatch_unknown");
+    assert.equal(first.getJob(accepted.jobId)?.status, "following");
+    client.messages = [{
+      info: { id: "assistant_unknown_recovery", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: finished before the daemon restarted" }],
+    }];
+    await first.stop();
+
+    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+    try {
+      await second.start();
+      assert.equal(second.getJob(accepted.jobId)?.status, "following", "restart must re-arm the follow for the active unknown-outcome job");
+      assert.ok(second.getJob(accepted.jobId)?.followDeadlineAt);
+      await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+      assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    client.releasePrompt();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("message.part.delta events are not persisted while meaningful events remain", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-delta-suppression-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const countEvents = () => (store.db.prepare("SELECT COUNT(*) AS count FROM events").get() as { count: number }).count;
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_delta_suppression", topic: "Delta suppression", task: "Ignore streaming deltas", cwd: directory });
+    const activityBefore = store.listActivity(accepted.agentId).length;
+    const eventsBefore = countEvents();
+    for (let index = 0; index < 25; index += 1) {
+      await client.emit({ type: "message.part.delta", properties: { sessionID: "session_1", delta: { text: "partial" } } });
+    }
+    assert.equal(store.listActivity(accepted.agentId).length, activityBefore, "deltas must not add activity rows");
+    assert.equal(countEvents(), eventsBefore, "deltas must not add event ledger rows");
+    client.messages = [{
+      info: { id: "assistant_delta_suppression", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: completed after deltas" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("idle with tool-only assistant output never completes; real output completes later", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-empty-tail-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_empty_tail", topic: "Empty tail", task: "Produce no visible output", cwd: directory });
+    client.messages = [{
+      info: { id: "assistant_tool_only", role: "assistant", sessionID: "session_1" },
+      parts: [
+        { type: "reasoning", text: "private reasoning" },
+        { type: "tool", text: "tool payload" },
+      ],
+    }];
+    await client.emit({ type: "session.idle", id: "idle_empty_tail_one", properties: { sessionID: "session_1" } });
+    assert.equal(service.getJob(accepted.jobId)?.status, "running", "a tool-only tail must not complete the job");
+    assert.equal(service.getAgent(accepted.agentId)?.status, "working");
+    client.messages = [{
+      info: { id: "assistant_tool_only", role: "assistant", sessionID: "session_1" },
+      parts: [
+        { type: "reasoning", text: "private reasoning" },
+        { type: "tool", text: "tool payload" },
+        { type: "text", text: "STATUS: completed\nSUMMARY: real output after the empty tail" },
+      ],
+    }];
+    await client.emit({ type: "session.idle", id: "idle_empty_tail_two", properties: { sessionID: "session_1" } });
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart reconciliation does not complete an empty-tail job", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-empty-tail-recovery-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await first.start();
+    const accepted = await first.spawn({ requestId: "request_empty_tail_recovery", topic: "Empty tail recovery", task: "Stay fail-closed", cwd: directory });
+    client.messages = [{
+      info: { id: "assistant_empty_tail", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "tool", text: "no visible text" }],
+    }];
+    await client.emit({ type: "session.idle", id: "idle_empty_tail_recovery_one", properties: { sessionID: "session_1" } });
+    assert.equal(first.getJob(accepted.jobId)?.status, "running");
+    await first.stop();
+
+    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+    try {
+      await second.start();
+      assert.equal(second.getJob(accepted.jobId)?.status, "running", "reconciliation must not turn an empty-tail job into a completed success");
+      client.messages = [{
+        info: { id: "assistant_empty_tail_text", role: "assistant", sessionID: "session_1" },
+        parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: visible output after recovery" }],
+      }];
+      await client.emit({ type: "session.idle", id: "idle_empty_tail_recovery_two", properties: { sessionID: "session_1" } });
+      assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("abort auto-closes the agent and keeps it non-continuable", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-close-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_abort_close", topic: "Abort close", task: "End cleanly", cwd: directory });
+    await service.abort(accepted.agentId, "test stop");
+    assert.equal(service.getAgent(accepted.agentId)?.status, "closed", "aborted agents are non-continuable and auto-close safely");
+    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_abort_close_continue",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Must be rejected",
+    }), /not continuable/);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed and timed-out writers remain continuable until closed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-writer-lifecycle-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const internal = service as unknown as {
+    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<unknown> };
+  };
+  try {
+    await service.start();
+    const failed = await service.spawn({ requestId: "request_writer_failed_seed", topic: "Failed writer", task: "Fail the seed", cwd: directory });
+    client.messages = [{
+      info: { id: "assistant_writer_failed_seed", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    client.promptErrors.push(new OpenCodeHttpError(503, "POST", "/prompt_async", "unavailable"));
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_writer_failed_second",
+      agentId: failed.agentId,
+      relation: "continuation",
+      task: "Trigger a definite failure",
+    }), /HTTP 503/);
+    assert.equal(service.getAgent(failed.agentId)?.status, "failed");
+    const continuedAfterFailure = await service.continueJob({
+      requestId: "request_writer_failed_continue",
+      agentId: failed.agentId,
+      relation: "continuation",
+      task: "A failed writer stays continuable",
+    });
+    assert.equal(continuedAfterFailure.status, "accepted");
+
+    const timedOut = await service.spawn({ requestId: "request_writer_timeout_seed", topic: "Timeout writer", task: "Hit the grace deadline", cwd: directory });
+    const job = service.getJob(timedOut.jobId);
+    assert.ok(job);
+    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
+    assert.equal((await lifecycle.promise).status, "timed_out");
+    assert.equal(service.getAgent(timedOut.agentId)?.status, "timed_out");
+    const continuedAfterTimeout = await service.continueJob({
+      requestId: "request_writer_timeout_continue",
+      agentId: timedOut.agentId,
+      relation: "continuation",
+      task: "A timed-out writer stays continuable",
+    });
+    assert.equal(continuedAfterTimeout.status, "accepted");
+
+    await service.close(failed.agentId);
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_writer_closed_continue",
+      agentId: failed.agentId,
+      relation: "continuation",
+      task: "Closed writers are not continuable",
+    }), /not continuable/);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn and continue persist validated MCP thread/turn hints without authorizing delivery", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-hints-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  const codex = new FakeCodex();
+  const service = new BridgeService(createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    codexCorrelationWindowMs: 25,
+    experimentalSameChatDelivery: true,
+  }), {
+    store,
+    manager: new FakeManager(client),
+    inbox,
+    codex,
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_hint_spawn",
+      topic: "Hint fixture",
+      task: "Record MCP hints",
+      cwd: directory,
+      threadId: "thread_mcp",
+      turnId: "turn_mcp",
+    });
+    const hinted = service.getJob(accepted.jobId);
+    assert.equal(hinted?.hintThreadId, "thread_mcp");
+    assert.equal(hinted?.hintTurnId, "turn_mcp");
+    assert.equal(hinted?.hintSource, "mcp");
+    assert.equal(store.getBinding(accepted.jobId), null, "hints must never be synthesized into bindings");
+
+    client.messages = [{
+      info: { id: "assistant_hint_seed", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: hint seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+
+    const continued = await service.continueJob({
+      requestId: "request_hint_continue",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Record a turn-only hint",
+      turnId: "turn_continuation",
+    });
+    const hintedContinue = service.getJob(continued.jobId);
+    assert.equal(hintedContinue?.hintThreadId, null);
+    assert.equal(hintedContinue?.hintTurnId, "turn_continuation");
+    assert.equal(hintedContinue?.hintSource, "mcp");
+
+    const plain = await service.spawn({
+      requestId: "request_hint_plain",
+      topic: "Plain fixture",
+      task: "Record no hints",
+      cwd: directory,
+    });
+    assert.equal(service.getJob(plain.jobId)?.hintThreadId, null);
+    assert.equal(service.getJob(plain.jobId)?.hintSource, null);
+
+    const status = service.status();
+    assert.equal(status.correlation.hints, 2);
+    assert.equal(status.correlation.bindings, 0);
+
+    await waitForCondition(() => inbox.delivered.includes(accepted.jobId), 1_000);
+    assert.deepEqual(codex.delivered, [], "a hint alone must not authorize Codex delivery");
+    assert.equal(store.getBinding(accepted.jobId), null);
+    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("approval-resume with unknown transport resolves accepted and settles through the armed deadline", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-resume-unknown-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const internal = service as unknown as {
+    timeoutFollow(jobId: string): Promise<void>;
+  };
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_resume_unknown", topic: "Resume unknown", task: "Wait for approval", cwd: directory });
+    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_resume_unknown" } } });
+    assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
+    client.blockPrompt();
+    client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
+    const continuation = service.continueJob({
+      requestId: "request_resume_unknown_continue",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Resume the approval",
+    });
+    await waitForCondition(() => client.promptCalls.length === 2);
+    client.releasePrompt();
+    const resumed = await continuation;
+    assert.equal(resumed.accepted, true, "an unknown approval-resume must resolve accepted");
+    assert.equal(resumed.outcome, "dispatch_unknown");
+    assert.equal(resumed.jobId, accepted.jobId, "the original job id must be preserved");
+    const job = service.getJob(accepted.jobId);
+    assert.equal(job?.status, "following", "approval-resume must arm the follow deadline");
+    assert.ok(job?.followDeadlineAt);
+    assert.equal(job?.permissionId, null, "the resumed permission is cleared");
+    assert.equal(job?.dispatchUnknown, true);
+    assert.equal(client.promptCalls.length, 2, "no second submission on the resume path");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_resume_unknown_duplicate",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Duplicate resume must be blocked",
+    }), /busy/);
+    assert.equal(client.promptCalls.length, 2);
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    store.updateJobStatus(accepted.jobId, "finalizing");
+    await internal.timeoutFollow(accepted.jobId);
+    assert.equal((await follow).status, "timed_out", "the armed deadline must settle an unaccepted resume");
+    assert.equal(client.promptCalls.length, 2, "settlement must not resubmit the resume prompt");
+  } finally {
+    client.releasePrompt();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("approval-reply with unknown transport resolves accepted and settles through the armed deadline", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-reply-unknown-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const internal = service as unknown as {
+    timeoutFollow(jobId: string): Promise<void>;
+  };
+  client.replyErrors.push(new OpenCodeTransportError("POST", "/api/session/session_1/permission/permission_reply_unknown/reply", "timed out"));
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_reply_unknown", topic: "Reply unknown", task: "Wait for approval", cwd: directory });
+    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_reply_unknown" } } });
+    const replied = await service.continueJob({
+      requestId: "request_reply_unknown_continue",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Answer the approval",
+      permissionId: "permission_reply_unknown",
+      permissionReply: "once",
+    });
+    assert.equal(replied.accepted, true, "an unknown approval-reply must resolve accepted");
+    assert.equal(replied.outcome, "dispatch_unknown");
+    assert.equal(replied.jobId, accepted.jobId, "the original job id must be preserved");
+    const job = service.getJob(accepted.jobId);
+    assert.equal(job?.status, "following", "approval-reply must arm the follow deadline");
+    assert.ok(job?.followDeadlineAt);
+    assert.equal(job?.permissionId, null, "the answered permission is cleared like the success path");
+    assert.equal(job?.dispatchUnknown, true);
+    assert.equal(client.permissionReplies.length, 1, "exactly one reply attempt");
+    assert.equal(client.promptCalls.length, 1, "no prompt was submitted");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_reply_unknown_duplicate",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Duplicate reply must be blocked",
+      permissionId: "permission_reply_unknown",
+      permissionReply: "once",
+    }), /busy/);
+    assert.equal(client.permissionReplies.length, 1, "no second reply submission");
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    store.updateJobStatus(accepted.jobId, "finalizing");
+    await internal.timeoutFollow(accepted.jobId);
+    assert.equal((await follow).status, "timed_out", "the armed deadline must settle an unaccepted reply");
+    assert.equal(client.permissionReplies.length, 1, "settlement must not resubmit the reply");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("explicit follow extends an auto-armed window without a second lifecycle or timer", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-extension-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  const internal = service as unknown as {
+    followLifecycles: Map<string, unknown>;
+    timeoutFollow(jobId: string): Promise<void>;
+  };
+  client.blockPrompt();
+  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
+  try {
+    await service.start();
+    const spawn = service.spawn({ requestId: "request_follow_extension", topic: "Follow extension", task: "Auto-armed window", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 1);
+    client.releasePrompt();
+    const accepted = await spawn;
+    assert.equal(accepted.outcome, "dispatch_unknown");
+    const autoArmed = service.getJob(accepted.jobId);
+    assert.ok(autoArmed);
+    assert.equal(autoArmed.status, "following");
+    assert.ok(Math.abs(Date.parse(autoArmed.followDeadlineAt ?? "") - Date.parse(autoArmed.followStartedAt ?? "") - 20 * 60_000) < 1_000);
+    assert.equal(internal.followLifecycles.size, 1);
+
+    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 60, graceMinutes: 10 });
+    const extended = service.getJob(accepted.jobId);
+    assert.ok(extended);
+    assert.ok(Math.abs(Date.parse(extended.followDeadlineAt ?? "") - Date.parse(extended.followStartedAt ?? "") - 60 * 60_000) < 1_000,
+      "a larger explicit follow must extend the persisted deadline");
+    assert.equal(extended.followGraceMinutes, 10, "a larger explicit follow must extend the persisted grace");
+    assert.equal(internal.followLifecycles.size, 1, "extension must not create a second lifecycle");
+
+    const smaller = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
+    const notShrunk = service.getJob(accepted.jobId);
+    assert.ok(notShrunk);
+    assert.ok(Math.abs(Date.parse(notShrunk.followDeadlineAt ?? "") - Date.parse(notShrunk.followStartedAt ?? "") - 60 * 60_000) < 1_000,
+      "smaller requested values must not shrink the active window");
+    assert.equal(notShrunk.followGraceMinutes, 10);
+    assert.equal(internal.followLifecycles.size, 1);
+
+    store.updateJobStatus(accepted.jobId, "finalizing");
+    await internal.timeoutFollow(accepted.jobId);
+    assert.equal((await Promise.all([follow, smaller])).every((result) => result.status === "timed_out"), true,
+      "the single extended lifecycle must settle through the deadline");
+  } finally {
+    client.releasePrompt();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("request_id retry for an active dispatch_unknown job keeps the original outcome without redispatch", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-request-dedup-unknown-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  client.blockPrompt();
+  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
+  try {
+    await service.start();
+    const spawn = service.spawn({ requestId: "request_dedup_spawn", topic: "Dedup spawn", task: "Unknown outcome", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 1);
+    client.releasePrompt();
+    const accepted = await spawn;
+    assert.equal(accepted.outcome, "dispatch_unknown");
+    const retry = await service.spawn({ requestId: "request_dedup_spawn", topic: "Dedup spawn", task: "Retry must not redispatch", cwd: directory });
+    assert.equal(retry.accepted, true);
+    assert.equal(retry.outcome, "dispatch_unknown", "the persisted outcome must be retained on retry");
+    assert.equal(retry.jobId, accepted.jobId);
+    assert.match(retry.message, /uncertain|transport failure/i);
+    assert.equal(client.sessionCount, 1, "no second session on retry");
+    assert.equal(client.promptCalls.length, 1, "no redispatch on retry");
+    assert.equal(store.getJob(accepted.jobId)?.dispatchUnknown, true);
+
+    const seed = await service.spawn({ requestId: "request_dedup_seed", topic: "Dedup seed", task: "Seed the continue path", cwd: directory });
+    client.messages = [{
+      info: { id: "assistant_dedup_seed", role: "assistant", sessionID: "session_2" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_2" } });
+    client.blockPrompt();
+    client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "connection reset"));
+    const continuation = service.continueJob({
+      requestId: "request_dedup_continue",
+      agentId: seed.agentId,
+      relation: "continuation",
+      task: "Unknown continue outcome",
+    });
+    await waitForCondition(() => client.promptCalls.length === 3);
+    client.releasePrompt();
+    const continued = await continuation;
+    assert.equal(continued.outcome, "dispatch_unknown");
+    const retryContinue = await service.continueJob({
+      requestId: "request_dedup_continue",
+      agentId: seed.agentId,
+      relation: "continuation",
+      task: "Retry must not redispatch",
+    });
+    assert.equal(retryContinue.accepted, true);
+    assert.equal(retryContinue.outcome, "dispatch_unknown", "the continue retry must retain the persisted outcome");
+    assert.equal(retryContinue.jobId, continued.jobId);
+    assert.match(retryContinue.message, /uncertain|transport failure/i);
+    assert.equal(client.promptCalls.length, 3, "no redispatch on the continue retry");
+    assert.equal(store.getJob(continued.jobId)?.dispatchUnknown, true);
+  } finally {
+    client.releasePrompt();
     await service.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });

@@ -1,9 +1,43 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
+import { Agent, fetch, type Dispatcher } from "undici";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
 import type { AgentMode, ConsultInput, ContinueInput, FollowInput, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
+
+// The follow endpoint holds the HTTP response open until the worker finishes.
+// A valid follow window can be 60 minutes of work plus 10 minutes of graceful
+// finalization. Undici's default 300-second headers timeout would kill such
+// calls, so the bridge uses a reusable dispatcher with headers and body
+// timeouts safely above the maximum follow window plus margin.
+export const BRIDGE_HEADERS_TIMEOUT_MS = 90 * 60_000;
+export const BRIDGE_BODY_TIMEOUT_MS = 90 * 60_000;
+export const BRIDGE_CONNECT_TIMEOUT_MS = 10_000;
+
+export function createBridgeDispatcher(): Dispatcher {
+  return new Agent({
+    keepAliveTimeout: 5 * 60_000,
+    headersTimeout: BRIDGE_HEADERS_TIMEOUT_MS,
+    bodyTimeout: BRIDGE_BODY_TIMEOUT_MS,
+    connect: { timeout: BRIDGE_CONNECT_TIMEOUT_MS },
+  });
+}
+
+// The doctor command probes the daemon health endpoint with its own caller-side
+// cap. The bridge's reusable dispatcher must keep the 90-minute follow timeouts
+// for real calls, so doctor uses a dedicated short-timeout dispatcher instead of
+// lowering the shared one.
+export const DOCTOR_HEALTH_TIMEOUT_MS = 5_000;
+
+export function createDoctorHealthDispatcher(timeoutMs = DOCTOR_HEALTH_TIMEOUT_MS): Dispatcher {
+  return new Agent({
+    keepAliveTimeout: 5 * 60_000,
+    headersTimeout: timeoutMs,
+    bodyTimeout: timeoutMs,
+    connect: { timeout: BRIDGE_CONNECT_TIMEOUT_MS },
+  });
+}
 
 export class BridgeHttpServer {
   private server: Server | null = null;
@@ -152,38 +186,63 @@ export class BridgeHttpServer {
 
 export class BridgeHttpClient {
   private readonly baseUrl: string;
+  private readonly dispatcher: Dispatcher;
 
-  constructor(private readonly config: BridgeConfig) {
+  constructor(private readonly config: BridgeConfig, dispatcher?: Dispatcher) {
     this.baseUrl = "http://" + (config.daemonHost === "::1" ? "[::1]" : config.daemonHost) + ":" + config.daemonPort;
+    this.dispatcher = dispatcher ?? createBridgeDispatcher();
   }
 
   async health(): Promise<unknown> {
-    const response = await fetch(this.baseUrl + "/health");
+    const response = await bridgeFetch(this.baseUrl + "/health", {}, this.dispatcher);
     return parseResponse(response);
   }
 
   async call<T>(pathname: string, body?: unknown): Promise<T> {
-    const response = await fetch(this.baseUrl + pathname, {
+    const response = await bridgeFetch(this.baseUrl + pathname, {
       method: "POST",
       headers: {
         authorization: "Bearer " + this.config.daemonToken,
         "content-type": "application/json",
       },
       body: JSON.stringify(body ?? {}),
-    });
+    }, this.dispatcher);
     return parseResponse(response) as Promise<T>;
   }
 
   async get<T>(pathname: string): Promise<T> {
-    const response = await fetch(this.baseUrl + pathname, {
+    const response = await bridgeFetch(this.baseUrl + pathname, {
       method: "GET",
       headers: { authorization: "Bearer " + this.config.daemonToken },
-    });
+    }, this.dispatcher);
     return parseResponse(response) as Promise<T>;
   }
 }
 
-async function parseResponse(response: Response): Promise<unknown> {
+type BridgeFetchInit = Parameters<typeof fetch>[1];
+type BridgeFetchResponse = Awaited<ReturnType<typeof fetch>>;
+
+async function bridgeFetch(url: string, init: BridgeFetchInit, dispatcher: Dispatcher): Promise<BridgeFetchResponse> {
+  try {
+    return await fetch(url, { ...init, dispatcher });
+  } catch (error) {
+    // Surface nested fetch/Undici cause codes (for example ECONNREFUSED or
+    // UND_ERR_HEADERS_TIMEOUT) so transport failures are distinguishable from
+    // definite HTTP rejections.
+    throw new Error("Bridge HTTP request failed: " + describeFetchError(error), { cause: error });
+  }
+}
+
+function describeFetchError(error: unknown): string {
+  const message = redactSecrets(String(error));
+  const cause = error && typeof error === "object" && "cause" in error ? (error as { cause?: unknown }).cause : undefined;
+  if (!cause) return message;
+  const causeText = redactSecrets(String(cause));
+  const code = cause && typeof cause === "object" && "code" in cause ? (cause as { code?: unknown }).code : undefined;
+  return code !== undefined ? message + " (cause: " + String(code) + " - " + causeText + ")" : message + " (cause: " + causeText + ")";
+}
+
+async function parseResponse(response: BridgeFetchResponse): Promise<unknown> {
   const text = await response.text();
   let value: unknown;
   try {

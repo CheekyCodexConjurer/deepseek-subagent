@@ -24,7 +24,7 @@ After all useful independent work is complete, use `deepseek_follow`. The call r
 
 ## MCP cannot connect to the local daemon
 
-The MCP performs a one-time readiness bootstrap and starts the detached daemon automatically when it is offline. If startup still times out, inspect `data/daemon.log` below the configured data directory and run `node dist/cli.js doctor --json`. The MCP only waits for daemon readiness; it does not poll job status.
+The MCP handshake and tool listing never wait for daemon or OpenCode startup. Daemon readiness is bootstrapped lazily and memoized on the first tool operation: the MCP process health-checks the bridge HTTP endpoint and starts the detached daemon automatically when it is offline, sharing one bootstrap across concurrent first calls. If startup still times out, the tool call returns a clear "daemon is not ready" error; inspect `data/daemon.log` below the configured data directory and run `node dist/cli.js doctor --json`.
 
 ## OpenCode startup failure
 
@@ -45,3 +45,11 @@ The WebSocket option is intentionally restricted to loopback and assumes the sam
 The default is 20 minutes of work plus 5 minutes of graceful finalization. The maximum is 60 plus 10 minutes. At the first deadline the bridge sends the same finalization prompt to the same OpenCode session. If that session is busy and rejects the prompt, the bridge aborts only the active turn, preserves the session, and resubmits the prompt asynchronously. If grace expires, the worker is aborted and the result contains `timed_out` plus the last available progress/evidence.
 
 Follow and approval deadlines are persisted. A daemon restart resumes the remaining window instead of starting a fresh one; if timeout evidence capture was interrupted, startup or explicit recovery retries the last available messages and diff.
+
+## Agent lifecycle after a terminal result
+
+A terminal follow result closes the job obligation only. The DeepSeek agent itself stays open and continuable: completed, failed and timed-out writers accept `deepseek_continue` until you call `deepseek_close` after reviewing the result. Aborted agents are not continuable and are auto-closed safely. The follow output states this explicitly so a closed obligation is never mistaken for a closed agent.
+
+## Unknown dispatch outcome
+
+If a `prompt_async` dispatch fails before an HTTP response (timeout or transport failure), the prompt may still have been accepted. The bridge keeps the job and agent active and recoverable instead of failing them, blocks a duplicate continuation, and lets completion events, restart reconciliation or the follow deadline settle the outcome. A definite HTTP rejection still fails the job.

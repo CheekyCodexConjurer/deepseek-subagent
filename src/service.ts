@@ -14,7 +14,8 @@ import {
   UnavailableCodexDeliveryAdapter,
 } from "./codex/adapter.js";
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
-import { formatHumanResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { OpenCodeTransportError } from "./opencode/client.js";
+import { assistantTextAfterBaseline, formatHumanResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import type {
   AgentRecord,
   BridgeConfig,
@@ -61,6 +62,7 @@ export interface AcceptedOperation {
   modelDisplayName: string;
   state: "Starting";
   message: string;
+  outcome?: "accepted" | "dispatch_unknown";
 }
 
 export class BridgeBusyError extends Error {
@@ -82,16 +84,20 @@ export interface ServiceStatus {
   followDefaultWaitMinutes: number;
   followDefaultGraceMinutes: number;
   codexDelivery: { available: boolean; reason: string | null };
+  correlation: { hints: number; bindings: number };
   lastStreamError: string | null;
 }
 
 const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "following", "finalizing", "needs_approval"]);
 const TERMINAL_JOB_STATUSES = new Set(["completed", "completed_partial", "timed_out", "failed", "aborted", "delivered"]);
 
+const DISPATCH_UNKNOWN_WARNING = "DeepSeek Sub-Agent accepted the task, but OpenCode dispatch acceptance is uncertain after a transport failure. Follow this job (deepseek_follow) or abort it (deepseek_abort) to settle the obligation.";
+
 interface FollowLifecycle {
   jobId: string;
   waitMinutes: number;
   graceMinutes: number;
+  autoArmed: boolean;
   promise: Promise<FollowResult>;
   resolve: (result: FollowResult) => void;
   reject: (error: unknown) => void;
@@ -298,6 +304,10 @@ export class BridgeService {
       followDefaultWaitMinutes: this.config.followDefaultWaitMinutes,
       followDefaultGraceMinutes: this.config.followDefaultGraceMinutes,
       codexDelivery: { available: this.codex.available, reason: this.codex.reason },
+      correlation: {
+        hints: this.store.countJobsWithCorrelationHints(),
+        bindings: this.store.countCodexBindings(),
+      },
       lastStreamError: this.lastStreamError,
     };
   }
@@ -308,7 +318,7 @@ export class BridgeService {
     if (input.task.length > this.config.maxTaskLength) throw new Error("Task exceeds configured length limit");
     return this.withRequestIdLock(input.requestId, async () => {
       const existing = this.store.getJobByRequestId(input.requestId);
-      if (existing) return this.accepted(existing);
+      if (existing) return this.acceptedRequest(existing);
       const repositoryRoot = path.resolve(input.cwd ?? defaultWorkspace());
       await ensureDirectory(repositoryRoot);
       const mode = input.mode ?? "analyze";
@@ -342,6 +352,7 @@ export class BridgeService {
         requestId: input.requestId,
         promptHash: hashPrompt(prompt),
       });
+      this.persistCorrelationHint(job, input.threadId, input.turnId);
       // MCP arguments are not proof of origin. A new binding is accepted only
       // after the configured App Server reports this job in item/completed.
       return this.dispatch(agent, job, prompt);
@@ -354,7 +365,7 @@ export class BridgeService {
     if (input.task.length > this.config.maxTaskLength) throw new Error("Task exceeds configured length limit");
     return this.withAgentOperationLock(input.agentId, async () => {
       const existing = this.store.getJobByRequestId(input.requestId);
-      if (existing) return this.accepted(existing);
+      if (existing) return this.acceptedRequest(existing);
       const agent = this.store.getAgent(input.agentId);
       if (!agent) throw new Error("Unknown agent: " + input.agentId);
       if (agent.status === "closed" || agent.status === "aborted") throw new Error("Agent is not continuable");
@@ -381,6 +392,7 @@ export class BridgeService {
         requestId: input.requestId,
         promptHash: hashPrompt(prompt),
       });
+      this.persistCorrelationHint(job, input.threadId, input.turnId);
       if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
       return this.dispatch(agent, job, prompt);
     });
@@ -435,7 +447,9 @@ export class BridgeService {
     if (!agent) throw new Error("Unknown agent: " + agentId);
     const active = this.activeJob(agentId);
     if (!active) {
-      if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agentId, "aborted", reason ?? null);
+      // A stopped agent is non-continuable; auto-close it so the obligation
+      // ends and the agent is not left in an open intermediate state.
+      if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agentId, "closed", reason ?? null);
       return { agentId, jobId: null, status: "aborted" };
     }
     this.clearApprovalTimer(agentId);
@@ -448,7 +462,8 @@ export class BridgeService {
     }
     const localReason = reason ?? (remoteError ? "Abort requested; remote abort failed: " + remoteError : "Aborted by orchestrator");
     if (active.status !== "aborted") this.store.updateJobStatus(active.id, "aborted", localReason);
-    if (agent.status !== "aborted" && agent.status !== "closed") this.store.updateAgentStatus(agent.id, "aborted", reason ?? null);
+    // Aborted agents are non-continuable; auto-close them safely.
+    if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", reason ?? null);
     this.recordActivity(agent, active, "abort", remoteError ? "Abort requested but OpenCode returned an error" : "Abort requested for the active DeepSeek task");
     await this.resolveFollow(active.id, {
       status: "aborted",
@@ -529,9 +544,15 @@ export class BridgeService {
     return Math.max(normalizeFollowMinutes(value, minimum, maximum, fallback), fallback);
   }
 
-  private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): FollowLifecycle {
+  private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number, autoArmed = false): FollowLifecycle {
     const existing = this.followLifecycles.get(job.id);
-    if (existing) return existing;
+    if (existing) {
+      // An auto-armed lifecycle (unknown dispatch outcome) may be extended by
+      // an explicit follow requesting a larger window; never create a second
+      // lifecycle or timer, and never shrink an active window.
+      if (existing.autoArmed) this.extendFollowLifecycle(job.id, existing, waitMinutes, graceMinutes);
+      return existing;
+    }
     const now = Date.now();
     const current = this.store.getJob(job.id) ?? job;
     const startedAt = parseTimestamp(current.followStartedAt) ?? now;
@@ -566,6 +587,7 @@ export class BridgeService {
       jobId: job.id,
       waitMinutes,
       graceMinutes: effectiveGraceMinutes,
+      autoArmed,
       promise,
       resolve,
       reject,
@@ -581,6 +603,51 @@ export class BridgeService {
       this.scheduleDeadlineTimer(lifecycle, deadlineAt);
     }
     return lifecycle;
+  }
+
+  private extendFollowLifecycle(jobId: string, lifecycle: FollowLifecycle, waitMinutes: number, graceMinutes: number): void {
+    const job = this.store.getJob(jobId);
+    if (!job || lifecycle.settled || TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") return;
+    const startedAt = parseTimestamp(job.followStartedAt) ?? Date.now();
+    const currentDeadlineAt = parseTimestamp(job.followDeadlineAt);
+    if (currentDeadlineAt === null) return;
+    const requestedDeadlineAt = startedAt + waitMinutes * 60_000;
+    const extendedDeadlineAt = Math.max(currentDeadlineAt, requestedDeadlineAt);
+    const currentGrace = job.followGraceMinutes ?? lifecycle.graceMinutes;
+    const extendedGrace = Math.max(currentGrace, graceMinutes);
+    const deadlineExtended = extendedDeadlineAt > currentDeadlineAt;
+    const graceExtended = extendedGrace > currentGrace;
+    if (!deadlineExtended && !graceExtended) return;
+    const finalizing = job.status === "finalizing";
+    let graceDeadlineAt: string | null = job.graceDeadlineAt;
+    if (finalizing && graceExtended) {
+      const currentGraceDeadlineAt = parseTimestamp(job.graceDeadlineAt);
+      const baseDeadlineAt = parseTimestamp(job.followDeadlineAt) ?? extendedDeadlineAt;
+      if (currentGraceDeadlineAt !== null) {
+        graceDeadlineAt = new Date(currentGraceDeadlineAt + (extendedGrace - currentGrace) * 60_000).toISOString();
+      } else {
+        graceDeadlineAt = new Date(baseDeadlineAt + extendedGrace * 60_000).toISOString();
+      }
+    }
+    this.store.setFollowWindow(jobId, {
+      startedAt: new Date(startedAt).toISOString(),
+      deadlineAt: new Date(extendedDeadlineAt).toISOString(),
+      graceMinutes: extendedGrace,
+      graceDeadlineAt,
+      gracefulFinalizeAttempted: job.gracefulFinalizeAttempted,
+    });
+    lifecycle.graceMinutes = extendedGrace;
+    if (finalizing) {
+      if (graceExtended && graceDeadlineAt) {
+        if (lifecycle.graceTimer) clearTimeout(lifecycle.graceTimer);
+        lifecycle.graceTimer = null;
+        this.scheduleGraceTimer(lifecycle, Date.parse(graceDeadlineAt));
+      }
+    } else if (deadlineExtended && ["dispatching", "running", "following"].includes(job.status)) {
+      if (lifecycle.deadlineTimer) clearTimeout(lifecycle.deadlineTimer);
+      lifecycle.deadlineTimer = null;
+      this.scheduleDeadlineTimer(lifecycle, extendedDeadlineAt);
+    }
   }
 
   private scheduleDeadlineTimer(lifecycle: FollowLifecycle, deadlineAt: number): void {
@@ -624,6 +691,10 @@ export class BridgeService {
       });
       this.recordActivity(agent, job, "finalize", "Graceful finalization prompt submitted in the same OpenCode session");
     } catch (error) {
+      if (isUnknownDispatchOutcome(error)) {
+        this.recordActivity(agent, job, "error", "Graceful finalization dispatch outcome is unknown after a transport failure; the deadline will settle it");
+        return;
+      }
       if (!isBusyError(error)) {
         this.recordActivity(agent, job, "error", "Graceful finalization prompt was rejected by OpenCode");
         return;
@@ -872,6 +943,28 @@ export class BridgeService {
       return this.accepted(this.store.getJob(job.id) ?? job);
     } catch (error) {
       const message = redactSecrets(String(error));
+      if (isUnknownDispatchOutcome(error)) {
+        // The prompt may still have been accepted server-side. Do not mark the
+        // job or agent failed and do not throw: resolve normally as an
+        // accepted pending bridge obligation so the caller receives the exact
+        // agentId/jobId it must follow or abort. Persist the diagnostic,
+        // keep the job active (which blocks a duplicate continuation), and arm
+        // the existing follow deadline/grace so a prompt that was never
+        // accepted cannot become immortal.
+        const currentJob = this.store.getJob(job.id);
+        if (currentJob?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
+        this.recordActivity(agent, this.store.getJob(job.id), "error", "OpenCode dispatch outcome is unknown after a transport failure; the job stays active");
+        const pending = this.store.getJob(job.id) ?? job;
+        this.ensureFollowLifecycle(
+          pending,
+          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+          true,
+        );
+        this.store.setJobError(job.id, "Dispatch outcome unknown after a transport failure: " + message);
+        this.store.markDispatchUnknown(job.id);
+        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
+      }
       const current = this.store.getJob(job.id);
       const preservesApproval = current?.status === "needs_approval";
       if (current && current.status !== "failed" && !preservesApproval) this.store.updateJobStatus(job.id, "failed", message);
@@ -901,6 +994,23 @@ export class BridgeService {
       return this.accepted(this.store.getJob(job.id) ?? job);
     } catch (error) {
       const message = redactSecrets(String(error));
+      if (isUnknownDispatchOutcome(error)) {
+        // Same accepted dispatch_unknown contract as spawn/continue: the
+        // caller keeps the exact job id, the follow deadline/grace is armed so
+        // an unaccepted prompt cannot become immortal, and no second
+        // submission occurs while the job stays active.
+        this.store.markDispatchUnknown(job.id);
+        this.recordActivity(agent, this.store.getJob(job.id), "error", "Approval continuation outcome is unknown after a transport failure; the job stays active");
+        const pending = this.store.getJob(job.id) ?? job;
+        this.ensureFollowLifecycle(
+          pending,
+          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+          true,
+        );
+        this.store.setJobError(job.id, "Approval continuation outcome unknown after a transport failure: " + message);
+        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
+      }
       const current = this.store.getJob(job.id);
       if (current?.status !== "needs_approval") {
         this.clearApprovalTimer(agent.id);
@@ -941,6 +1051,27 @@ export class BridgeService {
       return this.accepted(this.store.getJob(job.id) ?? job);
     } catch (error) {
       const errorText = redactSecrets(String(error));
+      if (isUnknownDispatchOutcome(error)) {
+        // Same accepted dispatch_unknown contract as resume: keep the exact
+        // job id, clear the answered permission like the success path, arm the
+        // follow deadline/grace, and prevent a second submission while the job
+        // stays active.
+        this.store.markDispatchUnknown(job.id);
+        const afterReply = this.store.getJob(job.id);
+        if (afterReply?.status === "running" && afterReply.permissionId === permissionId) {
+          this.store.setJobPermission(job.id, null);
+        }
+        this.recordActivity(agent, this.store.getJob(job.id), "error", "Permission reply outcome is unknown after a transport failure; the job stays active");
+        const pending = this.store.getJob(job.id) ?? job;
+        this.ensureFollowLifecycle(
+          pending,
+          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+          true,
+        );
+        this.store.setJobError(job.id, "Permission reply outcome unknown after a transport failure: " + errorText);
+        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
+      }
       const current = this.store.getJob(job.id);
       if (current?.status !== "needs_approval") {
         this.clearApprovalTimer(agent.id);
@@ -956,6 +1087,10 @@ export class BridgeService {
   }
 
   private async handleEvent(event: OpenCodeEvent, retry: { sourceEventId?: string; attempt?: number } = {}): Promise<void> {
+    // High-volume streaming deltas never change job state and would bloat the
+    // event ledger and activity table; skip them while keeping meaningful
+    // activity and events.
+    if (event.type === "message.part.delta") return;
     const sessionId = findSessionId(event.properties);
     if (!sessionId) return;
     const agent = this.store.getAgentBySession(sessionId);
@@ -1023,6 +1158,15 @@ export class BridgeService {
     const currentJob = this.store.getJob(job.id) ?? job;
     const latestAssistantId = latestAssistantMessageId(messages);
     if (currentJob.lastAssistantMessageId && (!latestAssistantId || latestAssistantId === currentJob.lastAssistantMessageId)) return;
+    if (!assistantTextAfterBaseline(messages, currentJob.lastAssistantMessageId).hasText) {
+      // Idle with no non-empty assistant text (tool-only or reasoning-only
+      // tails included) must never become a usable completed success. Leave
+      // the job active so the follow deadline, reconciliation or a later
+      // event settles it fail-closed.
+      if (currentJob.status === "dispatching") this.store.updateJobStatus(job.id, "running");
+      this.recordActivity(agent, this.store.getJob(job.id), "event", "OpenCode session became idle without non-empty assistant output; the job remains active");
+      return;
+    }
     const partial = currentJob.status === "finalizing" || currentJob.gracefulFinalizeAttempted;
     if (currentJob.status === "dispatching") this.store.updateJobStatus(job.id, "running");
     const stored = await persistResult(this.config.dataDir, currentAgent, currentJob, messages, diff, this.config.maxResultLength, {
@@ -1190,6 +1334,7 @@ export class BridgeService {
     if (assistants.length === 0 || messages.at(-1)?.info?.role !== "assistant") return;
     const latestAssistantId = latestAssistantMessageId(messages);
     if (job.lastAssistantMessageId && (!latestAssistantId || latestAssistantId === job.lastAssistantMessageId)) return;
+    if (!assistantTextAfterBaseline(messages, job.lastAssistantMessageId).hasText) return;
     const diff = await this.client.getDiff(agent.opencodeSessionId);
     const currentAgent = this.store.getAgent(agent.id) ?? agent;
     const stored = await persistResult(this.config.dataDir, currentAgent, job, messages, diff, this.config.maxResultLength);
@@ -1425,7 +1570,7 @@ export class BridgeService {
       ?.lastAssistantMessageId ?? null;
   }
 
-  private accepted(job: JobRecord): AcceptedOperation {
+  private accepted(job: JobRecord, extra: { outcome?: "dispatch_unknown"; warning?: string } = {}): AcceptedOperation {
     const agent = this.store.getAgent(job.agentId);
     if (!agent) throw new Error("Job has no agent: " + job.id);
     return {
@@ -1438,8 +1583,25 @@ export class BridgeService {
         ? "DeepSeek V4 Flash" + (agent.modelVariant === "max" ? " · Max" : "")
         : agent.modelId,
       state: "Starting",
-      message: "DeepSeek Sub-Agent accepted the task and will report asynchronously.",
+      message: extra.warning ?? "DeepSeek Sub-Agent accepted the task and will report asynchronously.",
+      ...(extra.outcome ? { outcome: extra.outcome } : {}),
     };
+  }
+
+  private persistCorrelationHint(job: JobRecord, threadId: string | undefined, turnId: string | undefined): void {
+    if (!threadId && !turnId) return;
+    this.store.setCorrelationHint(job.id, {
+      threadId: threadId ?? null,
+      turnId: turnId ?? null,
+      source: "mcp",
+    });
+  }
+
+  private acceptedRequest(job: JobRecord): AcceptedOperation {
+    if (job.dispatchUnknown) {
+      return this.accepted(job, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
+    }
+    return this.accepted(job);
   }
 
   private clientOrThrow(): OpenCodeClientLike {
@@ -1570,6 +1732,12 @@ function isBusyError(error: unknown): boolean {
   if (status === 409) return true;
   const message = redactSecrets(String(error)).toLowerCase();
   return message.includes("busy") || message.includes("already running") || message.includes("active turn") || message.includes("conflict");
+}
+
+function isUnknownDispatchOutcome(error: unknown): boolean {
+  // A transport/timeout failure means the prompt may still have been accepted
+  // server-side; a definite HTTP rejection means it was not.
+  return error instanceof OpenCodeTransportError;
 }
 
 function activityTypeForEvent(event: OpenCodeEvent): Parameters<BridgeStore["recordActivity"]>[0]["activityType"] {

@@ -97,6 +97,25 @@ test("persists agents, jobs, bindings and idempotent events", async () => {
   }
 });
 
+test("database health check uses the fast quick_check pragma", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-health-"));
+  const store = await BridgeStore.open(directory);
+  try {
+    const prepare = store.db.prepare;
+    const statements: string[] = [];
+    store.db.prepare = ((sql: string) => {
+      statements.push(sql);
+      return prepare.call(store.db, sql);
+    }) as typeof prepare;
+    assert.equal(store.integrityCheck(), "ok");
+    assert.ok(statements.includes("PRAGMA quick_check"), "health check must run PRAGMA quick_check");
+    assert.ok(!statements.includes("PRAGMA integrity_check"), "health check must not run a full integrity scan");
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("rejects a duplicate Codex correlation after reopening the store", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-correlation-"));
   const store = await BridgeStore.open(directory);
@@ -146,6 +165,76 @@ test("rejects a duplicate Codex correlation after reopening the store", async ()
         originatingTurnId: "turn_persisted",
         originatingItemId: "item_persisted",
       }), /already bound to job job_correlation_first/);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    if (!storeClosed) store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persists correlation hints with provenance, counters, and migration columns", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-hints-"));
+  const store = await BridgeStore.open(directory);
+  let storeClosed = false;
+  try {
+    store.createAgent({
+      id: "agent_hints",
+      title: "Hints",
+      topic: "Hints topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_hints",
+      opencodeSessionId: "session_hints",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+    });
+    const job = store.createJob({
+      id: "job_hints",
+      agentId: "agent_hints",
+      kind: "spawn",
+      requestId: "request_hints",
+      promptHash: "hash_hints",
+    });
+    const plain = store.createJob({
+      id: "job_hints_plain",
+      agentId: "agent_hints",
+      kind: "continue",
+      requestId: "request_hints_plain",
+      promptHash: "hash_hints_plain",
+    });
+    store.setCorrelationHint(job.id, { threadId: "thread_hint", turnId: "turn_hint", source: "mcp" });
+    const hinted = store.getJob(job.id);
+    assert.equal(hinted?.hintThreadId, "thread_hint");
+    assert.equal(hinted?.hintTurnId, "turn_hint");
+    assert.equal(hinted?.hintSource, "mcp");
+    store.setCorrelationHint(job.id, { turnId: "turn_hint_two", source: "mcp" });
+    assert.equal(store.getJob(job.id)?.hintThreadId, "thread_hint", "hints are additive");
+    assert.equal(store.getJob(job.id)?.hintTurnId, "turn_hint_two");
+    assert.equal(store.getJob(job.id)?.hintSource, "mcp");
+    assert.equal(store.getJob(plain.id)?.hintSource, null, "no hint is synthesized when absent");
+    assert.equal(store.countJobsWithCorrelationHints(), 1);
+    assert.equal(store.countCodexBindings(), 0);
+    store.setJobError(job.id, "Dispatch outcome unknown after a transport failure: timeout");
+    assert.equal(store.getJob(job.id)?.error, "Dispatch outcome unknown after a transport failure: timeout");
+    store.bindJob({ jobId: job.id, threadId: "thread_authoritative", originatingTurnId: null, originatingItemId: null });
+    assert.equal(store.countCodexBindings(), 1);
+    assert.equal(store.getBinding(job.id)?.threadId, "thread_authoritative");
+    store.close();
+    storeClosed = true;
+
+    const reopened = await BridgeStore.open(directory);
+    try {
+      const marker = reopened.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 5").get();
+      assert.ok(marker, "migration version 5 must be recorded");
+      const migrated = reopened.getJob(job.id);
+      assert.equal(migrated?.hintThreadId, "thread_hint");
+      assert.equal(migrated?.hintSource, "mcp");
+      assert.equal(reopened.countJobsWithCorrelationHints(), 1);
+      assert.equal(reopened.countCodexBindings(), 1);
     } finally {
       reopened.close();
     }

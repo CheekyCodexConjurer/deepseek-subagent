@@ -116,6 +116,10 @@ export interface JobRecord {
   graceDeadlineAt: string | null;
   gracefulFinalizeAttempted: boolean;
   approvalDeadlineAt: string | null;
+  hintThreadId: string | null;
+  hintTurnId: string | null;
+  hintSource: string | null;
+  dispatchUnknown: boolean;
 }
 
 export type ActivityType =

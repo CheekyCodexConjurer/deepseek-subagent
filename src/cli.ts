@@ -4,12 +4,14 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile } from "./security.js";
 import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
-import { BridgeHttpClient, BridgeHttpServer } from "./http-server.js";
+import { BridgeHttpClient, BridgeHttpServer, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
 import { runMcp } from "./mcp.js";
 import { BridgeService } from "./service.js";
 import { BridgeStore } from "./store.js";
 import { OpenCodeClient } from "./opencode/client.js";
 import type { BridgeConfig, DoctorCheck, DoctorReport } from "./types.js";
+
+export const DOCTOR_PROBE_TIMEOUT_MS = 10_000;
 
 interface CliArgs {
   command: string;
@@ -161,70 +163,80 @@ async function stopDaemon(config: BridgeConfig, json: boolean): Promise<void> {
 
 async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> {
   const checks: DoctorCheck[] = [];
-  checks.push({
+  const push = (check: DoctorCheck): void => {
+    checks.push(check);
+    console.error("[doctor] " + check.name + "=" + check.status);
+  };
+  push({
     name: "node",
     status: Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10) >= 24 ? "ok" : "error",
     detail: process.version,
   });
-  checks.push({
+  push({
     name: "data_directory",
     status: await canRead(config.dataDir) ? "ok" : "warning",
     detail: config.dataDir,
   });
-  const codexVersion = await runCodex(["--version"]);
-  checks.push({
+  console.error(`[doctor] probing codex and opencode CLIs (each probe bounded to ${DOCTOR_PROBE_TIMEOUT_MS / 1000}s, probes run in parallel)`);
+  const [codexVersion, openCodeCommand] = await Promise.all([
+    runCodex(["--version"]),
+    resolveOpenCodeCommand(),
+  ]);
+  push({
     name: "codex_installed",
     status: codexVersion.ok ? "ok" : "warning",
     detail: codexVersion.ok ? codexVersion.output.trim() : codexVersion.error,
   });
-  const openCodeCommand = await resolveOpenCodeCommand();
-  const openCodeVersion = await runCapture(openCodeCommand, ["--version"]);
-  checks.push({
+  const [openCodeVersion, authList, models, mcpList] = await Promise.all([
+    runCapture(openCodeCommand, ["--version"]),
+    runCapture(openCodeCommand, ["auth", "list"]),
+    runCapture(openCodeCommand, ["models"]),
+    runCodex(["mcp", "list"]),
+  ]);
+  push({
     name: "opencode_installed",
     status: openCodeVersion.ok ? "ok" : "warning",
     detail: openCodeVersion.ok ? openCodeVersion.output.trim() : openCodeVersion.error,
   });
-  const authList = await runCapture(openCodeCommand, ["auth", "list"]);
-  checks.push({
+  push({
     name: "opencode_go_auth",
     status: authList.ok && /opencode-go|opencode go/i.test(authList.output) ? "ok" : "warning",
     detail: authList.ok ? "provider names inspected; secret values were not read" : authList.error,
   });
-  const models = await runCapture(openCodeCommand, ["models"]);
   const targetModel = /opencode-go[\/\\]deepseek-v4-flash/i.test(models.output);
-  checks.push({
+  push({
     name: "deepseek_v4_flash",
     status: targetModel ? "ok" : "warning",
     detail: targetModel ? "configured model is listed by OpenCode" : "target model was not found in OpenCode model listing",
   });
-  checks.push({
+  push({
     name: "max_variant",
     status: config.opencodeVariant === "max" ? "warning" : "unknown",
     detail: config.opencodeVariant === "max"
       ? "configured as max; live runtime smoke is the proof, not a static listing"
       : "no max variant configured",
   });
-  checks.push({
+  push({
     name: "async_execution",
     status: "ok",
     detail: "spawn dispatches asynchronously and follow waits on internal events",
   });
-  checks.push({
+  push({
     name: "sse_completion_events",
     status: "ok",
     detail: "OpenCode SSE session.idle events are subscribed without job-status polling",
   });
-  checks.push({
+  push({
     name: "progress_snapshots",
     status: "ok",
     detail: "observable activity is persisted in SQLite without private reasoning",
   });
-  checks.push({
+  push({
     name: "follow_mode",
     status: "ok",
     detail: "event-driven waiter with one deadline timer and persisted restart state",
   });
-  checks.push({
+  push({
     name: "follow_default_timeout",
     status: isValidFollowDefaults(config) ? "ok" : "error",
     detail: isValidFollowDefaults(config)
@@ -233,32 +245,31 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
   });
   const codexToolTimeout = await readCodexMcpToolTimeout();
   const minimumToolTimeout = DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC;
-  checks.push({
+  push({
     name: "mcp_tool_timeout",
     status: codexToolTimeout !== null && codexToolTimeout >= minimumToolTimeout ? "ok" : "warning",
     detail: codexToolTimeout === null
       ? `MISCONFIGURED: Codex MCP tool_timeout_sec was not found; required > ${FOLLOW_MAX_TOTAL_MINUTES} min, recommended ${DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC / 60} min`
       : `DeepSeek follow max wait: ${FOLLOW_MAX_TOTAL_MINUTES} min; Codex MCP tool timeout: ${Math.floor(codexToolTimeout / 60)} min; Status: ${codexToolTimeout >= minimumToolTimeout ? "OK" : "MISCONFIGURED"}`,
   });
-  checks.push({
+  push({
     name: "same_chat_push",
     status: config.experimentalSameChatDelivery ? "warning" : "ok",
     detail: config.experimentalSameChatDelivery
       ? "Experimental / Enabled; requires an explicit live App Server correlation"
       : "Experimental / Disabled; normal operation uses persistence and follow",
   });
-  checks.push({
+  push({
     name: "fallback_persistence",
     status: "ok",
     detail: "private inbox and result files remain the durable fallback",
   });
-  const mcpList = await runCodex(["mcp", "list"]);
-  checks.push({
+  push({
     name: "mcp_registered",
     status: /deepseek-subagent/i.test(mcpList.output) ? "ok" : "warning",
     detail: mcpList.ok ? "deepseek-subagent registration was " + (/deepseek-subagent/i.test(mcpList.output) ? "found" : "not found") : mcpList.error,
   });
-  checks.push({
+  push({
     name: "codex_delivery",
     status: config.experimentalSameChatDelivery && (config.codexAppServerCommand || config.codexAppServerSocket) ? "warning" : "ok",
     detail: config.experimentalSameChatDelivery && (config.codexAppServerCommand || config.codexAppServerSocket)
@@ -272,35 +283,27 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
         username: config.opencodeUsername,
         password: config.opencodePassword,
       });
+      console.error("[doctor] probing opencode health (bounded to 5s)");
       const health = await client.health();
-      checks.push({ name: "opencode_health", status: health.healthy ? "ok" : "error", detail: health.version ?? "healthy" });
+      push({ name: "opencode_health", status: health.healthy ? "ok" : "error", detail: health.version ?? "healthy" });
     } catch (error) {
-      checks.push({ name: "opencode_health", status: "error", detail: redactSecrets(String(error)) });
+      push({ name: "opencode_health", status: "error", detail: redactSecrets(String(error)) });
     }
   } else {
-    checks.push({ name: "opencode_mode", status: "ok", detail: "managed loopback server; health is checked at daemon start" });
+    push({ name: "opencode_mode", status: "ok", detail: "managed loopback server; health is checked at daemon start" });
   }
+  console.error(`[doctor] probing bridge daemon health (headers/body bounded to ${DOCTOR_HEALTH_TIMEOUT_MS / 1000}s; TCP connect separately bounded to ${BRIDGE_CONNECT_TIMEOUT_MS / 1000}s)`);
   try {
-    const health = await new BridgeHttpClient(config).health();
+    const health = await new BridgeHttpClient(config, createDoctorHealthDispatcher()).health();
     const status = health && typeof health === "object" ? (health as Record<string, unknown>).status : null;
     const running = status && typeof status === "object" ? (status as Record<string, unknown>).running === true : false;
-    checks.push({ name: "bridge_daemon", status: running ? "ok" : "warning", detail: JSON.stringify(health) });
+    push({ name: "bridge_daemon", status: running ? "ok" : "warning", detail: JSON.stringify(health) });
   } catch (error) {
-    checks.push({ name: "bridge_daemon", status: "warning", detail: "not reachable: " + redactSecrets(String(error)) });
+    push({ name: "bridge_daemon", status: "warning", detail: "not reachable: " + redactSecrets(String(error)) });
   }
   const databasePath = path.join(config.dataDir, "bridge.sqlite");
-  if (await canRead(databasePath)) {
-    try {
-      const store = new BridgeStore(databasePath);
-      const integrity = store.integrityCheck();
-      store.close();
-      checks.push({ name: "database", status: integrity === "ok" ? "ok" : "error", detail: integrity });
-    } catch (error) {
-      checks.push({ name: "database", status: "error", detail: redactSecrets(String(error)) });
-    }
-  } else {
-    checks.push({ name: "database", status: "warning", detail: "database has not been created yet" });
-  }
+  console.error("[doctor] checking database (synchronous SQLite quick_check; it can take a moment under IO/lock contention)");
+  await doctorDatabaseCheck(databasePath, push);
   const report: DoctorReport = {
     generatedAt: new Date().toISOString(),
     displayName: "DeepSeek Sub-Agent",
@@ -308,6 +311,41 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
     completeDeliverySupported: false,
   };
   output(json, report, checks.map((check) => check.name + "=" + check.status + " (" + check.detail + ")").join("\n"));
+}
+
+// Runs the synchronous SQLite doctor checks and guarantees the store handle is
+// closed even when a check throws. The synchronous quick_check cannot be
+// interrupted from the caller, so the honest contract is: run it, report its
+// result, and never leak the handle.
+export function withStore<T>(databasePath: string, fn: (store: BridgeStore) => T): T {
+  const store = new BridgeStore(databasePath);
+  try {
+    return fn(store);
+  } finally {
+    store.close();
+  }
+}
+
+export async function doctorDatabaseCheck(databasePath: string, push: (check: DoctorCheck) => void): Promise<void> {
+  if (!(await canRead(databasePath))) {
+    push({ name: "database", status: "warning", detail: "database has not been created yet" });
+    return;
+  }
+  try {
+    withStore(databasePath, (store) => {
+      const integrity = store.integrityCheck();
+      push({ name: "database", status: integrity === "ok" ? "ok" : "error", detail: integrity });
+      const hintCount = store.countJobsWithCorrelationHints();
+      const bindingCount = store.countCodexBindings();
+      push({
+        name: "correlation",
+        status: "ok",
+        detail: `${hintCount} persisted MCP hint(s) vs ${bindingCount} authoritative App Server binding(s); delivery still requires an authoritative binding`,
+      });
+    });
+  } catch (error) {
+    push({ name: "database", status: "error", detail: redactSecrets(String(error)) });
+  }
 }
 
 async function listResource(config: BridgeConfig, resource: "agents" | "jobs", json: boolean, verbose: boolean): Promise<void> {
@@ -468,7 +506,7 @@ async function runProcess(command: string, args: string[]): Promise<void> {
   });
 }
 
-async function runCapture(command: string, args: string[]): Promise<{ ok: boolean; output: string; error: string }> {
+export async function runCapture(command: string, args: string[], timeoutMs = DOCTOR_PROBE_TIMEOUT_MS): Promise<{ ok: boolean; output: string; error: string }> {
   return await new Promise((resolve) => {
     const chunks: Buffer[] = [];
     const errors: Buffer[] = [];
@@ -493,12 +531,27 @@ async function runCapture(command: string, args: string[]): Promise<{ ok: boolea
       });
     };
     const timer = setTimeout(() => {
-      child.kill();
+      terminateProcessTree(child);
       finish(false, "command timed out");
-    }, 10_000);
+    }, timeoutMs);
     child.once("error", (error) => finish(false, redactSecrets(String(error))));
     child.once("close", (code) => finish(code === 0, code === 0 ? "" : command + " exited with " + code));
   });
+}
+
+// Killing the shell wrapper alone on Windows leaves grandchildren behind.
+// taskkill /T /F terminates the whole subtree so a timed-out doctor probe
+// cannot orphan a codex/opencode child. If taskkill cannot be spawned (for
+// example it is missing from PATH), the failure is absorbed: cleanup is
+// best-effort and must not crash the doctor process.
+export function terminateProcessTree(child: import("node:child_process").ChildProcess): void {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { shell: false, windowsHide: true, stdio: "ignore" });
+    killer.once("error", () => undefined);
+  } else {
+    child.kill();
+  }
 }
 
 async function runUninstall(parsed: CliArgs): Promise<void> {

@@ -3,6 +3,13 @@ import path from "node:path";
 import { writePrivateFile, redactSecrets, redactUnknown, truncate } from "./security.js";
 import type { AgentRecord, JobRecord, OpenCodeMessage, ResultEnvelope } from "./types.js";
 
+const PROTOCOL_HEADINGS = ["STATUS", "SUMMARY", "ASSUMPTIONS", "CHANGES", "FILES", "TESTS", "RISKS", "UNRESOLVED"];
+
+// A heading value runs until the next known protocol heading or the end of the
+// text. Arbitrary uppercase lines such as "NOTE:" inside a value must not
+// terminate it.
+const PROTOCOL_HEADING_TERMINATOR = "(?=\\n\\s*(?:" + PROTOCOL_HEADINGS.join("|") + ")\\s*:|$)";
+
 export interface ParsedSubagentResult {
   status: "completed" | "failed" | "aborted";
   summary: string;
@@ -11,8 +18,36 @@ export interface ParsedSubagentResult {
   risks: string[];
   unresolved: string[];
   fullText: string;
+  hasText: boolean;
   assistantMessageId: string | null;
   userMessageId: string | null;
+}
+
+/**
+ * Aggregates the non-empty assistant text written after the job baseline.
+ * Empty tails (tool-only or reasoning-only assistant messages) are skipped so
+ * a truncated tail never shadows earlier text, and output from a prior
+ * continuation (before the baseline) never leaks into the current job. When a
+ * non-null baseline is not found in the session, no text is considered
+ * relevant (fail closed) instead of falling back to all history.
+ */
+export function assistantTextAfterBaseline(messages: OpenCodeMessage[], baselineAssistantId: string | null): { text: string; hasText: boolean } {
+  const assistants = messages.filter((message) => message.info?.role === "assistant");
+  const baselineIndex = baselineAssistantId
+    ? assistants.findIndex((message) => message.info?.id === baselineAssistantId)
+    : -1;
+  const relevant = baselineAssistantId === null
+    ? assistants
+    : baselineIndex < 0
+      ? []
+      : assistants.slice(baselineIndex + 1);
+  const blocks: string[] = [];
+  for (const message of relevant) {
+    const text = extractText(message);
+    if (text) blocks.push(text);
+  }
+  const fullText = blocks.join("\n\n");
+  return { text: fullText, hasText: fullText.trim().length > 0 };
 }
 
 export async function persistResult(
@@ -30,7 +65,7 @@ export async function persistResult(
     workerAborted?: boolean;
   } = {},
 ): Promise<{ envelope: ResultEnvelope; resultPath: string; parsed: ParsedSubagentResult }> {
-  const parsed = parseMessages(messages);
+  const parsed = parseMessages(messages, job.lastAssistantMessageId);
   const resultPath = path.join(dataDir, "results", job.id + ".json");
   const diffSummary = redactSecrets(summarizeDiff(diff));
   const envelope: ResultEnvelope = {
@@ -199,12 +234,13 @@ export function formatHumanResult(envelope: ResultEnvelope): string {
   return lines.join("\n");
 }
 
-function parseMessages(messages: OpenCodeMessage[]): ParsedSubagentResult {
+function parseMessages(messages: OpenCodeMessage[], baselineAssistantId: string | null = null): ParsedSubagentResult {
   const users = messages.filter((message) => message.info?.role === "user");
   const assistants = messages.filter((message) => message.info?.role === "assistant");
   const latest = assistants.at(-1);
-  const fullText = latest ? redactSecrets(extractText(latest)) : "";
-  const statusValue = headingValue(fullText, "STATUS").toLowerCase();
+  const output = assistantTextAfterBaseline(messages, baselineAssistantId);
+  const fullText = output.hasText ? redactSecrets(output.text) : "";
+  const statusValue = statusFirstToken(headingValue(fullText, "STATUS"));
   const status = statusValue === "failed"
     ? "failed"
     : statusValue === "aborted"
@@ -218,6 +254,7 @@ function parseMessages(messages: OpenCodeMessage[]): ParsedSubagentResult {
     risks: headingList(fullText, "RISKS"),
     unresolved: headingList(fullText, "UNRESOLVED"),
     fullText,
+    hasText: output.hasText,
     assistantMessageId: latest?.info?.id ?? null,
     userMessageId: users.at(-1)?.info?.id ?? null,
   };
@@ -231,19 +268,44 @@ function extractText(message: OpenCodeMessage): string {
     .trim();
 }
 
+// The aggregate text can contain intermediate milestone reports followed by a
+// final report. Each protocol heading is extracted from its latest occurrence
+// so an intermediate report never shadows the final one; earlier fields are
+// preserved only when no later occurrence exists.
+function headingCaptures(text: string, heading: string): string[] {
+  const pattern = new RegExp("(^|\\n)\\s*" + heading + "\\s*:\\s*([\\s\\S]*?)" + PROTOCOL_HEADING_TERMINATOR, "gi");
+  const captures: string[] = [];
+  for (const match of text.matchAll(pattern)) {
+    if (match[2] !== undefined) captures.push(match[2]);
+  }
+  return captures;
+}
+
 function headingValue(text: string, heading: string): string {
-  const match = text.match(new RegExp("(^|\\n)\\s*" + heading + "\\s*:\\s*([^\\n]+)", "i"));
-  return match?.[2]?.trim() ?? "";
+  const value = headingCaptures(text, heading).at(-1);
+  if (value === undefined) return "";
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+    .filter((line) => line.length > 0)
+    .join(" ");
 }
 
 function headingList(text: string, heading: string): string[] {
-  const match = text.match(new RegExp("(^|\\n)\\s*" + heading + "\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*[A-Z][A-Z_ ]+\\s*:|$)", "i"));
-  if (!match?.[2]) return [];
-  return match[2]
+  const value = headingCaptures(text, heading).at(-1);
+  if (value === undefined) return [];
+  return value
     .split(/\r?\n/)
     .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
     .filter((line) => line.length > 0 && !/^none$/i.test(line))
     .slice(0, 100);
+}
+
+// STATUS is compared on the first trimmed token/line only: a multiline
+// "STATUS: failed" followed by an explanation line still resolves to failed.
+function statusFirstToken(value: string): string {
+  const firstLine = value.split(/\r?\n/, 1)[0] ?? "";
+  return firstLine.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 }
 
 function firstParagraph(text: string): string {

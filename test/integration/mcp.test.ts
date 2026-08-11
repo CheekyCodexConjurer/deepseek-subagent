@@ -4,7 +4,41 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpClient } from "../../src/http-server.js";
-import { createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
+import { createLazyDaemonBootstrap, createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
+
+function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<string, unknown>> } {
+  return {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/spawn" || pathname === "/v1/jobs/continue") {
+        return {
+          accepted: true,
+          status: "accepted",
+          topic: "test topic",
+          modelDisplayName: "DeepSeek V4 Flash · Max",
+          agentId: "agent_1",
+          jobId: "job_1",
+          state: "Starting",
+        };
+      }
+      if (pathname === "/v1/jobs/consult") {
+        return {
+          agentId: "agent_1",
+          jobId: "job_1",
+          topic: "test topic",
+          status: "running",
+          elapsedSeconds: 1,
+          lastActivityAgoSeconds: 1,
+          currentActivity: "Working",
+          recentActivity: [],
+          filesTouched: [],
+          testSummary: "No test result observed yet.",
+          resultAvailable: false,
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  };
+}
 
 test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async () => {
   const config = createDefaultConfig({
@@ -75,6 +109,83 @@ test("MCP startup recovers an offline local daemon before exposing tools", async
   assert.equal(healthCalls, 2);
 });
 
+test("MCP handshake and tool listing complete without waiting for daemon startup; first operations wait", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = false;
+  let starts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const server = createMcpServer(acceptedCallFixture() as unknown as BridgeHttpClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        ready = true;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.listTools();
+    assert.equal(result.tools.length, 7);
+    assert.equal(starts, 0, "tool listing must not bootstrap the daemon");
+    const first = client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
+    const second = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    const [spawned, consulted] = await Promise.all([first, second]);
+    assert.equal(spawned.isError, undefined);
+    assert.equal(consulted.isError, undefined);
+    assert.equal(starts, 1, "concurrent first operations must share one bootstrap");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP bootstrap failure surfaces a clear readiness error on tool operations", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const healthClient = {
+    async health(): Promise<unknown> {
+      throw new Error("connect ECONNREFUSED");
+    },
+  };
+  const server = createMcpServer(acceptedCallFixture() as unknown as BridgeHttpClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        throw new Error("daemon refused to start");
+      },
+      timeoutMs: 20,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
+    assert.equal(result.isError, true);
+    const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(text, /daemon is not ready/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("MCP exposes visual_context as an optional string on spawn and continue", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
@@ -102,6 +213,52 @@ test("MCP exposes visual_context as an optional string on spawn and continue", a
     assert.match(spawn?.description ?? "", /Uncertainty/);
     assert.match(continueTool?.description ?? "", /visual_context/);
     assert.match(continueTool?.description ?? "", /never receives pixels/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP accepted text warns and names the exact job when dispatch outcome is uncertain", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/spawn") {
+        return {
+          accepted: true,
+          status: "accepted",
+          topic: "test topic",
+          modelDisplayName: "DeepSeek V4 Flash · Max",
+          agentId: "agent_1",
+          jobId: "job_1",
+          state: "Starting",
+          outcome: "dispatch_unknown",
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
+    assert.equal(result.isError, undefined, "an uncertain dispatch must still resolve as an accepted tool result");
+    const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(text, /Pending DeepSeek job: job_1/);
+    assert.match(text, /uncertain|transport failure/i);
+    assert.match(text, /deepseek_follow/);
+    const structured = result.structuredContent as Record<string, unknown>;
+    assert.equal(structured.accepted, true);
+    assert.equal(structured.agentId, "agent_1");
+    assert.equal(structured.jobId, "job_1");
+    assert.equal(structured.obligationState, "pending");
+    assert.equal(structured.nextRequiredAction, "deepseek_follow");
   } finally {
     await client.close();
     await server.close();

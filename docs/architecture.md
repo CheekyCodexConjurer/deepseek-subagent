@@ -4,11 +4,11 @@ DeepSeek Sub-Agent is a local bridge with one daemon, one stdio MCP process, an 
 
 ## Runtime flow
 
-1. The MCP tool calls the loopback daemon with a bearer token.
+1. The MCP tool calls the loopback daemon with a bearer token. The stdio MCP handshake and tool listing never wait for daemon or OpenCode startup; daemon readiness is bootstrapped lazily and memoized on the first tool call, and concurrent first calls share one bootstrap.
 2. The daemon validates the request, workspace boundary and context files.
 3. spawn creates one logical agent and one new OpenCode session. continue uses the same agent and session.
 4. The daemon sends one asynchronous OpenCode prompt and returns an accepted response.
-5. A single SSE subscription receives session events. session.idle triggers one reconciliation of messages and diff.
+5. A single SSE subscription receives session events. session.idle triggers one reconciliation of messages and diff. High-volume `message.part.delta` events are not persisted, and an idle session without non-empty assistant text (tool-only or reasoning-only tails included) never becomes a completed success.
 6. Observable events and bridge operations are written to `agent_activity`; consult reads this persisted table and never asks OpenCode for hidden reasoning or status polling.
 7. follow registers one shared waiter per job. It stays open until the persisted completion/error/approval event, a deadline, or cancellation of that waiter. Only the deadline and grace timers are allowed; there is no job-status polling loop.
 8. The full result is written before delivery is attempted. A grace-period result is marked `completed_partial`; an unresponsive worker is aborted after grace and marked `timed_out` with the last available evidence.
@@ -31,7 +31,7 @@ Startup recovery performs a bounded one-time reconciliation for unfinished jobs,
 
 ## State
 
-Agents move through created, working, needs_approval, completed, completed_partial, timed_out, failed, aborted and closed. Jobs additionally use following and finalizing, then completed_partial or timed_out when the deadline path is used. SQLite transition checks reject invalid transitions, follow/grace/approval deadlines survive daemon restart, and unique request ids make MCP retries idempotent.
+Agents move through created, working, needs_approval, completed, completed_partial, timed_out, failed, aborted and closed. Jobs additionally use following and finalizing, then completed_partial or timed_out when the deadline path is used. SQLite transition checks reject invalid transitions, follow/grace/approval deadlines survive daemon restart, and unique request ids make MCP retries idempotent. Completed, failed and timed-out writers remain continuable until `deepseek_close`; aborted agents are non-continuable and auto-close. MCP-supplied `thread_id`/`turn_id` are persisted as validated provenance-tagged hints (`hint_thread_id`, `hint_turn_id`, `hint_source`) and are never synthesized into bindings: delivery still requires the authoritative App Server `item/completed` correlation, and doctor/status report hint-versus-binding counts.
 
 ## Workspace strategies
 

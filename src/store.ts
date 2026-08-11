@@ -42,8 +42,13 @@ export class BridgeStore {
 
   constructor(readonly databasePath: string) {
     this.db = new DatabaseSync(databasePath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-    this.migrate();
+    try {
+      this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   static async open(dataDir: string): Promise<BridgeStore> {
@@ -56,8 +61,8 @@ export class BridgeStore {
   }
 
   integrityCheck(): string {
-    const row = this.db.prepare("PRAGMA integrity_check").get() as Row | undefined;
-    return row?.integrity_check === undefined ? "unknown" : String(row.integrity_check);
+    const row = this.db.prepare("PRAGMA quick_check").get() as Row | undefined;
+    return row?.quick_check === undefined ? "unknown" : String(row.quick_check);
   }
 
   migrate(): void {
@@ -111,6 +116,10 @@ export class BridgeStore {
       ["grace_deadline_at", "TEXT"],
       ["graceful_finalize_attempted", "INTEGER NOT NULL DEFAULT 0"],
       ["approval_deadline_at", "TEXT"],
+      ["hint_thread_id", "TEXT"],
+      ["hint_turn_id", "TEXT"],
+      ["hint_source", "TEXT"],
+      ["dispatch_unknown", "INTEGER NOT NULL DEFAULT 0"],
     ] as const) {
       if (!followColumns.some((column) => column.name === name)) {
         this.db.exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition);
@@ -119,6 +128,14 @@ export class BridgeStore {
     const followMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 4").get() as Row | undefined;
     if (!followMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?)").run(new Date().toISOString());
+    }
+    const hintMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 5").get() as Row | undefined;
+    if (!hintMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?)").run(new Date().toISOString());
+    }
+    const dispatchUnknownMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 6").get() as Row | undefined;
+    if (!dispatchUnknownMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?)").run(new Date().toISOString());
     }
   }
 
@@ -281,6 +298,47 @@ export class BridgeStore {
     const job = this.getJob(id);
     if (!job) throw new Error("Job disappeared: " + id);
     return job;
+  }
+
+  setJobError(id: string, error: string | null): JobRecord {
+    this.db.prepare("UPDATE jobs SET error = ? WHERE id = ?").run(error, id);
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  setCorrelationHint(id: string, input: { threadId?: string | null; turnId?: string | null; source: string }): JobRecord {
+    const current = this.getJob(id);
+    if (!current) throw new Error("Unknown job: " + id);
+    const threadId = input.threadId ?? current.hintThreadId;
+    const turnId = input.turnId ?? current.hintTurnId;
+    const source = threadId || turnId ? input.source : null;
+    this.db.prepare("UPDATE jobs SET hint_thread_id = ?, hint_turn_id = ?, hint_source = ? WHERE id = ?").run(
+      threadId,
+      turnId,
+      source,
+      id,
+    );
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  markDispatchUnknown(id: string): JobRecord {
+    this.db.prepare("UPDATE jobs SET dispatch_unknown = 1 WHERE id = ?").run(id);
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  countJobsWithCorrelationHints(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE hint_thread_id IS NOT NULL OR hint_turn_id IS NOT NULL").get() as Row;
+    return numberValue(row, "count");
+  }
+
+  countCodexBindings(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM codex_bindings").get() as Row;
+    return numberValue(row, "count");
   }
 
   hasActivity(input: { agentId: string; jobId: string; activityType: ActivityType }): boolean {
@@ -571,6 +629,10 @@ export class BridgeStore {
       graceDeadlineAt: nullableString(row, "grace_deadline_at"),
       gracefulFinalizeAttempted: numberValue(row, "graceful_finalize_attempted") === 1,
       approvalDeadlineAt: nullableString(row, "approval_deadline_at"),
+      hintThreadId: nullableString(row, "hint_thread_id"),
+      hintTurnId: nullableString(row, "hint_turn_id"),
+      hintSource: nullableString(row, "hint_source"),
+      dispatchUnknown: numberValue(row, "dispatch_unknown") === 1,
     };
   }
 

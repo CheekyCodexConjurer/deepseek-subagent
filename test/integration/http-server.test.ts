@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type AddressInfo } from "node:net";
+import { createServer, type AddressInfo, type Server as NetServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { Agent } from "undici";
+import { FOLLOW_MAX_TOTAL_MINUTES } from "../../src/config.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeHttpServer } from "../../src/http-server.js";
+import { BridgeHttpClient, BridgeHttpServer, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
 import type { BridgeService } from "../../src/service.js";
 
 async function freePort(): Promise<number> {
@@ -72,3 +75,99 @@ test("HTTP maps visual_context to spawn and continue inputs", async () => {
     await server.stop();
   }
 });
+
+test("bridge dispatcher timeouts exceed the maximum follow window plus margin", () => {
+  const maxFollowMs = FOLLOW_MAX_TOTAL_MINUTES * 60_000;
+  assert.equal(FOLLOW_MAX_TOTAL_MINUTES, 70);
+  assert.ok(BRIDGE_HEADERS_TIMEOUT_MS >= maxFollowMs + 10 * 60_000, "headers timeout must sit safely above 60 min wait + 10 min grace");
+  assert.ok(BRIDGE_BODY_TIMEOUT_MS >= maxFollowMs + 10 * 60_000, "body timeout must sit safely above the maximum follow window");
+});
+
+test("BridgeHttpClient uses the injected dispatcher and surfaces nested cause codes", async () => {
+  const http = createHttpServer((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end("{}");
+    }, 1_500);
+  });
+  await listenHttp(http);
+  const address = http.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const config = createDefaultConfig({
+      daemonHost: "127.0.0.1",
+      daemonPort: address.port,
+      daemonToken: "http-test-token",
+      dataDir: "C:\\deepseek-http-test-data",
+      configPath: "C:\\deepseek-http-test-data\\config.json",
+    });
+    const fastTimeout = new Agent({ headersTimeout: 250, bodyTimeout: 250 });
+    const client = new BridgeHttpClient(config, fastTimeout);
+    await assert.rejects(() => client.call("/v1/jobs/anything"), /UND_ERR_HEADERS_TIMEOUT/);
+    const normalClient = new BridgeHttpClient(config);
+    const value = await normalClient.get("/health");
+    assert.deepEqual(value, {});
+  } finally {
+    await closeHttp(http);
+  }
+});
+
+test("BridgeHttpClient surfaces fetch connection causes like ECONNREFUSED", async () => {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = probe.address();
+  assert.ok(address && typeof address === "object");
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: (address as AddressInfo).port,
+    daemonToken: "http-test-token",
+    dataDir: "C:\\deepseek-http-test-data",
+    configPath: "C:\\deepseek-http-test-data\\config.json",
+  });
+  const client = new BridgeHttpClient(config);
+  await assert.rejects(() => client.call("/v1/jobs/anything"), /ECONNREFUSED/);
+});
+
+test("doctor health dispatcher stays far below the bridge follow timeouts", () => {
+  assert.ok(DOCTOR_HEALTH_TIMEOUT_MS < BRIDGE_HEADERS_TIMEOUT_MS, "doctor probe must not inherit the 90-minute follow timeouts");
+  assert.ok(DOCTOR_HEALTH_TIMEOUT_MS <= 10_000, "doctor probe must be bounded to a few seconds");
+});
+
+test("doctor health dispatcher bounds an unresponsive daemon on the caller side", async () => {
+  const http = createHttpServer(() => {
+    // Stall forever: an unresponsive daemon must not hold doctor for 90 minutes.
+  });
+  await listenHttp(http);
+  const address = http.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const dispatcher = createDoctorHealthDispatcher(250);
+    const start = Date.now();
+    await assert.rejects(
+      () => fetch(`http://127.0.0.1:${address.port}/health`, { dispatcher }),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message + (error.cause instanceof Error ? ": " + error.cause.message : "") : String(error);
+        return /timeout/i.test(message);
+      },
+    );
+    assert.ok(Date.now() - start < 3_000, "doctor health probe must abort well below the follow timeouts");
+    await dispatcher.close();
+  } finally {
+    await closeHttp(http);
+  }
+});
+
+async function listenHttp(server: ReturnType<typeof createHttpServer>): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+}
+
+async function closeHttp(server: NetServer): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
