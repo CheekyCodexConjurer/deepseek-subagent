@@ -1,4 +1,5 @@
 import { access, open, readFile, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,10 +7,11 @@ import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePri
 import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpServer, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
 import { runMcp } from "./mcp.js";
+import { createLegacyPruneIndexes, evaluateRetentionPolicy, runRetentionPrune } from "./retention.js";
 import { BridgeService } from "./service.js";
 import { BridgeStore } from "./store.js";
 import { OpenCodeClient } from "./opencode/client.js";
-import type { BridgeConfig, DoctorCheck, DoctorReport } from "./types.js";
+import type { BridgeConfig, DoctorCheck, DoctorReport, RetentionMode } from "./types.js";
 
 export const DOCTOR_PROBE_TIMEOUT_MS = 10_000;
 
@@ -22,6 +24,7 @@ interface CliArgs {
   removeCodex: boolean;
   purgeData: boolean;
   confirmPurge: boolean;
+  confirmRetention: boolean;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -88,6 +91,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     case "config":
       await showConfig(config, parsed.json);
+      return;
+    case "obligations":
+      await showObligations(config, parsed.json);
+      return;
+    case "retention":
+      await runRetentionCommand(config, parsed.rest[0], parsed.json, parsed.confirmRetention);
       return;
     default:
       throw new Error("Unknown command: " + parsed.command);
@@ -304,6 +313,10 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
   const databasePath = path.join(config.dataDir, "bridge.sqlite");
   console.error("[doctor] checking database (synchronous SQLite quick_check; it can take a moment under IO/lock contention)");
   await doctorDatabaseCheck(databasePath, push);
+  console.error("[doctor] checking obligations and terminal-result consumption");
+  await doctorObligationChecks(databasePath, push);
+  console.error("[doctor] checking retention policy");
+  doctorRetentionCheck(config, databasePath, push);
   const report: DoctorReport = {
     generatedAt: new Date().toISOString(),
     displayName: "DeepSeek Sub-Agent",
@@ -345,6 +358,88 @@ export async function doctorDatabaseCheck(databasePath: string, push: (check: Do
     });
   } catch (error) {
     push({ name: "database", status: "error", detail: redactSecrets(String(error)) });
+  }
+}
+
+export async function doctorObligationChecks(databasePath: string, push: (check: DoctorCheck) => void): Promise<void> {
+  if (!(await canRead(databasePath))) {
+    push({ name: "obligation_consumption", status: "ok", detail: "no database yet" });
+    return;
+  }
+  try {
+    withStore(databasePath, (store) => {
+      const unconsumed = store.listUnconsumedTerminalResults();
+      push({
+        name: "obligation_consumption",
+        status: unconsumed.length > 0 ? "warning" : "ok",
+        detail: unconsumed.length > 0
+          ? unconsumed.length + " terminal result(s) with a persisted result were never consumed by follow/recover: " + unconsumed.slice(0, 5).map((job) => job.id).join(", ")
+          : "every terminal result has been consumed",
+      });
+      const openTerminal = store.countOpenTerminalAgents();
+      push({
+        name: "open_terminal_agents",
+        status: openTerminal > 0 ? "warning" : "ok",
+        detail: openTerminal > 0
+          ? openTerminal + " completed/failed/timed-out agent(s) are still open (not closed); close them with deepseek_close after reviewing"
+          : "no terminal agents left open",
+      });
+      const openObligations = store.countOpenObligations();
+      push({
+        name: "open_obligations",
+        status: openObligations > 0 ? "warning" : "ok",
+        detail: openObligations > 0
+          ? openObligations + " job obligation(s) are still active (dispatching/running/following/finalizing/needs_approval)"
+          : "no open obligations",
+      });
+      const staleFollowWindows = store.countStaleFollowWindows();
+      push({
+        name: "stale_follow_windows",
+        status: staleFollowWindows > 0 ? "warning" : "ok",
+        detail: staleFollowWindows > 0
+          ? staleFollowWindows + " follow window(s) expired their grace deadline while the job is still following/finalizing; restart recovery settles them, no auto-close is performed"
+          : "no stale follow windows (fresh and auto-armed windows are not flagged)",
+      });
+    });
+  } catch (error) {
+    push({ name: "obligation_consumption", status: "error", detail: redactSecrets(String(error)) });
+  }
+}
+
+export function doctorRetentionCheck(config: BridgeConfig, databasePath: string, push: (check: DoctorCheck) => void): void {
+  push({
+    name: "retention_mode",
+    status: config.retentionMode === "disabled" ? "ok" : "warning",
+    detail: "mode=" + config.retentionMode
+      + (config.retentionMode === "disabled" ? " (pruning never runs; events and activity are retained indefinitely)" : ""),
+  });
+  if (!existsSync(databasePath)) {
+    push({ name: "retention", status: "ok", detail: "no database yet" });
+    return;
+  }
+  try {
+    withStore(databasePath, (store) => {
+      const policy = evaluateRetentionPolicy(store, config.retentionMode);
+      const unpreparedEnabled = config.retentionMode === "enabled" && !policy.pruningEnabled;
+      const autoLegacy = config.retentionMode === "auto" && policy.dbState === "legacy";
+      push({
+        name: "retention",
+        status: unpreparedEnabled || autoLegacy ? "warning" : "ok",
+        detail: "mode=" + config.retentionMode + " db=" + policy.dbState + " pruningEnabled=" + policy.pruningEnabled
+          + (policy.reason ? "; " + policy.reason : ""),
+      });
+      if (config.retentionMode !== "disabled") {
+        const dryRun = runRetentionPrune(store, { dryRun: true });
+        push({
+          name: "retention_dry_run",
+          status: dryRun.prunedEvents + dryRun.prunedActivity === 0 ? "ok" : "warning",
+          detail: "would prune " + dryRun.prunedEvents + " event(s) and " + dryRun.prunedActivity + " activity row(s); " +
+            dryRun.protectedEvents + " event(s) and " + dryRun.protectedActivity + " activity row(s) protected",
+        });
+      }
+    });
+  } catch (error) {
+    push({ name: "retention", status: "error", detail: redactSecrets(String(error)) });
   }
 }
 
@@ -450,6 +545,136 @@ async function showConfig(config: BridgeConfig, json: boolean): Promise<void> {
   output(json, safe, JSON.stringify(safe, null, 2));
 }
 
+interface ObligationDiagnostics {
+  unconsumedTerminalResults: Array<{ jobId: string; agentId: string; status: string; createdAt: string }>;
+  openTerminalAgents: Array<{ agentId: string; status: string; title: string }>;
+  openObligations: Array<{ jobId: string; agentId: string; status: string; createdAt: string }>;
+  staleFollowWindows: Array<{ jobId: string; agentId: string; status: string; graceDeadlineAt: string | null }>;
+}
+
+/**
+ * Offline obligation diagnostics. Read-only: warnings only, never auto-close
+ * and never auto-consume.
+ */
+export function collectObligationDiagnostics(databasePath: string): ObligationDiagnostics | null {
+  if (!existsSync(databasePath)) return null;
+  return withStore(databasePath, (store) => {
+    const unconsumedTerminalResults = store.listUnconsumedTerminalResults().map((job) => ({
+      jobId: job.id,
+      agentId: job.agentId,
+      status: job.status,
+      createdAt: job.createdAt,
+    }));
+    const openTerminalAgents = store.listAgents()
+      .filter((agent) => ["completed", "completed_partial", "timed_out", "failed"].includes(agent.status) && agent.closedAt === null)
+      .map((agent) => ({ agentId: agent.id, status: agent.status, title: agent.title }));
+    const openObligations = store.listJobs()
+      .filter((job) => ["dispatching", "running", "following", "finalizing", "needs_approval"].includes(job.status))
+      .map((job) => ({ jobId: job.id, agentId: job.agentId, status: job.status, createdAt: job.createdAt }));
+    const staleFollowWindows = store.listJobs()
+      .filter((job) => ["following", "finalizing"].includes(job.status) && job.graceDeadlineAt !== null && !job.dispatchUnknown)
+      .filter((job) => Date.parse(job.graceDeadlineAt ?? "") < Date.now())
+      .map((job) => ({ jobId: job.id, agentId: job.agentId, status: job.status, graceDeadlineAt: job.graceDeadlineAt }));
+    return { unconsumedTerminalResults, openTerminalAgents, openObligations, staleFollowWindows };
+  });
+}
+
+async function showObligations(config: BridgeConfig, json: boolean): Promise<void> {
+  const diagnostics = collectObligationDiagnostics(path.join(config.dataDir, "bridge.sqlite"));
+  if (!diagnostics) {
+    output(json, { unconsumedTerminalResults: [], openTerminalAgents: [], openObligations: [], staleFollowWindows: [] }, "No bridge database exists yet.");
+    return;
+  }
+  if (json) {
+    console.log(JSON.stringify(diagnostics, null, 2));
+    return;
+  }
+  const warnings: string[] = [];
+  if (diagnostics.unconsumedTerminalResults.length > 0) {
+    warnings.push("WARNING: " + diagnostics.unconsumedTerminalResults.length + " terminal result(s) were never consumed by follow/recover: " +
+      diagnostics.unconsumedTerminalResults.map((item) => item.jobId).join(", "));
+  }
+  if (diagnostics.openTerminalAgents.length > 0) {
+    warnings.push("WARNING: " + diagnostics.openTerminalAgents.length + " terminal agent(s) are still open (not closed); close them with deepseek_close after reviewing: " +
+      diagnostics.openTerminalAgents.map((item) => item.agentId).join(", "));
+  }
+  if (diagnostics.openObligations.length > 0) {
+    warnings.push("WARNING: " + diagnostics.openObligations.length + " job obligation(s) are still open: " +
+      diagnostics.openObligations.map((item) => item.jobId).join(", "));
+  }
+  if (diagnostics.staleFollowWindows.length > 0) {
+    warnings.push("WARNING: " + diagnostics.staleFollowWindows.length + " follow window(s) expired their grace deadline while still following/finalizing: " +
+      diagnostics.staleFollowWindows.map((item) => item.jobId).join(", ") + " (restart recovery settles them; nothing was auto-closed)");
+  }
+  output(json, diagnostics, warnings.length > 0 ? warnings.join("\n") : "No open obligations, unconsumed terminal results, open terminal agents or stale follow windows.");
+}
+
+const RETENTION_MODES: readonly RetentionMode[] = ["auto", "disabled", "dry-run", "enabled"];
+
+async function runRetentionCommand(config: BridgeConfig, mode: string | undefined, json: boolean, confirm: boolean): Promise<void> {
+  if (!mode || !(RETENTION_MODES as readonly string[]).includes(mode)) {
+    throw new Error("retention requires one of: " + RETENTION_MODES.join(", "));
+  }
+  const requested = mode as RetentionMode;
+  const databasePath = path.join(config.dataDir, "bridge.sqlite");
+  if (requested === "dry-run") {
+    if (!existsSync(databasePath)) {
+      output(json, { mode: "dry-run", prunedEvents: 0, prunedActivity: 0, note: "no database yet" }, "No database yet; nothing to preview.");
+      await saveConfig({ ...config, retentionMode: requested });
+      return;
+    }
+    withStore(databasePath, (store) => {
+      createLegacyPruneIndexes(store);
+      const dryRun = runRetentionPrune(store, { dryRun: true });
+      const policy = evaluateRetentionPolicy(store, requested);
+      // Explicit offline preparation: this preview is the operator-approved
+      // gate that arms pruning on a legacy database.
+      if (policy.dbState === "legacy") store.markRetentionPrepared();
+      output(json, { ...dryRun, mode: "dry-run", dbState: policy.dbState, note: "preview only; no rows were deleted" },
+        "Dry-run retention preview (no rows were deleted): would prune " + dryRun.prunedEvents + " event(s) and " +
+          dryRun.prunedActivity + " activity row(s); " + dryRun.protectedEvents + " event(s) and " +
+          dryRun.protectedActivity + " activity row(s) protected.");
+    });
+    await saveConfig({ ...config, retentionMode: requested });
+    return;
+  }
+  if (requested === "enabled") {
+    if (!existsSync(databasePath)) {
+      await saveConfig({ ...config, retentionMode: requested });
+      output(json, { mode: "enabled", prunedEvents: 0, prunedActivity: 0, note: "no database yet; pruning is armed for future runs" },
+        "Retention enabled. No database yet; pruning is armed for future runs.");
+      return;
+    }
+    withStore(databasePath, (store) => {
+      const policy = evaluateRetentionPolicy(store, requested);
+      if (policy.dbState === "legacy" && !confirm) {
+        throw new Error("The existing database is not empty (legacy). Run `retention dry-run` first to preview what would be pruned, then repeat with --confirm. No rows were deleted.");
+      }
+      createLegacyPruneIndexes(store);
+      // Explicit offline confirmation: arm pruning on this legacy database.
+      if (policy.dbState === "legacy") store.markRetentionPrepared();
+      const result = runRetentionPrune(store, {});
+      output(json, { ...result, mode: "enabled", note: "only events and agent_activity are pruned; agents/jobs/results/deliveries/bindings/inbox are never touched" },
+        "Retention enabled. Pruned " + result.prunedEvents + " event(s) and " + result.prunedActivity + " activity row(s); checkpoint=" + result.checkpoint + ".");
+    });
+    await saveConfig({ ...config, retentionMode: requested });
+    return;
+  }
+  if (requested === "auto") {
+    if (existsSync(databasePath)) {
+      const policy = withStore(databasePath, (store) => evaluateRetentionPolicy(store, requested));
+      if (policy.dbState === "legacy") {
+        console.error("WARNING: auto mode stays disabled because the database already contains data. Run `retention dry-run` to preview or `retention enabled --confirm` to prune it explicitly.");
+      }
+    }
+    await saveConfig({ ...config, retentionMode: requested });
+    output(json, { mode: "auto", note: "auto enables pruning only on a provably empty database" }, "Retention mode set to auto.");
+    return;
+  }
+  await saveConfig({ ...config, retentionMode: requested });
+  output(json, { mode: "disabled", note: "no pruning runs; events and activity are retained indefinitely" }, "Retention disabled. No pruning runs.");
+}
+
 async function ensureConfig(configPath: string): Promise<BridgeConfig> {
   const config = await loadConfig(configPath);
   await ensurePrivateDir(config.dataDir);
@@ -477,6 +702,7 @@ function parseArgs(argv: string[]): CliArgs {
   let removeCodex = false;
   let purgeData = false;
   let confirmPurge = false;
+  let confirmRetention = false;
   const rest: string[] = [];
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
@@ -485,13 +711,14 @@ function parseArgs(argv: string[]): CliArgs {
     else if (value === "--remove-codex") removeCodex = true;
     else if (value === "--purge-data") purgeData = true;
     else if (value === "--confirm-purge") confirmPurge = true;
+    else if (value === "--confirm") confirmRetention = true;
     else if (value === "--config") {
       const next = argv[++index];
       if (!next) throw new Error("--config requires a path");
       configPath = path.resolve(next);
     } else rest.push(value as string);
   }
-  return { command, rest, json, verbose, configPath, removeCodex, purgeData, confirmPurge };
+  return { command, rest, json, verbose, configPath, removeCodex, purgeData, confirmPurge, confirmRetention };
 }
 
 function output(json: boolean, value: unknown, human: string): void {
@@ -653,7 +880,8 @@ function printHelp(): void {
   console.log([
     "DeepSeek Sub-Agent local bridge",
     "",
-    "Commands: daemon, mcp, install, start, stop, restart, doctor, logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show",
+    "Commands: daemon, mcp, install, start, stop, restart, doctor, logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>",
+    "retention enabled on an existing database requires --confirm after reviewing `retention dry-run`. Run retention commands while the daemon is stopped.",
     "Use --json for machine-readable output or --verbose for technical IDs in human listings. Secrets are always redacted.",
   ].join("\n"));
 }

@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { access, chmod, mkdir, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { InvalidRequestError } from "./errors.js";
 
 const SECRET_PATTERNS = [
   /(authorization\s*:\s*bearer\s+)[^\s]+/gi,
@@ -97,6 +98,85 @@ export function assertInside(root: string, candidate: string): string {
 
 export function validateContextFiles(root: string, files: string[]): string[] {
   return files.map((file) => assertInside(root, path.isAbsolute(file) ? file : path.join(root, file)));
+}
+
+export const DEFAULT_MAX_CONTEXT_FILE_BYTES = 1_000_000;
+
+export type ContextFileValidationReason = "outside_workspace" | "missing" | "not_a_regular_file" | "unreadable" | "too_large" | "inside_worktrees_directory";
+
+export interface ContextFileValidationErrorDetails {
+  file: string;
+  reason: ContextFileValidationReason;
+  sizeBytes?: number;
+  maxBytes?: number;
+}
+
+/**
+ * Validates every context file before any workspace/worktree/session/job side
+ * effect: containment inside the workspace root, existence, regular readable
+ * file, and bounded size. Oversized input is rejected with a stable typed 400,
+ * never silently truncated.
+ */
+export async function validateContextFilesStrict(
+  root: string,
+  files: string[],
+  maxBytes = DEFAULT_MAX_CONTEXT_FILE_BYTES,
+): Promise<string[]> {
+  const resolved: string[] = [];
+  for (const file of files) {
+    let candidate: string;
+    try {
+      candidate = assertInside(root, path.isAbsolute(file) ? file : path.join(root, file));
+    } catch (error) {
+      throw new InvalidRequestError(
+        "context file is outside the requested workspace: " + file,
+        "context_file_invalid",
+        { file, reason: "outside_workspace" } satisfies ContextFileValidationErrorDetails,
+      );
+    }
+    const info = await stat(candidate).catch((error: unknown) => {
+      const code = error && typeof error === "object" && "code" in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      if (code === "ENOENT") {
+        throw new InvalidRequestError(
+          "context file does not exist: " + file,
+          "context_file_invalid",
+          { file, reason: "missing" } satisfies ContextFileValidationErrorDetails,
+        );
+      }
+      throw error;
+    });
+    if (!info.isFile()) {
+      throw new InvalidRequestError(
+        "context file is not a regular file: " + file,
+        "context_file_invalid",
+        { file, reason: "not_a_regular_file" } satisfies ContextFileValidationErrorDetails,
+      );
+    }
+    const readable = await access(candidate).then(() => true).catch(() => false);
+    if (!readable) {
+      throw new InvalidRequestError(
+        "context file is not readable: " + file,
+        "context_file_invalid",
+        { file, reason: "unreadable" } satisfies ContextFileValidationErrorDetails,
+      );
+    }
+    if (info.size > maxBytes) {
+      throw new InvalidRequestError(
+        "context file exceeds the configured size limit (" + maxBytes + " bytes): " + file,
+        "context_file_invalid",
+        {
+          file,
+          reason: "too_large",
+          sizeBytes: info.size,
+          maxBytes,
+        } satisfies ContextFileValidationErrorDetails,
+      );
+    }
+    resolved.push(candidate);
+  }
+  return resolved;
 }
 
 export async function ensurePrivateDir(directory: string): Promise<void> {

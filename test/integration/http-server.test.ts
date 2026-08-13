@@ -5,7 +5,9 @@ import { createServer as createHttpServer } from "node:http";
 import { Agent } from "undici";
 import { FOLLOW_MAX_TOTAL_MINUTES } from "../../src/config.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeHttpClient, BridgeHttpServer, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
+import { BridgeError, ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError } from "../../src/errors.js";
+import { BridgeBusyError } from "../../src/service.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
 import type { BridgeService } from "../../src/service.js";
 
 async function freePort(): Promise<number> {
@@ -171,3 +173,202 @@ async function listenHttp(server: ReturnType<typeof createHttpServer>): Promise<
 async function closeHttp(server: NetServer): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+test("HTTP surfaces stable typed 400/404/409/500 error codes in the JSON body", async () => {
+  const service = {
+    spawn: async () => {
+      throw new InvalidRequestError("Unknown model route: nonsense", "unknown_route", { route: "nonsense" });
+    },
+    consult: async () => {
+      throw new UnknownAgentError("agent_missing");
+    },
+    follow: async () => {
+      throw new ConflictError("Agent is busy with job job_9", "busy");
+    },
+    abort: async () => {
+      throw new NotFoundError("No persisted result is available for job job_9");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-error-token",
+    dataDir: "C:\\deepseek-http-error-data",
+    configPath: "C:\\deepseek-http-error-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+    const post = async (pathname: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> => {
+      const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}${pathname}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+
+    const route = await post("/v1/jobs/spawn", { topic: "t", task: "t", model_route: "nonsense" });
+    assert.equal(route.status, 400);
+    assert.equal(route.body.code, "unknown_route");
+    assert.equal(route.body.status, 400);
+    assert.deepEqual(route.body.details, { route: "nonsense" });
+
+    const agent = await post("/v1/jobs/consult", { agent_id: "agent_missing" });
+    assert.equal(agent.status, 404);
+    assert.equal(agent.body.code, "unknown_agent");
+
+    const busy = await post("/v1/jobs/follow", { agent_id: "agent_busy" });
+    assert.equal(busy.status, 409);
+    assert.equal(busy.body.code, "busy");
+
+    const missing = await post("/v1/jobs/abort", { agent_id: "agent_x" });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, "not_found");
+
+    const badBody = await post("/v1/jobs/spawn", "not json");
+    assert.equal(badBody.status, 400);
+    assert.equal(badBody.body.code, "invalid_request");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP maps BridgeBusyError to 409 with retry and jobId without text sniffing", async () => {
+  const service = {
+    spawn: async () => {
+      throw new BridgeBusyError("job_busy_1");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-busy-token",
+    dataDir: "C:\\deepseek-http-busy-data",
+    configPath: "C:\\deepseek-http-busy-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ topic: "t", task: "t" }),
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, "busy");
+    assert.equal(body.retry, false);
+    assert.equal(body.jobId, "job_busy_1");
+    assert.ok(body.error && typeof body.error === "string" && body.error.length > 0);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("unknown errors map to a stable 500 internal code", async () => {
+  const service = {
+    spawn: async () => {
+      throw new Error("unexpected internal failure");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-500-token",
+    dataDir: "C:\\deepseek-http-500-data",
+    configPath: "C:\\deepseek-http-500-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ topic: "t", task: "t" }),
+    });
+    assert.equal(response.status, 500);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, "internal");
+    assert.equal(body.status, 500);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("unauthorized requests return a structured typed 401 body", async () => {
+  const service = {
+    spawn: async () => {
+      throw new Error("must never be reached without a valid token");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-401-token",
+    dataDir: "C:\\deepseek-http-401-data",
+    configPath: "C:\\deepseek-http-401-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wrong-token",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ topic: "t", task: "t" }),
+    });
+    assert.equal(response.status, 401);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.error, "Unauthorized");
+    assert.equal(body.code, "unauthorized");
+    assert.equal(body.status, 401);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("BridgeHttpClient propagates the daemon's structured code as a typed BridgeHttpError", async () => {
+  const http = createHttpServer((_request, response) => {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "Model route is disabled: pro-max", code: "route_disabled", status: 400, details: { route: "pro-max" } }));
+  });
+  await listenHttp(http);
+  const address = http.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const config = createDefaultConfig({
+      daemonHost: "127.0.0.1",
+      daemonPort: address.port,
+      daemonToken: "http-client-token",
+      dataDir: "C:\\deepseek-http-client-data",
+      configPath: "C:\\deepseek-http-client-data\\config.json",
+    });
+    const client = new BridgeHttpClient(config);
+    await assert.rejects(
+      () => client.call("/v1/jobs/spawn", { topic: "t", task: "t", model_route: "pro-max" }),
+      (error: unknown) => {
+        assert.ok(error instanceof BridgeHttpError);
+        assert.equal(error.status, 400);
+        assert.equal(error.code, "route_disabled");
+        assert.deepEqual(error.details, { route: "pro-max" });
+        assert.ok(error instanceof BridgeError === false);
+        return true;
+      },
+    );
+  } finally {
+    await closeHttp(http);
+  }
+});

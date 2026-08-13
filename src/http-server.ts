@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL } from "node:url";
 import { Agent, fetch, type Dispatcher } from "undici";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
+import { BridgeError, InvalidRequestError } from "./errors.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
 import type { AgentMode, ConsultInput, ContinueInput, FollowInput, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
@@ -53,11 +54,7 @@ export class BridgeHttpServer {
     const server = createServer((request, response) => {
       void this.handle(request, response).catch((error: unknown) => {
         if (error instanceof FollowCancelledError || response.destroyed || response.writableEnded) return;
-        const status = error instanceof BridgeBusyError ? 409 : 500;
-        writeJson(response, status, {
-          error: redactSecrets(String(error)),
-          ...(error instanceof BridgeBusyError ? { code: error.code, retry: false, jobId: error.jobId } : {}),
-        });
+        writeError(response, error);
       });
     });
     this.server = server;
@@ -85,7 +82,7 @@ export class BridgeHttpServer {
       return;
     }
     if (!this.authorized(request)) {
-      writeJson(response, 401, { error: "Unauthorized" });
+      writeJson(response, 401, { error: "Unauthorized", code: "unauthorized", status: 401 });
       return;
     }
     if (method === "GET" && url.pathname === "/v1/agents") {
@@ -96,7 +93,9 @@ export class BridgeHttpServer {
       writeJson(response, 200, { jobs: this.service.listJobs() });
       return;
     }
-    const body = method === "POST" ? await readJson(request) : null;
+    const body = method === "POST" ? await readJson(request).catch((error: unknown) => {
+      throw invalidRequestError(error);
+    }) : null;
     if (method === "POST" && url.pathname === "/v1/jobs/spawn") {
       const result = await this.service.spawn(toSpawnInput(body));
       writeJson(response, 202, result);
@@ -159,7 +158,7 @@ export class BridgeHttpServer {
     if (method === "GET" && jobMatch) {
       const job = this.service.getJob(decodeURIComponent(jobMatch[1] as string));
       if (!job) {
-        writeJson(response, 404, { error: "Job not found" });
+        writeJson(response, 404, { error: "Job not found", code: "unknown_job", status: 404 });
         return;
       }
       writeJson(response, 200, { job });
@@ -169,13 +168,13 @@ export class BridgeHttpServer {
     if (method === "GET" && agentMatch) {
       const agent = this.service.getAgent(decodeURIComponent(agentMatch[1] as string));
       if (!agent) {
-        writeJson(response, 404, { error: "Agent not found" });
+        writeJson(response, 404, { error: "Agent not found", code: "unknown_agent", status: 404 });
         return;
       }
       writeJson(response, 200, { agent });
       return;
     }
-    writeJson(response, 404, { error: "Not found" });
+    writeJson(response, 404, { error: "Not found", code: "not_found", status: 404 });
   }
 
   private authorized(request: IncomingMessage): boolean {
@@ -242,6 +241,43 @@ function describeFetchError(error: unknown): string {
   return code !== undefined ? message + " (cause: " + String(code) + " - " + causeText + ")" : message + " (cause: " + causeText + ")";
 }
 
+/**
+ * Stable typed HTTP error contract: { error, code, status } plus optional
+ * details and retry semantics. Text is never sniffed by consumers; the code
+ * is the machine-readable discriminator.
+ */
+function writeError(response: ServerResponse, error: unknown): void {
+  if (error instanceof BridgeError) {
+    const body: Record<string, unknown> = {
+      error: redactSecrets(error.message),
+      code: error.code,
+      status: error.status,
+    };
+    if (error.details !== undefined) body.details = error.details;
+    if (error instanceof BridgeBusyError) {
+      body.retry = false;
+      body.jobId = error.jobId;
+    }
+    writeJson(response, error.status, body);
+    return;
+  }
+  writeJson(response, 500, { error: redactSecrets(String(error)), code: "internal", status: 500 });
+}
+
+export class BridgeHttpError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly details: unknown;
+
+  constructor(status: number, code: string, message: string, details?: unknown) {
+    super(message);
+    this.name = "BridgeHttpError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
 async function parseResponse(response: BridgeFetchResponse): Promise<unknown> {
   const text = await response.text();
   let value: unknown;
@@ -251,10 +287,28 @@ async function parseResponse(response: BridgeFetchResponse): Promise<unknown> {
     value = text;
   }
   if (!response.ok) {
-    const detail = typeof value === "string" ? value : JSON.stringify(value);
-    throw new Error("Bridge HTTP " + response.status + ": " + truncate(redactSecrets(detail), 600));
+    const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+    const code = typeof record?.code === "string" && record.code.length > 0 ? record.code : defaultCodeForStatus(response.status);
+    const detail = typeof value === "string" ? value : typeof record?.error === "string" ? record.error : JSON.stringify(value);
+    throw new BridgeHttpError(response.status, code, truncate(redactSecrets(detail), 600), record?.details);
   }
   return value;
+}
+
+function defaultCodeForStatus(status: number): string {
+  if (status === 400) return "invalid_request";
+  if (status === 401) return "unauthorized";
+  if (status === 404) return "not_found";
+  if (status === 409) return "conflict";
+  return "internal";
+}
+
+function invalidRequestError(error: unknown): BridgeError {
+  if (error instanceof BridgeError) return error;
+  const message = error && typeof error === "object" && "message" in error
+    ? String((error as { message: unknown }).message)
+    : String(error);
+  return new BridgeError(400, "invalid_request", message);
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
@@ -282,7 +336,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function requiredString(value: unknown, name: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error(name + " is required");
+  if (typeof value !== "string" || value.trim().length === 0) throw new InvalidRequestError(name + " is required");
   return value.trim();
 }
 
@@ -292,7 +346,7 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalArray(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error("contextFiles must be an array of strings");
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new InvalidRequestError("contextFiles must be an array of strings");
   return value as string[];
 }
 
@@ -308,6 +362,7 @@ function toSpawnInput(body: unknown): SpawnInput {
   const visualContext = optionalString(value.visualContext ?? value.visual_context);
   const threadId = optionalString(value.threadId ?? value.thread_id);
   const turnId = optionalString(value.turnId ?? value.turn_id);
+  const modelRoute = optionalString(value.modelRoute ?? value.model_route);
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     topic: requiredString(value.topic, "topic"),
@@ -319,6 +374,7 @@ function toSpawnInput(body: unknown): SpawnInput {
     ...(visualContext ? { visualContext } : {}),
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
+    ...(modelRoute ? { modelRoute } : {}),
   };
 }
 
@@ -373,10 +429,10 @@ function toFollowInput(body: unknown): FollowInput {
 
 function enumValue(value: unknown, allowed: string[], name: string): string {
   if (typeof value === "string" && allowed.includes(value)) return value;
-  throw new Error(name + " must be one of: " + allowed.join(", "));
+  throw new InvalidRequestError(name + " must be one of: " + allowed.join(", "));
 }
 
 function integerInRange(value: unknown, minimum: number, maximum: number, name: string): number {
   if (typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum) return value;
-  throw new Error(name + " must be an integer between " + minimum + " and " + maximum);
+  throw new InvalidRequestError(name + " must be an integer between " + minimum + " and " + maximum);
 }

@@ -16,6 +16,82 @@
     "variant": "max",
     "display": "DeepSeek V4 Flash · Max"
   },
+  "routes": {
+    "registry": [
+      {
+        "name": "flash-max",
+        "provider": "opencode-go",
+        "model": "deepseek-v4-flash",
+        "variant": "max",
+        "enabled": true,
+        "default": true,
+        "display": "DeepSeek V4 Flash · Max"
+      },
+      {
+        "name": "pro-max",
+        "provider": "opencode-go",
+        "model": "deepseek-v4-pro",
+        "variant": "max",
+        "enabled": false,
+        "default": false,
+        "display": "DeepSeek V4 Pro · Max"
+      }
+    ],
+    "modelRouteOnSpawn": "optional; unknown or disabled routes fail closed with a typed 400 before any side effect; no fallback route",
+    "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults",
+    "legacyCompatibility": "agents without a pinned route keep dispatching on their persisted flat provider/model/variant columns"
+  },
+  "errors": {
+    "typed": true,
+    "statusCodes": ["400", "401", "404", "409", "500"],
+    "propagation": "stable machine-readable codes flow through HTTP bodies and MCP structuredContent without text sniffing",
+    "codes": [
+      "invalid_request",
+      "unknown_route",
+      "route_disabled",
+      "context_file_invalid",
+      "unknown_agent",
+      "unknown_job",
+      "not_found",
+      "busy",
+      "not_continuable",
+      "not_followable",
+      "permission_required",
+      "permission_mismatch",
+      "job_agent_mismatch",
+      "unauthorized",
+      "internal"
+    ]
+  },
+  "contextFiles": {
+    "prevalidation": "containment, existence, regular readable file and bounded size are validated before any workspace/worktree/session/job side effect; rejected input returns a typed 400 and never creates an orphan worktree",
+    "oversizedInput": "rejected, never silently truncated",
+    "maxContextFileBytes": 1000000
+  },
+  "visualContext": {
+    "semantics": "textual only; optional string on spawn and continue, no default. The orchestrator inspects visuals itself and sends three labeled parts ('Direct observations:', 'Interpretation:', 'Uncertainty:'). DeepSeek never receives pixels; direct observations are evidence, interpretation is a hypothesis, and details absent from the context must not be invented"
+  },
+  "obligations": {
+    "consumption": "terminal results become consumed when follow/recover returns a usable final result (persisted per job); needs_approval stays pending",
+    "agentCloseSeparate": "closing the agent is separate from consuming the obligation",
+    "doctorWarnings": [
+      "unconsumed terminal results",
+      "terminal agents still open",
+      "open obligations",
+      "genuine stale follow windows only (no false positives for fresh or auto-armed jobs; no auto-close)"
+    ]
+  },
+  "retention": {
+    "modes": ["auto", "disabled", "dry-run", "enabled"],
+    "default": "disabled",
+    "autoGate": "auto only enables pruning on a provably empty database",
+    "intrinsicGate": "online pruning on a non-empty legacy database requires the in-database offline-preparation marker written by `retention dry-run` or `retention enabled --confirm`; a hand-edited retentionMode=enabled alone never arms pruning",
+    "prunesOnly": ["events", "agent_activity"],
+    "neverPrunes": ["agents", "jobs", "results", "deliveries", "bindings", "inbox"],
+    "protections": ["active jobs", "open obligations", "unconsumed results", "undelivered results", "fresh rows", "activity floor of 50 newest rows per agent"],
+    "metrics": "dry-run and real passes report accurate protected counts (rows never eligible for pruning); doctor never claims zero protected when protected rows exist",
+    "safety": ["chunked", "time-bounded", "idempotent", "PASSIVE WAL checkpoint only, never an online VACUUM", "legacy prune indexes created only by the offline CLI path"]
+  },
   "delivery": {
     "primary": "event-driven-follow-and-persistence",
     "fallback": "private-inbox",

@@ -1,6 +1,25 @@
 export type WorkspaceStrategy = "shared" | "worktree";
 export type AgentMode = "analyze" | "edit" | "test";
 export type JobKind = "spawn" | "continue";
+export type RetentionMode = "auto" | "disabled" | "dry-run" | "enabled";
+
+export interface ModelRoute {
+  name: string;
+  providerId: string;
+  modelId: string;
+  variant: string | null;
+  enabled: boolean;
+  default: boolean;
+  display: string;
+}
+
+export interface ResolvedRoute {
+  name: string;
+  providerId: string;
+  modelId: string;
+  variant: string | null;
+  display: string;
+}
 export type JobStatus =
   | "created"
   | "dispatching"
@@ -41,6 +60,7 @@ export interface SpawnInput {
   visualContext?: string;
   threadId?: string;
   turnId?: string;
+  modelRoute?: string;
 }
 
 export interface ContinueInput {
@@ -86,6 +106,7 @@ export interface AgentRecord {
   modelProviderId: string;
   modelId: string;
   modelVariant: string | null;
+  modelRoute: string | null;
   status: AgentStatus;
   createdAt: string;
   updatedAt: string;
@@ -120,6 +141,7 @@ export interface JobRecord {
   hintTurnId: string | null;
   hintSource: string | null;
   dispatchUnknown: boolean;
+  resultConsumedAt: string | null;
 }
 
 export type ActivityType =
@@ -302,6 +324,10 @@ export interface BridgeConfig {
   codexAppServerArgs: string[];
   maxTaskLength: number;
   maxResultLength: number;
+  modelRoutes: ModelRoute[];
+  defaultModelRoute: string;
+  retentionMode: RetentionMode;
+  maxContextFileBytes: number;
 }
 
 export interface DoctorCheck {

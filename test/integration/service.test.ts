@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { createDefaultConfig } from "../../src/config.js";
 import type { CodexCorrelation, CodexDeliveryAdapter } from "../../src/codex/adapter.js";
+import { BridgeError } from "../../src/errors.js";
 import { InboxDelivery } from "../../src/delivery/inbox.js";
 import { OpenCodeHttpError, OpenCodeTransportError } from "../../src/opencode/client.js";
 import { BridgeStore } from "../../src/store.js";
@@ -23,6 +24,7 @@ async function git(cwd: string, ...args: string[]): Promise<void> {
 class FakeClient implements OpenCodeClientLike {
   sessionCount = 0;
   promptCalls: Array<{ sessionId: string; task: string }> = [];
+  promptOptions: Array<Record<string, unknown>> = [];
   promptErrors: Array<Error | null> = [];
   aborted: string[] = [];
   abortCalls = 0;
@@ -49,8 +51,9 @@ class FakeClient implements OpenCodeClientLike {
     this.sessionCount += 1;
     return { id: "session_" + this.sessionCount };
   }
-  async promptAsync(sessionId: string, task: string): Promise<void> {
+  async promptAsync(sessionId: string, task: string, options?: Record<string, unknown>): Promise<void> {
     this.promptCalls.push({ sessionId, task });
+    if (options) this.promptOptions.push({ ...options });
     const error = this.promptErrors.shift();
     if (this.promptGate) await this.promptGate;
     if (error) throw error;
@@ -2712,6 +2715,805 @@ test("request_id retry for an active dispatch_unknown job keeps the original out
   } finally {
     client.releasePrompt();
     await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn pins the route on the agent and dispatches with the pinned route options", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-default-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_route_default",
+      topic: "Route default",
+      task: "Run on the default route",
+      cwd: directory,
+      mode: "analyze",
+    });
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    assert.equal(agent.modelRoute, "flash-max");
+    assert.equal(agent.modelProviderId, "opencode-go");
+    assert.equal(agent.modelId, "deepseek-v4-flash");
+    assert.equal(agent.modelVariant, "max");
+    assert.equal(client.promptOptions[0]?.providerId, "opencode-go");
+    assert.equal(client.promptOptions[0]?.modelId, "deepseek-v4-flash");
+    assert.equal(client.promptOptions[0]?.variant, "max");
+    assert.equal(accepted.modelDisplayName, "DeepSeek V4 Flash · Max");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn with an explicitly enabled custom route pins that route", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-custom-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_route_custom",
+      topic: "Route custom",
+      task: "Run on pro",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "pro-max",
+    });
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    assert.equal(agent.modelRoute, "pro-max");
+    assert.equal(client.promptOptions[0]?.modelId, "deepseek-v4-pro");
+    assert.equal(accepted.modelDisplayName, "DeepSeek V4 Pro · Max");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn with an unknown route fails closed typed 400 before any side effect", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-unknown-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({
+      requestId: "request_route_unknown",
+      topic: "Route unknown",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "nonsense-route",
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "unknown_route");
+      return true;
+    });
+    assert.equal(store.listAgents().length, 0);
+    assert.equal(store.listJobs().length, 0);
+    assert.equal(client.sessionCount, 0);
+    assert.equal(client.promptCalls.length, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn with a disabled route fails closed typed 400 with no fallback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-disabled-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({
+      requestId: "request_route_disabled",
+      topic: "Route disabled",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "pro-max",
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "route_disabled");
+      return true;
+    });
+    assert.equal(store.listAgents().length, 0);
+    assert.equal(client.promptCalls.length, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn without a model_route fails closed when the default route is disabled", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-default-disabled-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: false, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({
+      requestId: "request_route_no_default",
+      topic: "No default",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "route_disabled");
+      return true;
+    });
+    assert.equal(store.listAgents().length, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("continue and approval resume use the persisted agent route, not mutable live defaults", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-pinned-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const proConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const first = new BridgeService(proConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  let accepted: Awaited<ReturnType<typeof first.spawn>>;
+  try {
+    await first.start();
+    accepted = await first.spawn({
+      requestId: "request_route_pinned",
+      topic: "Route pinned",
+      task: "Seed the pinned route",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "pro-max",
+    });
+    assert.equal(store.getAgent(accepted.agentId)?.modelRoute, "pro-max");
+    client.messages = [{
+      info: { id: "assistant_route_pinned", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seeded on pro" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(store.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    await first.stop();
+  }
+  // A second daemon with the default registry (pro-max disabled) must still
+  // continue the pinned agent on the persisted pro-max route.
+  const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await second.start();
+    const continued = await second.continueJob({
+      requestId: "request_route_pinned_continue",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Continue on the pinned route",
+    });
+    assert.equal(continued.accepted, true);
+    const options = client.promptOptions.at(-1);
+    assert.equal(options?.modelId, "deepseek-v4-pro");
+    assert.equal(options?.variant, "max");
+  } finally {
+    await second.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("mutating or repointing the live config route never redirects a pinned pro agent", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-repoint-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const spawnConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const first = new BridgeService(spawnConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  let proAgentId: string;
+  try {
+    await first.start();
+    const accepted = await first.spawn({
+      requestId: "request_route_repoint",
+      topic: "Route repoint",
+      task: "Pin the pro route",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "pro-max",
+    });
+    proAgentId = accepted.agentId;
+    assert.equal(store.getAgent(proAgentId)?.modelRoute, "pro-max");
+    client.messages = [{
+      info: { id: "assistant_route_repoint", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on pro" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(store.getJob(accepted.jobId)?.status, "delivered");
+  } finally {
+    await first.stop();
+  }
+
+  // Live config mutation: the pro-max route now points at a different model,
+  // flash-max is repointed as well, and the agent's route name was deleted
+  // from the registry entirely in the second half. Dispatch must still use
+  // the persisted spawn-time identity, with no fallback.
+  const repointedConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-other", variant: "max", enabled: true, default: true, display: "Renamed" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-gamma", variant: "max", enabled: false, default: false, display: "Repointed" },
+    ],
+  });
+  const second = new BridgeService(repointedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await second.start();
+    const continued = await second.continueJob({
+      requestId: "request_route_repoint_continue",
+      agentId: proAgentId,
+      relation: "continuation",
+      task: "Continue on the pinned identity",
+    });
+    assert.equal(continued.accepted, true);
+    const options = client.promptOptions.at(-1);
+    assert.equal(options?.providerId, "opencode-go", "provider stays the persisted spawn-time provider");
+    assert.equal(options?.modelId, "deepseek-v4-pro", "model stays the persisted spawn-time model");
+    assert.equal(options?.variant, "max", "variant stays the persisted spawn-time variant");
+  } finally {
+    await second.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("deleting the route from the live registry still dispatches the persisted identity without fallback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-delete-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const spawnConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const first = new BridgeService(spawnConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  let proAgentId: string;
+  try {
+    await first.start();
+    const accepted = await first.spawn({
+      requestId: "request_route_delete",
+      topic: "Route delete",
+      task: "Pin the pro route",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "pro-max",
+    });
+    proAgentId = accepted.agentId;
+    client.messages = [{
+      info: { id: "assistant_route_delete", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on pro" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+  } finally {
+    await first.stop();
+  }
+
+  const deletedConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+    ],
+  });
+  const second = new BridgeService(deletedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await second.start();
+    const continued = await second.continueJob({
+      requestId: "request_route_delete_continue",
+      agentId: proAgentId,
+      relation: "continuation",
+      task: "Continue after the route was deleted",
+    });
+    assert.equal(continued.accepted, true);
+    const options = client.promptOptions.at(-1);
+    assert.equal(options?.modelId, "deepseek-v4-pro", "no fallback: deleted route must not redirect to the default route");
+    assert.equal(options?.variant, "max");
+  } finally {
+    await second.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a default-spawned flash agent stays pinned when the live default route is repointed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-flash-pinned-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  let flashAgentId: string;
+  try {
+    await first.start();
+    const accepted = await first.spawn({
+      requestId: "request_route_flash_pinned",
+      topic: "Route flash pinned",
+      task: "Pin the default flash route",
+      cwd: directory,
+      mode: "analyze",
+    });
+    flashAgentId = accepted.agentId;
+    assert.equal(store.getAgent(flashAgentId)?.modelRoute, "flash-max");
+    assert.equal(store.getAgent(flashAgentId)?.modelId, "deepseek-v4-flash");
+    client.messages = [{
+      info: { id: "assistant_route_flash_pinned", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on flash" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+  } finally {
+    await first.stop();
+  }
+
+  const repointedConfig = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-other", variant: "max", enabled: true, default: true, display: "Repointed" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
+    ],
+  });
+  const second = new BridgeService(repointedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await second.start();
+    const continued = await second.continueJob({
+      requestId: "request_route_flash_pinned_continue",
+      agentId: flashAgentId,
+      relation: "continuation",
+      task: "Continue on the persisted flash identity",
+    });
+    assert.equal(continued.accepted, true);
+    const options = client.promptOptions.at(-1);
+    assert.equal(options?.modelId, "deepseek-v4-flash", "default-spawned agents stay pinned to their persisted flash identity");
+    assert.equal(options?.variant, "max");
+  } finally {
+    await second.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy agents without a persisted route keep dispatching on their flat columns", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-legacy-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const agent = store.createAgent({
+      id: "agent_legacy_route",
+      title: "Legacy",
+      topic: "Legacy route topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_legacy",
+      opencodeSessionId: "session_legacy_route",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-pro",
+      modelVariant: "max",
+    });
+    const job = store.createJob({ id: "job_legacy_route", agentId: agent.id, kind: "continue", requestId: "request_legacy_route", promptHash: "hash" });
+    store.updateJobStatus(job.id, "dispatching");
+    store.updateJobStatus(job.id, "running");
+    store.setJobPermission(job.id, "permission_legacy");
+    store.updateJobStatus(job.id, "needs_approval");
+    store.updateAgentStatus(agent.id, "working");
+    store.updateAgentStatus(agent.id, "needs_approval");
+    const continued = await service.continueJob({
+      requestId: "request_legacy_route_continue",
+      agentId: agent.id,
+      relation: "continuation",
+      task: "Continue a legacy agent",
+    });
+    assert.equal(continued.accepted, true);
+    const options = client.promptOptions.at(-1);
+    assert.equal(options?.modelId, "deepseek-v4-pro");
+    assert.equal(store.getAgent(agent.id)?.modelRoute, null);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("context file validation rejects missing, oversized and non-regular files before side effects", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-validate-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+  });
+  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await service.start();
+    await writeFile(path.join(directory, "small.txt"), "small", "utf8");
+    await writeFile(path.join(directory, "large.txt"), "x".repeat(2_000_000), "utf8");
+    await mkdir(path.join(directory, "folder.txt"));
+
+    await assert.rejects(() => service.spawn({
+      requestId: "request_context_missing",
+      topic: "Context missing",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["does-not-exist.txt"],
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "context_file_invalid");
+      assert.equal((error.details as { reason?: string })?.reason, "missing");
+      return true;
+    });
+
+    await assert.rejects(() => service.spawn({
+      requestId: "request_context_large",
+      topic: "Context large",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["large.txt"],
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal((error.details as { reason?: string })?.reason, "too_large");
+      return true;
+    });
+
+    await assert.rejects(() => service.spawn({
+      requestId: "request_context_folder",
+      topic: "Context folder",
+      task: "Must not run",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["folder.txt"],
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal((error.details as { reason?: string })?.reason, "not_a_regular_file");
+      return true;
+    });
+
+    assert.equal(store.listAgents().length, 0);
+    assert.equal(store.listJobs().length, 0);
+    assert.equal(client.sessionCount, 0);
+
+    const accepted = await service.spawn({
+      requestId: "request_context_ok",
+      topic: "Context ok",
+      task: "Use the small context file",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["small.txt"],
+    });
+    assert.equal(accepted.accepted, true);
+    assert.equal(client.promptCalls.length, 1);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("context file rejection creates no orphan worktree", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-"));
+  await git(directory, "init", "-q");
+  await writeFile(path.join(directory, "tracked.txt"), "initial\n", "utf8");
+  await git(directory, "add", "tracked.txt");
+  await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
+
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({
+      requestId: "request_context_worktree_bad",
+      topic: "Context worktree bad",
+      task: "Must not create a worktree",
+      cwd: directory,
+      mode: "edit",
+      workspaceStrategy: "worktree",
+      contextFiles: ["missing.txt"],
+    }), /context file/);
+    const worktrees = path.join(directory, ".deepseek-worktrees");
+    const entries = await readdir(worktrees).catch(() => []);
+    assert.deepEqual(entries, [], "no orphan worktree may be created for a rejected context");
+    assert.equal(store.listAgents().length, 0);
+    assert.equal(client.sessionCount, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("valid tracked context files work with worktree strategy and resolve inside the worktree without path leakage", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-valid-"));
+  await git(directory, "init", "-q");
+  await writeFile(path.join(directory, "tracked.txt"), "tracked context content\n", "utf8");
+  await git(directory, "add", "tracked.txt");
+  await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
+
+  // The bridge store must live OUTSIDE the repository so the worktree
+  // cleanliness check (untracked files included) never sees the database.
+  const dataDir = path.join(path.dirname(directory), path.basename(directory) + "-data");
+  await mkdir(dataDir, { recursive: true });
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir, configPath: path.join(dataDir, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_context_worktree_valid",
+      topic: "Context worktree valid",
+      task: "Use a tracked context file",
+      cwd: directory,
+      mode: "edit",
+      workspaceStrategy: "worktree",
+      contextFiles: ["tracked.txt"],
+    });
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.outcome, undefined, "valid context must dispatch normally, not fail");
+    assert.equal(client.promptCalls.length, 1);
+    const prompt = client.promptCalls[0]?.task ?? "";
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    assert.equal(agent.workspaceStrategy, "worktree");
+    const worktreeFilePath = path.normalize(path.join(agent.workspacePath, "tracked.txt"));
+    assert.ok(prompt.includes("FILE: " + worktreeFilePath), "the context FILE path must point inside the worktree");
+    assert.equal(
+      prompt.includes("FILE: " + path.normalize(path.join(directory, "tracked.txt"))),
+      false,
+      "the main repository path must not leak into the prompt",
+    );
+    const worktrees = path.join(directory, ".deepseek-worktrees");
+    assert.equal((await readdir(worktrees)).length, 1, "exactly one worktree exists");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("escaping context paths with worktree strategy fail typed 400 before any worktree", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-escape-"));
+  await git(directory, "init", "-q");
+  await writeFile(path.join(directory, "tracked.txt"), "initial\n", "utf8");
+  await git(directory, "add", "tracked.txt");
+  await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
+  await writeFile(path.join(path.dirname(directory), "outside.txt"), "outside\n", "utf8");
+
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    await assert.rejects(() => service.spawn({
+      requestId: "request_context_worktree_escape",
+      topic: "Context worktree escape",
+      task: "Must not run",
+      cwd: directory,
+      mode: "edit",
+      workspaceStrategy: "worktree",
+      contextFiles: ["../outside.txt"],
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.equal(error.code, "context_file_invalid");
+      assert.equal((error.details as { reason?: string })?.reason, "outside_workspace");
+      return true;
+    });
+    const worktrees = path.join(directory, ".deepseek-worktrees");
+    assert.deepEqual(await readdir(worktrees).catch(() => []), [], "no worktree may exist after a rejected context");
+    assert.equal(store.listAgents().length, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a terminal follow consumes the obligation while needs_approval stays pending", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-obligation-consumed-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_obligation_consumed", topic: "Consumed follow", task: "Finish normally", cwd: directory, mode: "analyze" });
+    client.messages = [{
+      info: { id: "assistant_consumed", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: consumed" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(store.getJob(accepted.jobId)?.resultConsumedAt, null);
+    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    assert.equal(followed.status, "completed");
+    assert.ok(store.getJob(accepted.jobId)?.resultConsumedAt, "terminal follow must persist consumption");
+
+    const approved = await service.spawn({ requestId: "request_obligation_approval", topic: "Approval follow", task: "Wait for approval", cwd: directory, mode: "analyze" });
+    await client.emit({ type: "permission.asked", properties: { sessionID: "session_2", permission: { id: "permission_obligation" } } });
+    const approvalFollow = await service.follow({ agentId: approved.agentId, jobId: approved.jobId });
+    assert.equal(approvalFollow.status, "needs_approval");
+    assert.equal(store.getJob(approved.jobId)?.resultConsumedAt, null, "needs_approval keeps the obligation pending");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("recover_result persists consumption of the returned terminal result", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-obligation-recover-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({ requestId: "request_obligation_recover", topic: "Recover consumed", task: "Finish normally", cwd: directory, mode: "analyze" });
+    client.messages = [{
+      info: { id: "assistant_recover_consumed", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: recover consumed" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
+    assert.equal(store.getJob(accepted.jobId)?.resultConsumedAt, null);
+    const recovered = await service.recoverResult(accepted.jobId);
+    assert.ok(recovered);
+    assert.ok(store.getJob(accepted.jobId)?.resultConsumedAt, "successful recover must persist consumption");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("enabled retention never auto-prunes a legacy database without the offline preparation marker", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-retention-gate-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const old = new Date(Date.now() - 60 * 24 * 60 * 60_000).toISOString();
+  store.createAgent({
+    id: "agent_retention_gate",
+    title: "Gate",
+    topic: "Gate topic",
+    repositoryRoot: directory,
+    workspacePath: directory,
+    workspaceStrategy: "shared",
+    opencodeServerId: "server_gate",
+    opencodeSessionId: "session_gate",
+    modelProviderId: "opencode-go",
+    modelId: "deepseek-v4-flash",
+    modelVariant: "max",
+    modelRoute: "flash-max",
+  });
+  const job = store.createJob({ id: "job_retention_gate", agentId: "agent_retention_gate", kind: "spawn", requestId: "request_retention_gate", promptHash: "h" });
+  store.updateJobStatus(job.id, "dispatching");
+  store.updateJobStatus(job.id, "running");
+  store.updateJobStatus(job.id, "completed");
+  store.updateJobStatus(job.id, "delivery_pending");
+  store.updateJobStatus(job.id, "delivered");
+  store.setJobResult(job.id, path.join(directory, "results", "job_retention_gate.json"), "gate");
+  store.consumeResult(job.id);
+  for (let index = 0; index < 3; index += 1) {
+    store.insertEvent({ source: "opencode", sourceEventId: "gate_" + index, eventType: "session.idle", sessionId: "session_gate", jobId: job.id });
+  }
+  store.db.prepare("UPDATE events SET received_at = ? WHERE job_id = ?").run(old, job.id);
+
+  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), retentionMode: "enabled" });
+  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await first.start();
+    assert.equal(first.status().retention.pruningEnabled, false, "hand-edited enabled mode must not arm online pruning on a legacy DB");
+    const remaining = store.db.prepare("SELECT COUNT(*) AS count FROM events WHERE job_id = ?").get(job.id) as { count: number | bigint };
+    assert.equal(Number(remaining.count), 3, "no events may be pruned without explicit offline preparation");
+  } finally {
+    await first.stop();
+  }
+
+  store.markRetentionPrepared();
+  const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
+  try {
+    await second.start();
+    assert.equal(second.status().retention.pruningEnabled, true, "the offline preparation marker arms pruning on the legacy DB");
+    const remaining = store.db.prepare("SELECT COUNT(*) AS count FROM events WHERE job_id = ?").get(job.id) as { count: number | bigint };
+    assert.equal(Number(remaining.count), 0, "the daemon pruned the eligible old events after preparation");
+  } finally {
+    await second.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });
   }

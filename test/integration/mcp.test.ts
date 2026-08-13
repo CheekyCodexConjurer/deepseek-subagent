@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeHttpClient } from "../../src/http-server.js";
+import { BridgeHttpClient, BridgeHttpError } from "../../src/http-server.js";
 import { createLazyDaemonBootstrap, createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
 
 function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<string, unknown>> } {
@@ -537,6 +537,72 @@ test("MCP obligation metadata: descriptions, readOnlyHint and output schemas", a
     assert.match(followNextAction, /deepseek_continue/);
     assert.equal(outputProperties(abort).obligationState?.const, "closed");
     assert.equal(outputProperties(close).obligationState?.const, "closed");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP exposes model_route as an optional string on spawn only", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const server = createMcpServer(new BridgeHttpClient(config));
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const tools = await client.listTools();
+    const spawn = tools.tools.find((tool) => tool.name === "deepseek_spawn");
+    const continueTool = tools.tools.find((tool) => tool.name === "deepseek_continue");
+    const spawnProperties = (spawn?.inputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+    const continueProperties = (continueTool?.inputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
+    assert.ok("model_route" in spawnProperties, "spawn must accept model_route");
+    assert.equal("model_route" in continueProperties, false, "model_route is only valid on spawn");
+    assert.match(spawn?.description ?? "", /model_route/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP propagates structured error codes without sniffing message text", async () => {
+  const failing = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/spawn") {
+        throw new BridgeHttpError(400, "route_disabled", "Model route is disabled: pro-max", { route: "pro-max" });
+      }
+      if (pathname === "/v1/jobs/abort") {
+        throw new BridgeHttpError(404, "unknown_agent", "Unknown agent: agent_1");
+      }
+      if (pathname === "/v1/jobs/continue") {
+        throw new BridgeHttpError(409, "busy", "Agent is busy with job job_1", { jobId: "job_1" });
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(failing);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const routeResult = await client.callTool({ name: "deepseek_spawn", arguments: { topic: "t", task: "t", model_route: "pro-max" } });
+    assert.equal(routeResult.isError, true);
+    assert.equal((routeResult.structuredContent as Record<string, unknown>)?.code, "route_disabled");
+    assert.equal((routeResult.structuredContent as Record<string, unknown>)?.status, 400);
+
+    const agentResult = await client.callTool({ name: "deepseek_abort", arguments: { agent_id: "agent_1" } });
+    assert.equal(agentResult.isError, true);
+    assert.equal((agentResult.structuredContent as Record<string, unknown>)?.code, "unknown_agent");
+
+    const busyResult = await client.callTool({ name: "deepseek_continue", arguments: { agent_id: "agent_1", task: "t" } });
+    assert.equal(busyResult.isError, true);
+    const busyStructured = busyResult.structuredContent as Record<string, unknown>;
+    assert.equal(busyStructured.code, "busy");
+    assert.equal(busyStructured.retry, false);
   } finally {
     await client.close();
     await server.close();

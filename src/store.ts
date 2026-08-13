@@ -137,6 +137,58 @@ export class BridgeStore {
     if (!dispatchUnknownMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(6, ?)").run(new Date().toISOString());
     }
+    const agentColumns = this.db.prepare("PRAGMA table_info(agents)").all() as Row[];
+    if (!agentColumns.some((column) => column.name === "model_route")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN model_route TEXT");
+    }
+    const jobColumnsAfter = this.db.prepare("PRAGMA table_info(jobs)").all() as Row[];
+    if (!jobColumnsAfter.some((column) => column.name === "result_consumed_at")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN result_consumed_at TEXT");
+    }
+    const routeMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 7").get() as Row | undefined;
+    if (!routeMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(7, ?)").run(new Date().toISOString());
+    }
+    // Intrinsic retention gate: the explicit offline CLI flow writes a marker
+    // into the database; a hand-edited retentionMode alone can never arm
+    // online pruning on a legacy database.
+    this.db.exec("CREATE TABLE IF NOT EXISTS retention_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);");
+    const retentionMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 8").get() as Row | undefined;
+    if (!retentionMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?)").run(new Date().toISOString());
+    }
+    // Retention prune-support indexes are cheap on an empty database and are
+    // created here; on a legacy (non-empty) database they are only created by
+    // the explicit offline retention CLI path.
+    if (this.isProvablyEmpty()) {
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_agent_activity_created_at ON agent_activity(created_at);");
+    }
+  }
+
+  /** True only when no business rows exist at all (fresh database). */
+  isProvablyEmpty(): boolean {
+    const row = this.db.prepare(
+      "SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM agent_activity) + (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM codex_bindings) AS total",
+    ).get() as Row;
+    return numberValue(row, "total") === 0;
+  }
+
+  /**
+   * Records explicit offline retention preparation (the `retention dry-run` or
+   * `retention enabled --confirm` CLI flow). Without this in-database marker,
+   * online pruning never runs on a non-empty legacy database, even if the
+   * config file was hand-edited to retentionMode=enabled.
+   */
+  markRetentionPrepared(): void {
+    this.db.prepare(
+      "INSERT INTO retention_meta(key, value, updated_at) VALUES('legacy_prepared', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    ).run(new Date().toISOString(), new Date().toISOString());
+  }
+
+  isRetentionPrepared(): boolean {
+    const row = this.db.prepare("SELECT 1 AS found FROM retention_meta WHERE key = 'legacy_prepared'").get() as Row | undefined;
+    return row !== undefined;
   }
 
   createAgent(input: {
@@ -151,9 +203,10 @@ export class BridgeStore {
     modelProviderId: string;
     modelId: string;
     modelVariant: string | null;
+    modelRoute?: string | null;
   }): AgentRecord {
     const now = new Date().toISOString();
-    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,model_route,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
       input.id,
       input.title,
       input.topic,
@@ -165,6 +218,7 @@ export class BridgeStore {
       input.modelProviderId,
       input.modelId,
       input.modelVariant,
+      input.modelRoute ?? null,
       "created",
       now,
       now,
@@ -355,6 +409,72 @@ export class BridgeStore {
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
+  }
+
+  /**
+   * Marks a terminal job result as explicitly consumed (follow/recover
+   * returned a usable final result). Idempotent; only meaningful for jobs
+   * with a persisted result.
+   */
+  consumeResult(id: string): JobRecord {
+    const current = this.getJob(id);
+    if (!current) throw new Error("Unknown job: " + id);
+    if (!current.resultPath) return current;
+    if (current.resultConsumedAt === null) {
+      this.db.prepare("UPDATE jobs SET result_consumed_at = ? WHERE id = ?").run(new Date().toISOString(), id);
+    }
+    const updated = this.getJob(id);
+    if (!updated) throw new Error("Job disappeared: " + id);
+    return updated;
+  }
+
+  countUnconsumedTerminalResults(): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM jobs WHERE result_path IS NOT NULL AND result_consumed_at IS NULL",
+    ).get() as Row;
+    return numberValue(row, "count");
+  }
+
+  listUnconsumedTerminalResults(): JobRecord[] {
+    return (this.db.prepare(
+      "SELECT * FROM jobs WHERE result_path IS NOT NULL AND result_consumed_at IS NULL ORDER BY created_at DESC",
+    ).all() as Row[]).map((row) => this.toJob(row));
+  }
+
+  countOpenTerminalAgents(): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM agents WHERE status IN ('completed','completed_partial','timed_out','failed') AND closed_at IS NULL",
+    ).get() as Row;
+    return numberValue(row, "count");
+  }
+
+  countOpenObligations(): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('dispatching','running','following','finalizing','needs_approval')",
+    ).get() as Row;
+    return numberValue(row, "count");
+  }
+
+  /**
+   * Counts genuinely stale follow windows: a job still following/finalizing
+   * after its grace deadline AND not auto-armed (auto-armed windows are
+   * safety nets for unknown dispatch outcomes and are never flagged). Fresh
+   * windows whose deadline has not passed are never counted.
+   */
+  countStaleFollowWindows(now = Date.now()): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('following','finalizing') AND grace_deadline_at IS NOT NULL AND grace_deadline_at < ? AND dispatch_unknown = 0",
+    ).get(new Date(now).toISOString()) as Row;
+    return numberValue(row, "count");
+  }
+
+  /** Job ids whose events/activity must never be pruned: active jobs plus
+   *  terminal jobs with an unconsumed or undelivered result. */
+  protectedJobIds(): Set<string> {
+    const rows = this.db.prepare(
+      "SELECT id FROM jobs WHERE status IN ('dispatching','running','following','finalizing','needs_approval','delivery_pending') OR (result_path IS NOT NULL AND result_consumed_at IS NULL)",
+    ).all() as Row[];
+    return new Set(rows.map((row) => stringValue(row, "id")));
   }
 
   recordActivity(input: {
@@ -597,6 +717,7 @@ export class BridgeStore {
       modelProviderId: stringValue(row, "model_provider_id"),
       modelId: stringValue(row, "model_id"),
       modelVariant: nullableString(row, "model_variant"),
+      modelRoute: nullableString(row, "model_route"),
       status: stringValue(row, "status") as AgentStatus,
       createdAt: stringValue(row, "created_at"),
       updatedAt: stringValue(row, "updated_at"),
@@ -633,6 +754,7 @@ export class BridgeStore {
       hintTurnId: nullableString(row, "hint_turn_id"),
       hintSource: nullableString(row, "hint_source"),
       dispatchUnknown: numberValue(row, "dispatch_unknown") === 1,
+      resultConsumedAt: nullableString(row, "result_consumed_at"),
     };
   }
 

@@ -22,6 +22,7 @@
     "test:integration": "node --import tsx --test \"test/integration/**/*.test.ts\"",
     "test:e2e": "node --import tsx --test \"test/e2e/**/*.test.ts\"",
     "test:e2e:live": "node --import tsx --test \"test/e2e/live.test.ts\"",
+    "test:e2e:live:pro": "node --import tsx --test \"test/e2e/live-pro.test.ts\"",
     "doctor": "node dist/cli.js doctor",
     "lint": "tsc -p tsconfig.json --noEmit",
     "discovery:codex": "tsx scripts/codex-correlation-probe.ts"

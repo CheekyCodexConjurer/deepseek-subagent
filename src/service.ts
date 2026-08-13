@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { defaultWorkspace } from "./security.js";
+import { defaultWorkspace, assertInside } from "./security.js";
 import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT } from "./prompts.js";
 import { BridgeStore } from "./store.js";
-import { newId, normalizeTitle, redactSecrets, truncate, validateContextFiles } from "./security.js";
+import { newId, normalizeTitle, redactSecrets, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
 import { InboxDelivery } from "./delivery/inbox.js";
 import {
   CodexAppServerDeliveryAdapter,
@@ -16,6 +16,8 @@ import {
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { assistantTextAfterBaseline, formatHumanResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError, UnknownJobError } from "./errors.js";
+import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
   AgentRecord,
   BridgeConfig,
@@ -29,9 +31,12 @@ import type {
   OpenCodeMessage,
   ProgressActivity,
   ProgressSnapshot,
+  ResolvedRoute,
   ResultEnvelope,
   SpawnInput,
 } from "./types.js";
+
+export const RETENTION_INTERVAL_MS = 60 * 60_000;
 
 export interface ServiceDependencies {
   store?: BridgeStore;
@@ -65,11 +70,11 @@ export interface AcceptedOperation {
   outcome?: "accepted" | "dispatch_unknown";
 }
 
-export class BridgeBusyError extends Error {
-  readonly code = "busy";
+export class BridgeBusyError extends ConflictError {
+  override readonly code = "busy" as const;
 
   constructor(readonly jobId: string) {
-    super("Agent is busy with job " + jobId + ". Do not retry in a loop; wait for its asynchronous result or call deepseek_abort.");
+    super("Agent is busy with job " + jobId + ". Do not retry in a loop; wait for its asynchronous result or call deepseek_abort.", "busy");
     this.name = "BridgeBusyError";
   }
 }
@@ -85,6 +90,7 @@ export interface ServiceStatus {
   followDefaultGraceMinutes: number;
   codexDelivery: { available: boolean; reason: string | null };
   correlation: { hints: number; bindings: number };
+  retention: { mode: string; dbState: string; pruningEnabled: boolean };
   lastStreamError: string | null;
 }
 
@@ -206,6 +212,8 @@ export class BridgeService {
   private readonly eventProcessing = new Set<string>();
   private readonly eventRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly followLifecycles = new Map<string, FollowLifecycle>();
+  private retentionTimer: NodeJS.Timeout | null = null;
+  private retentionState: RetentionPolicyState | null = null;
 
   constructor(private readonly config: BridgeConfig, dependencies: ServiceDependencies = {}) {
     this.store = dependencies.store ?? new BridgeStore(path.join(config.dataDir, "bridge.sqlite"));
@@ -253,10 +261,13 @@ export class BridgeService {
       if (!this.streamAbort?.signal.aborted) this.lastStreamError = redactSecrets(String(error));
     });
     await this.recoverPendingJobs();
+    this.applyRetentionPolicy();
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    if (this.retentionTimer) clearInterval(this.retentionTimer);
+    this.retentionTimer = null;
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
     for (const timer of this.correlationFallbackTimers.values()) clearTimeout(timer);
@@ -294,12 +305,13 @@ export class BridgeService {
   }
 
   status(): ServiceStatus {
+    const defaultRoute = this.config.modelRoutes.find((route) => route.name === this.config.defaultModelRoute);
     return {
       running: this.running,
       opencodeUrl: this.managed?.baseUrl ?? null,
-      provider: this.config.opencodeProviderId,
-      model: this.config.opencodeModelId,
-      variant: this.config.opencodeVariant,
+      provider: defaultRoute?.providerId ?? this.config.opencodeProviderId,
+      model: defaultRoute?.modelId ?? this.config.opencodeModelId,
+      variant: defaultRoute?.variant ?? this.config.opencodeVariant,
       experimentalSameChatDelivery: this.config.experimentalSameChatDelivery,
       followDefaultWaitMinutes: this.config.followDefaultWaitMinutes,
       followDefaultGraceMinutes: this.config.followDefaultGraceMinutes,
@@ -308,41 +320,77 @@ export class BridgeService {
         hints: this.store.countJobsWithCorrelationHints(),
         bindings: this.store.countCodexBindings(),
       },
+      retention: this.retentionState ?? { mode: this.config.retentionMode, dbState: "legacy", pruningEnabled: false },
       lastStreamError: this.lastStreamError,
     };
   }
 
+  private applyRetentionPolicy(): void {
+    const policy = evaluateRetentionPolicy(this.store, this.config.retentionMode);
+    this.retentionState = policy;
+    if (!policy.pruningEnabled) return;
+    const runPass = () => {
+      try {
+        runRetentionPrune(this.store, {});
+      } catch (error) {
+        this.lastStreamError = redactSecrets(String(error));
+      }
+    };
+    runPass();
+    this.retentionTimer = setInterval(runPass, RETENTION_INTERVAL_MS);
+    this.retentionTimer.unref?.();
+  }
+
   async spawn(input: SpawnInput): Promise<AcceptedOperation> {
     this.requireRunning();
-    if (!input.task.trim()) throw new Error("Task must not be empty");
-    if (input.task.length > this.config.maxTaskLength) throw new Error("Task exceeds configured length limit");
+    if (!input.task.trim()) throw new InvalidRequestError("Task must not be empty");
+    if (input.task.length > this.config.maxTaskLength) throw new InvalidRequestError("Task exceeds configured length limit");
     return this.withRequestIdLock(input.requestId, async () => {
       const existing = this.store.getJobByRequestId(input.requestId);
       if (existing) return this.acceptedRequest(existing);
+      const route = this.resolveRouteForSpawn(input.modelRoute);
       const repositoryRoot = path.resolve(input.cwd ?? defaultWorkspace());
       await ensureDirectory(repositoryRoot);
       const mode = input.mode ?? "analyze";
       const strategy = input.workspaceStrategy ?? (mode === "edit" ? "worktree" : "shared");
       const agentId = newId("agent");
-      const workspacePath = await prepareWorkspace(repositoryRoot, strategy, agentId);
-      validateContextFiles(workspacePath, input.contextFiles ?? []);
-      const prompt = await buildWorkerPrompt({ ...input, mode, workspaceStrategy: strategy }, workspacePath, {
+      // The worktree path is deterministic and requires no side effects:
+      // compute it now so context containment is fully validated against the
+      // effective workspace BEFORE any worktree/session/job is created. A
+      // rejected context can never orphan a worktree.
+      const workspacePath = strategy === "shared"
+        ? repositoryRoot
+        : path.join(repositoryRoot, ".deepseek-worktrees", agentId);
+      // Strict existence/regular-file/size validation runs against the
+      // repository root (the worktree does not exist yet); the mapped paths
+      // below are then used by the worker inside the created worktree.
+      const validatedContextFiles = await validateContextFilesStrict(
+        repositoryRoot,
+        input.contextFiles ?? [],
+        this.config.maxContextFileBytes,
+      );
+      const contextFiles = strategy === "worktree"
+        ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles)
+        : validatedContextFiles;
+      const createdWorkspace = await prepareWorkspace(repositoryRoot, strategy, agentId);
+      const prompt = await buildWorkerPrompt({ ...input, contextFiles, mode, workspaceStrategy: strategy }, createdWorkspace, {
         maxLength: this.config.maxTaskLength,
       });
       const title = normalizeTitle(input.topic);
-      const session = await this.clientOrThrow().createSession(workspacePath, title);
+      const session = await this.clientOrThrow().createSession(createdWorkspace, title);
       const agent = this.store.createAgent({
         id: agentId,
         title,
         topic: input.topic.trim() || title,
         repositoryRoot,
-        workspacePath,
+        workspacePath: createdWorkspace,
         workspaceStrategy: strategy,
         opencodeServerId: this.managed?.serverId ?? "unknown",
         opencodeSessionId: session.id,
-        modelProviderId: this.config.opencodeProviderId,
-        modelId: this.config.opencodeModelId,
-        modelVariant: this.config.opencodeVariant,
+        modelProviderId: route.providerId,
+        modelId: route.modelId,
+        modelVariant: route.variant,
+        modelRoute: route.name,
       });
       this.recordActivity(agent, null, "dispatch", "Created OpenCode session for the DeepSeek task");
       const job = this.store.createJob({
@@ -361,14 +409,14 @@ export class BridgeService {
 
   async continueJob(input: ContinueInput): Promise<AcceptedOperation> {
     this.requireRunning();
-    if (!input.task.trim()) throw new Error("Task must not be empty");
-    if (input.task.length > this.config.maxTaskLength) throw new Error("Task exceeds configured length limit");
+    if (!input.task.trim()) throw new InvalidRequestError("Task must not be empty");
+    if (input.task.length > this.config.maxTaskLength) throw new InvalidRequestError("Task exceeds configured length limit");
     return this.withAgentOperationLock(input.agentId, async () => {
       const existing = this.store.getJobByRequestId(input.requestId);
       if (existing) return this.acceptedRequest(existing);
       const agent = this.store.getAgent(input.agentId);
-      if (!agent) throw new Error("Unknown agent: " + input.agentId);
-      if (agent.status === "closed" || agent.status === "aborted") throw new Error("Agent is not continuable");
+      if (!agent) throw new UnknownAgentError(input.agentId);
+      if (agent.status === "closed" || agent.status === "aborted") throw new ConflictError("Agent is not continuable", "not_continuable");
       const active = this.activeJob(agent.id);
       if (active && active.status !== "needs_approval") throw new BridgeBusyError(active.id);
       const prompt = await buildWorkerPrompt({
@@ -379,7 +427,7 @@ export class BridgeService {
       if (active?.status === "needs_approval") {
         if (input.permissionId || input.permissionReply || input.permissionMessage) {
           if (!input.permissionId || !input.permissionReply) {
-            throw new Error("permissionId and permissionReply are both required to answer an approval request");
+            throw new InvalidRequestError("permissionId and permissionReply are both required to answer an approval request", "permission_required");
           }
           return this.replyApproval(agent, active, input.permissionId, input.permissionReply, input.permissionMessage);
         }
@@ -401,10 +449,10 @@ export class BridgeService {
   async consult(input: ConsultInput): Promise<ProgressSnapshot> {
     this.requireRunning();
     const agent = this.store.getAgent(input.agentId);
-    if (!agent) throw new Error("Unknown agent: " + input.agentId);
+    if (!agent) throw new UnknownAgentError(input.agentId);
     const job = this.resolveJobForAgent(agent.id, input.jobId);
     if (input.jobId && (!job || job.agentId !== agent.id)) {
-      throw new Error("Job does not belong to the requested agent");
+      throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
     }
     return this.progressSnapshot(agent, job, normalizeActivityLimit(input.activityLimit));
   }
@@ -412,10 +460,10 @@ export class BridgeService {
   async follow(input: FollowInput, signal?: AbortSignal): Promise<FollowResult> {
     this.requireRunning();
     const agent = this.store.getAgent(input.agentId);
-    if (!agent) throw new Error("Unknown agent: " + input.agentId);
+    if (!agent) throw new UnknownAgentError(input.agentId);
     const job = this.resolveJobForAgent(agent.id, input.jobId);
-    if (!job) throw new Error("No DeepSeek job exists for agent " + agent.id);
-    if (input.jobId && job.agentId !== agent.id) throw new Error("Job does not belong to the requested agent");
+    if (!job) throw new UnknownJobError("No DeepSeek job exists for agent " + agent.id);
+    if (input.jobId && job.agentId !== agent.id) throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
 
     if (job.status === "needs_approval") {
       return this.followNeedsApproval(agent, job);
@@ -424,7 +472,7 @@ export class BridgeService {
       return this.followResultForJob(agent, job);
     }
     if (!ACTIVE_JOB_STATUSES.has(job.status)) {
-      throw new Error("Job " + job.id + " is not followable in state " + job.status);
+      throw new ConflictError("Job " + job.id + " is not followable in state " + job.status, "not_followable");
     }
 
     const lifecycle = this.ensureFollowLifecycle(
@@ -444,7 +492,7 @@ export class BridgeService {
   async abort(agentId: string, reason?: string): Promise<{ agentId: string; jobId: string | null; status: string }> {
     this.requireRunning();
     const agent = this.store.getAgent(agentId);
-    if (!agent) throw new Error("Unknown agent: " + agentId);
+    if (!agent) throw new UnknownAgentError(agentId);
     const active = this.activeJob(agentId);
     if (!active) {
       // A stopped agent is non-continuable; auto-close it so the obligation
@@ -476,7 +524,7 @@ export class BridgeService {
 
   async close(agentId: string): Promise<{ agentId: string; status: string }> {
     const agent = this.store.getAgent(agentId);
-    if (!agent) throw new Error("Unknown agent: " + agentId);
+    if (!agent) throw new UnknownAgentError(agentId);
     const active = this.activeJob(agentId);
     if (active) await this.abort(agentId, "Closed by orchestrator");
     const refreshed = this.store.getAgent(agentId);
@@ -486,8 +534,8 @@ export class BridgeService {
 
   async recoverResult(jobId: string, agentId?: string): Promise<unknown> {
     let job = this.store.getJob(jobId);
-    if (!job) throw new Error("Unknown job: " + jobId);
-    if (agentId && job.agentId !== agentId) throw new Error("Job does not belong to the requested agent");
+    if (!job) throw new UnknownJobError(jobId);
+    if (agentId && job.agentId !== agentId) throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
     if (!job.resultPath && this.client && ["dispatching", "running", "completed", "delivery_pending"].includes(job.status)) {
       await this.reconcileJob(job);
       job = this.store.getJob(jobId);
@@ -497,8 +545,12 @@ export class BridgeService {
       if (agent) await this.captureTimedOutEvidence(agent, job);
       job = this.store.getJob(jobId);
     }
-    if (!job?.resultPath) throw new Error("No persisted result is available for job " + jobId);
-    return sanitizePersistedResult(JSON.parse(await readFile(job.resultPath, "utf8")), this.config.maxResultLength);
+    if (!job?.resultPath) throw new NotFoundError("No persisted result is available for job " + jobId);
+    const result = sanitizePersistedResult(JSON.parse(await readFile(job.resultPath, "utf8")), this.config.maxResultLength);
+    // Recover returns a usable final result: the terminal obligation is
+    // explicitly consumed here, separate from agent close.
+    this.store.consumeResult(jobId);
+    return result;
   }
 
   getAgent(agentId: string): AgentRecord | null {
@@ -525,8 +577,8 @@ export class BridgeService {
 
   async deliverJob(jobId: string): Promise<void> {
     const job = this.store.getJob(jobId);
-    if (!job) throw new Error("Unknown job: " + jobId);
-    if (!job.resultPath) throw new Error("Job has no persisted result");
+    if (!job) throw new UnknownJobError(jobId);
+    if (!job.resultPath) throw new NotFoundError("Job has no persisted result");
     if (["completed", "completed_partial", "timed_out"].includes(job.status)) this.store.updateJobStatus(job.id, "delivery_pending");
     const pending = this.store.getJob(job.id);
     if (!pending) throw new Error("Job disappeared: " + job.id);
@@ -542,6 +594,94 @@ export class BridgeService {
 
   private followWindowMinutes(value: number | undefined, minimum: number, maximum: number, fallback: number): number {
     return Math.max(normalizeFollowMinutes(value, minimum, maximum, fallback), fallback);
+  }
+
+  /**
+   * Resolves the route for a new spawn. An explicit model_route must be
+   * registered AND enabled, otherwise the dispatch fails closed with a typed
+   * 400 before any side effect; there is no silent fallback route. Without an
+   * explicit route the configured default route applies (and also fails
+   * closed if it is disabled).
+   */
+  private resolveRouteForSpawn(modelRoute: string | undefined): ResolvedRoute {
+    const routes = this.config.modelRoutes;
+    if (modelRoute !== undefined) {
+      const route = routes.find((candidate) => candidate.name === modelRoute);
+      if (!route) {
+        throw new InvalidRequestError("Unknown model route: " + modelRoute, "unknown_route", { route: modelRoute });
+      }
+      if (!route.enabled) {
+        throw new InvalidRequestError("Model route is disabled: " + modelRoute, "route_disabled", { route: modelRoute });
+      }
+      return { name: route.name, providerId: route.providerId, modelId: route.modelId, variant: route.variant, display: route.display };
+    }
+    const route = routes.find((candidate) => candidate.name === this.config.defaultModelRoute) ?? routes.find((candidate) => candidate.default);
+    if (!route || !route.enabled) {
+      throw new InvalidRequestError("The default model route is disabled: " + this.config.defaultModelRoute, "route_disabled", { route: this.config.defaultModelRoute });
+    }
+    return { name: route.name, providerId: route.providerId, modelId: route.modelId, variant: route.variant, display: route.display };
+  }
+
+  /**
+   * Resolves the dispatch identity of an existing agent EXCLUSIVELY from the
+   * persisted spawn-time columns (modelProviderId/modelId/modelVariant).
+   * Continue, approval resume/reply, graceful finalization, recovery and
+   * reconciliation always use this persisted identity, never the mutable live
+   * config registry: changing, removing, disabling or repointing a config
+   * route after spawn can never silently redirect an existing agent.
+   * modelRoute is an immutable diagnostic label only. Agents created before
+   * route pinning (model_route IS NULL) take the same persisted-columns path,
+   * keeping legacy agents compatible.
+   */
+  private resolveAgentRoute(agent: AgentRecord): ResolvedRoute {
+    return {
+      name: agent.modelRoute ?? "legacy",
+      providerId: agent.modelProviderId,
+      modelId: agent.modelId,
+      variant: agent.modelVariant,
+      display: staticModelDisplayName(agent.modelId, agent.modelVariant),
+    };
+  }
+
+  private dispatchOptions(agent: AgentRecord): { providerId: string; modelId: string; variant?: string; agent?: string } {
+    const route = this.resolveAgentRoute(agent);
+    return {
+      providerId: route.providerId,
+      modelId: route.modelId,
+      ...(route.variant ? { variant: route.variant } : {}),
+      ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
+    };
+  }
+
+  /**
+   * Maps already-validated repository-root context paths into the would-be
+   * worktree (the worktree mirrors the repository root, so the repo-relative
+   * path is the worktree-relative path). This keeps worker-visible paths
+   * inside the worktree (no main-repository path leakage) and rejects, with a
+   * typed 400, files that would not exist inside the worktree (for example
+   * untracked files under .deepseek-worktrees) before any side effect.
+   */
+  private mapContextIntoWorktree(workspacePath: string, repositoryRoot: string, files: string[]): string[] {
+    return files.map((file) => {
+      const relative = path.relative(repositoryRoot, file);
+      if (relative === ".deepseek-worktrees" || relative.startsWith(".deepseek-worktrees" + path.sep)) {
+        throw new InvalidRequestError(
+          "context file inside .deepseek-worktrees is not available inside a worktree: " + file,
+          "context_file_invalid",
+          { file, reason: "inside_worktrees_directory" },
+        );
+      }
+      const mapped = path.join(workspacePath, relative);
+      try {
+        return assertInside(workspacePath, mapped);
+      } catch {
+        throw new InvalidRequestError(
+          "context file escapes the worktree: " + file,
+          "context_file_invalid",
+          { file, reason: "outside_workspace" },
+        );
+      }
+    });
   }
 
   private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number, autoArmed = false): FollowLifecycle {
@@ -683,12 +823,7 @@ export class BridgeService {
   private async requestGracefulFinalize(agent: AgentRecord, job: JobRecord): Promise<void> {
     const client = this.clientOrThrow();
     try {
-      await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, {
-        providerId: this.config.opencodeProviderId,
-        modelId: this.config.opencodeModelId,
-        ...(this.config.opencodeVariant ? { variant: this.config.opencodeVariant } : {}),
-        ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-      });
+      await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent));
       this.recordActivity(agent, job, "finalize", "Graceful finalization prompt submitted in the same OpenCode session");
     } catch (error) {
       if (isUnknownDispatchOutcome(error)) {
@@ -706,12 +841,7 @@ export class BridgeService {
         this.recordActivity(agent, job, "error", "OpenCode abort failed during graceful finalization");
       }
       try {
-        await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, {
-          providerId: this.config.opencodeProviderId,
-          modelId: this.config.opencodeModelId,
-          ...(this.config.opencodeVariant ? { variant: this.config.opencodeVariant } : {}),
-          ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-        });
+        await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent));
         this.recordActivity(agent, job, "finalize", "Graceful finalization prompt resubmitted in the same OpenCode session");
       } catch {
         this.recordActivity(agent, job, "error", "Graceful finalization could not be submitted after the busy turn was aborted");
@@ -828,6 +958,14 @@ export class BridgeService {
     const status = overrides.status ?? envelope?.status ?? mapJobToFollowStatus(job.status);
     const progress = await this.progressSnapshot(agent, job, 10);
     const failure = overrides.error ?? job.error;
+    const resultAvailable = overrides.resultAvailable ?? Boolean(job.resultPath || envelope);
+    // Explicit consumption semantics: a terminal follow result with a usable
+    // final result consumes the job obligation; needs_approval and
+    // non-terminal states keep the obligation pending. Consumption is
+    // persisted and is separate from closing the agent.
+    if (["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) && resultAvailable) {
+      this.store.consumeResult(job.id);
+    }
     return {
       agentId: agent.id,
       jobId: job.id,
@@ -836,7 +974,7 @@ export class BridgeService {
       gracefulFinalize: overrides.gracefulFinalize ?? Boolean(job.gracefulFinalizeAttempted || envelope?.gracefulFinalize),
       partial: overrides.partial ?? Boolean(envelope?.partial || status === "completed_partial" || status === "timed_out"),
       workerAborted: overrides.workerAborted ?? Boolean(envelope?.workerAborted || status === "timed_out"),
-      resultAvailable: overrides.resultAvailable ?? Boolean(job.resultPath || envelope),
+      resultAvailable,
       ...(envelope ? { result: { envelope } } : {}),
       progress,
       ...(failure ? { error: failure } : {}),
@@ -931,12 +1069,7 @@ export class BridgeService {
       if (baselineAssistantMessageId) this.store.setJobMessages(job.id, null, baselineAssistantMessageId);
     }
     try {
-      await this.clientOrThrow().promptAsync(jobAgentSession(agent), prompt, {
-        providerId: this.config.opencodeProviderId,
-        modelId: this.config.opencodeModelId,
-        ...(this.config.opencodeVariant ? { variant: this.config.opencodeVariant } : {}),
-        ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-      });
+      await this.clientOrThrow().promptAsync(jobAgentSession(agent), prompt, this.dispatchOptions(agent));
       const current = this.store.getJob(job.id);
       if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
       this.recordActivity(agent, job, "dispatch", "Dispatched task to the OpenCode session");
@@ -985,12 +1118,7 @@ export class BridgeService {
     this.store.updateJobStatus(job.id, "running");
     if (agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "working");
     try {
-      await this.clientOrThrow().promptAsync(agent.opencodeSessionId, prompt, {
-        providerId: this.config.opencodeProviderId,
-        modelId: this.config.opencodeModelId,
-        ...(this.config.opencodeVariant ? { variant: this.config.opencodeVariant } : {}),
-        ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-      });
+      await this.clientOrThrow().promptAsync(agent.opencodeSessionId, prompt, this.dispatchOptions(agent));
       return this.accepted(this.store.getJob(job.id) ?? job);
     } catch (error) {
       const message = redactSecrets(String(error));
@@ -1036,7 +1164,7 @@ export class BridgeService {
   ): Promise<AcceptedOperation> {
     const current = this.store.getJob(job.id);
     if (!current || current.status !== "needs_approval" || current.permissionId !== permissionId) {
-      throw new Error("permissionId does not match the active approval request");
+      throw new ConflictError("permissionId does not match the active approval request", "permission_mismatch");
     }
     this.clearApprovalTimer(agent.id);
     this.store.setApprovalDeadline(job.id, null);
@@ -1579,9 +1707,7 @@ export class BridgeService {
       agentId: agent.id,
       jobId: job.id,
       topic: agent.topic,
-      modelDisplayName: agent.modelId === "deepseek-v4-flash"
-        ? "DeepSeek V4 Flash" + (agent.modelVariant === "max" ? " · Max" : "")
-        : agent.modelId,
+      modelDisplayName: this.resolveAgentRoute(agent).display,
       state: "Starting",
       message: extra.warning ?? "DeepSeek Sub-Agent accepted the task and will report asynchronously.",
       ...(extra.outcome ? { outcome: extra.outcome } : {}),
@@ -1616,6 +1742,20 @@ export class BridgeService {
 
 function jobAgentSession(agent: AgentRecord): string {
   return agent.opencodeSessionId;
+}
+
+/**
+ * Static, immutable display name for persisted model identity. Deliberately
+ * not derived from the live config registry so renaming a route never changes
+ * an existing agent's label; unknown models fall back to the model id.
+ */
+function staticModelDisplayName(modelId: string, variant: string | null): string {
+  const base = modelId === "deepseek-v4-flash"
+    ? "DeepSeek V4 Flash"
+    : modelId === "deepseek-v4-pro"
+      ? "DeepSeek V4 Pro"
+      : modelId;
+  return variant === "max" ? base + " · Max" : base;
 }
 
 function hashPrompt(prompt: string): string {

@@ -1,13 +1,43 @@
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { defaultUserDataRoot, ensurePrivateDir, isLoopbackHost, writePrivateFile } from "./security.js";
-import type { BridgeConfig } from "./types.js";
+import { DEFAULT_MAX_CONTEXT_FILE_BYTES, defaultUserDataRoot, ensurePrivateDir, isLoopbackHost, writePrivateFile } from "./security.js";
+import type { BridgeConfig, ModelRoute, RetentionMode } from "./types.js";
 
 export const FOLLOW_MAX_WAIT_MINUTES = 60;
 export const FOLLOW_MAX_GRACE_MINUTES = 10;
 export const FOLLOW_MAX_TOTAL_MINUTES = FOLLOW_MAX_WAIT_MINUTES + FOLLOW_MAX_GRACE_MINUTES;
 export const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 4_500;
+
+export const DEFAULT_MODEL_ROUTE_NAME = "flash-max";
+export const DEFAULT_PROVIDER_ID = "opencode-go";
+
+/**
+ * Built-in route registry. flash-max is enabled by default; pro-max is
+ * registered but disabled until explicitly enabled by the user. Dispatches
+ * resolve strictly through this registry: an unknown or disabled route fails
+ * closed with a stable typed 400 and there is no silent fallback route.
+ */
+export const MODEL_ROUTE_REGISTRY: readonly ModelRoute[] = [
+  {
+    name: "flash-max",
+    providerId: DEFAULT_PROVIDER_ID,
+    modelId: "deepseek-v4-flash",
+    variant: "max",
+    enabled: true,
+    default: true,
+    display: "DeepSeek V4 Flash · Max",
+  },
+  {
+    name: "pro-max",
+    providerId: DEFAULT_PROVIDER_ID,
+    modelId: "deepseek-v4-pro",
+    variant: "max",
+    enabled: false,
+    default: false,
+    display: "DeepSeek V4 Pro · Max",
+  },
+];
 
 export function defaultConfigPath(): string {
   return path.join(defaultUserDataRoot(), "config.json");
@@ -31,6 +61,67 @@ function boundedInteger(value: unknown, fallback: number, minimum: number, maxim
     : fallback;
 }
 
+function asRetentionMode(value: unknown, fallback: RetentionMode): RetentionMode {
+  return value === "auto" || value === "disabled" || value === "dry-run" || value === "enabled"
+    ? value
+    : fallback;
+}
+
+function parseRouteRegistry(value: unknown): ModelRoute[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const routes: ModelRoute[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.name !== "string" || raw.name.length === 0) return null;
+    if (typeof raw.providerId !== "string" || raw.providerId.length === 0) return null;
+    if (typeof raw.modelId !== "string" || raw.modelId.length === 0) return null;
+    const variant = asNullableString(raw.variant);
+    const enabled = raw.enabled !== false;
+    const defaultRoute = raw.default === true;
+    const display = typeof raw.display === "string" && raw.display.length > 0
+      ? raw.display
+      : raw.providerId + "/" + raw.modelId + (variant ? " · " + variant : "");
+    routes.push({ name: raw.name, providerId: raw.providerId, modelId: raw.modelId, variant, enabled, default: defaultRoute, display });
+  }
+  if (routes.some((route) => route.default)) return routes;
+  const first = routes[0];
+  if (!first) return null;
+  return routes.map((route) => route.name === first.name ? { ...route, default: true } : route);
+}
+
+function registryWithFlatDefault(routes: ModelRoute[], providerId: string, modelId: string, variant: string | null): ModelRoute[] {
+  if (routes.some((route) => route.default)) return routes.map((route) => ({ ...route }));
+  const flatMatches = routes.find((route) =>
+    route.providerId === providerId && route.modelId === modelId && (route.variant ?? null) === variant);
+  const first = routes[0];
+  const winner = flatMatches ?? first;
+  if (!winner) return [];
+  return routes.map((route) => route.name === winner.name ? { ...route, default: true } : route);
+}
+
+/**
+ * Backward compatibility for old flat configs (opencodeProviderId /
+ * opencodeModelId / opencodeVariant): when no modelRoutes registry is present
+ * in the config file, the default route is derived from the flat fields. A
+ * flat configuration that explicitly names a non-default model (for example
+ * deepseek-v4-pro) promotes that route to default and enabled.
+ */
+function defaultModelRoutes(flat: { providerId: string; modelId: string; variant: string | null }): ModelRoute[] {
+  const matches = MODEL_ROUTE_REGISTRY.filter((route) =>
+    route.providerId === flat.providerId && route.modelId === flat.modelId && (route.variant ?? null) === flat.variant);
+  if (matches.length === 0) return MODEL_ROUTE_REGISTRY.map((route) => ({ ...route }));
+  return MODEL_ROUTE_REGISTRY.map((route) => {
+    if (route.name === matches[0]?.name) return { ...route, default: true, enabled: true };
+    return route.default ? { ...route, default: false } : { ...route };
+  });
+}
+
+function defaultRouteName(routes: ModelRoute[]): string {
+  const defaultRoute = routes.find((route) => route.default);
+  return defaultRoute?.name ?? DEFAULT_MODEL_ROUTE_NAME;
+}
+
 export function isValidFollowDefaults(config: Pick<BridgeConfig, "followDefaultWaitMinutes" | "followDefaultGraceMinutes">): boolean {
   return boundedInteger(config.followDefaultWaitMinutes, Number.NaN, 1, FOLLOW_MAX_WAIT_MINUTES) === config.followDefaultWaitMinutes &&
     boundedInteger(config.followDefaultGraceMinutes, Number.NaN, 1, FOLLOW_MAX_GRACE_MINUTES) === config.followDefaultGraceMinutes;
@@ -39,6 +130,11 @@ export function isValidFollowDefaults(config: Pick<BridgeConfig, "followDefaultW
 export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   const dataDir = overrides.dataDir ?? defaultUserDataRoot();
   const configPath = overrides.configPath ?? path.join(dataDir, "config.json");
+  const modelRoutes = overrides.modelRoutes ?? defaultModelRoutes({
+    providerId: overrides.opencodeProviderId ?? DEFAULT_PROVIDER_ID,
+    modelId: overrides.opencodeModelId ?? "deepseek-v4-flash",
+    variant: overrides.opencodeVariant ?? "max",
+  });
   return {
     dataDir,
     configPath,
@@ -50,7 +146,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     opencodeUsername: overrides.opencodeUsername ?? "opencode",
     opencodePassword: overrides.opencodePassword ?? null,
     opencodeBinary: overrides.opencodeBinary ?? null,
-    opencodeProviderId: overrides.opencodeProviderId ?? "opencode-go",
+    opencodeProviderId: overrides.opencodeProviderId ?? DEFAULT_PROVIDER_ID,
     opencodeModelId: overrides.opencodeModelId ?? "deepseek-v4-flash",
     opencodeVariant: overrides.opencodeVariant ?? "max",
     opencodeAgent: overrides.opencodeAgent ?? "build",
@@ -66,6 +162,10 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     codexAppServerArgs: overrides.codexAppServerArgs ?? [],
     maxTaskLength: overrides.maxTaskLength ?? 120_000,
     maxResultLength: overrides.maxResultLength ?? 2_000_000,
+    modelRoutes,
+    defaultModelRoute: overrides.defaultModelRoute ?? defaultRouteName(modelRoutes),
+    retentionMode: overrides.retentionMode ?? "disabled",
+    maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
   };
 }
 
@@ -75,6 +175,16 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
     const parsed: unknown = JSON.parse(await readFile(configPath, "utf8"));
     if (!parsed || typeof parsed !== "object") return defaults;
     const raw = parsed as Record<string, unknown>;
+    const flatProviderId = asString(raw.opencodeProviderId, defaults.opencodeProviderId);
+    const flatModelId = asString(raw.opencodeModelId, defaults.opencodeModelId);
+    const flatVariant = asNullableString(raw.opencodeVariant);
+    const parsedRoutes = parseRouteRegistry(raw.modelRoutes);
+    const modelRoutes = parsedRoutes ?? defaultModelRoutes({ providerId: flatProviderId, modelId: flatModelId, variant: flatVariant });
+    const configuredDefaultRoute = typeof raw.defaultModelRoute === "string"
+      && modelRoutes.some((route) => route.name === raw.defaultModelRoute)
+      ? raw.defaultModelRoute
+      : defaultRouteName(modelRoutes);
+    const retentionMode = asRetentionMode(raw.retentionMode, defaults.retentionMode);
     return {
       ...defaults,
       dataDir: asString(raw.dataDir, defaults.dataDir),
@@ -89,9 +199,9 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       opencodeUsername: asString(raw.opencodeUsername, defaults.opencodeUsername),
       opencodePassword: asNullableString(raw.opencodePassword),
       opencodeBinary: asNullableString(raw.opencodeBinary),
-      opencodeProviderId: asString(raw.opencodeProviderId, defaults.opencodeProviderId),
-      opencodeModelId: asString(raw.opencodeModelId, defaults.opencodeModelId),
-      opencodeVariant: asNullableString(raw.opencodeVariant),
+      opencodeProviderId: flatProviderId,
+      opencodeModelId: flatModelId,
+      opencodeVariant: flatVariant,
       opencodeAgent: asString(raw.opencodeAgent, defaults.opencodeAgent),
       opencodeStartupTimeoutMs: asNumber(raw.opencodeStartupTimeoutMs, defaults.opencodeStartupTimeoutMs),
       opencodeEventReconnectMaxMs: asNumber(raw.opencodeEventReconnectMaxMs, defaults.opencodeEventReconnectMaxMs),
@@ -107,6 +217,10 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
         : defaults.codexAppServerArgs,
       maxTaskLength: asNumber(raw.maxTaskLength, defaults.maxTaskLength),
       maxResultLength: asNumber(raw.maxResultLength, defaults.maxResultLength),
+      modelRoutes,
+      defaultModelRoute: configuredDefaultRoute,
+      retentionMode,
+      maxContextFileBytes: boundedInteger(raw.maxContextFileBytes, defaults.maxContextFileBytes, 1_024, 64_000_000),
     };
   } catch {
     return defaults;

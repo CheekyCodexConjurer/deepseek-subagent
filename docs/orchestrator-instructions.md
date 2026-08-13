@@ -16,7 +16,7 @@ MCP registration exposes the DeepSeek tools but does not by itself make them the
 
 When delegating work to DeepSeek:
 
-1. Start the independent task with `deepseek_spawn`. Provide a concise topic, the complete task, the intended mode and an explicit workspace when it matters.
+1. Start the independent task with `deepseek_spawn`. Provide a concise topic, the complete task, the intended mode and an explicit workspace when it matters. `model_route` is optional and names a registered, enabled route (default: `flash-max`); an unknown or disabled route is rejected with a typed 400 before any workspace or session side effect, with no fallback route. The route is pinned on the agent for the rest of its lifetime.
 2. Continue doing all useful independent work yourself. Do not poll DeepSeek while useful work remains.
 3. Use `deepseek_consult` only when the user requests progress, the task is taking unusually long, or the snapshot materially changes the next decision. It returns observable activity only; never private reasoning. Do not call it repeatedly to wait.
 4. When all useful independent work is exhausted and the next step depends on DeepSeek, call `deepseek_follow`. It waits efficiently on completion events, approval, error, deadline or graceful finalization.
@@ -25,6 +25,8 @@ When delegating work to DeepSeek:
 
 `deepseek_follow` does not replace the worker or create a new session. Cancelling it removes only the waiter; use `deepseek_abort` when the worker itself must stop.
 
-Use deepseek_abort only when active work must stop. Use deepseek_close after the logical agent is no longer needed. Use deepseek_recover_result only when delivery was interrupted and a technical job id is known.
+A terminal `deepseek_follow` result consumes the job obligation (persisted); a `needs_approval` follow keeps the obligation pending and requires `deepseek_continue` with `permission_id` and `permission_reply`. Closing the agent with `deepseek_close` is separate from consuming the obligation: consume first, then close after review.
+
+Use deepseek_abort only when active work must stop. Use deepseek_close after the logical agent is no longer needed. Use deepseek_recover_result only when delivery was interrupted and a technical job id is known; a successful recover also consumes the obligation.
 
 The worker must report STATUS, SUMMARY, ASSUMPTIONS, CHANGES, FILES, TESTS, RISKS and UNRESOLVED. It must not claim an unrun validation and must not reveal private reasoning.

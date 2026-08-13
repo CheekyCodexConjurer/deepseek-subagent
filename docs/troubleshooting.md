@@ -32,7 +32,27 @@ Check the configured binary and run the same-user OpenCode CLI. Managed mode sea
 
 ## Provider or model failure
 
-The bridge uses the configured opencode-go provider, deepseek-v4-flash model and max variant by default. It does not silently fall back to another provider or model. Inspect the persisted job error after the failure.
+Dispatch resolves strictly through the configured route registry. The built-in default is the `flash-max` route (`opencode-go` / `deepseek-v4-flash` / `max`); `pro-max` is registered but disabled. `deepseek_spawn` accepts an optional `model_route`; an unknown or disabled route is rejected with a typed 400 (`unknown_route` / `route_disabled`) before any workspace or session side effect. There is no fallback route: the bridge never substitutes another provider or model. Inspect the persisted job error after a dispatch failure.
+
+## Model route pinning
+
+The route chosen at spawn is persisted on the agent. Continue, approval resume/reply, graceful finalization, recovery and restart reconciliation always use that persisted route — changing the config default or disabling a route later never redirects an in-flight agent. Agents created before route pinning keep dispatching on their persisted flat provider/model/variant columns.
+
+## Context files rejected with 400
+
+Context files are validated before any side effect: they must be inside the workspace, must exist, must be regular readable files, and must not exceed `maxContextFileBytes` (1 MB default). The rejection is a typed 400 (`context_file_invalid`) and no session or worktree is created. Oversized input is rejected, never truncated.
+
+## Obligation and consumption warnings
+
+Doctor and `node dist/cli.js obligations` warn about: terminal results with a persisted result that were never consumed by `deepseek_follow` or `deepseek_recover_result`; terminal agents still open (not closed); open job obligations; and genuinely stale follow windows (grace deadline passed while still following/finalizing and not auto-armed). Fresh windows and auto-armed windows are never flagged. Warnings are read-only: nothing is auto-closed or auto-consumed.
+
+## Retention
+
+Retention is opt-in and defaults to `disabled`. `node dist/cli.js retention dry-run` previews what would be pruned (nothing is deleted) and performs the explicit offline preparation; `node dist/cli.js retention enabled --confirm` arms pruning on an existing database after the preview; `auto` enables pruning only on a provably empty database. The preparation gate is intrinsic: only the offline CLI flow writes the in-database preparation marker, so hand-editing `retentionMode` to `enabled` alone never arms online pruning on a non-empty legacy database (doctor reports the reason). Pruning deletes only old `events` and `agent_activity` rows of settled, consumed jobs — agents, jobs, results, deliveries, bindings and the inbox are never touched, and active/open/unconsumed/undelivered/fresh rows plus the newest activity per agent are always protected. Run retention commands while the daemon is stopped.
+
+## Agent lifecycle after a terminal result
+
+A terminal follow result closes the job obligation only. The DeepSeek agent itself stays open and continuable: completed, failed and timed-out writers accept `deepseek_continue` until you call `deepseek_close` after reviewing the result. Aborted agents are not continuable and are auto-closed safely. The follow output states this explicitly so a closed obligation is never mistaken for a closed agent. Consumption is persisted separately: a terminal follow or a successful recover marks the result consumed (`result_consumed_at`); closing the agent never consumes an obligation and consuming never closes the agent.
 
 ## Codex delivery is unavailable
 
