@@ -74,6 +74,8 @@
   "obligations": {
     "consumption": "terminal results become consumed when follow/recover returns a usable final result (persisted per job); needs_approval stays pending",
     "agentCloseSeparate": "closing the agent is separate from consuming the obligation",
+    "respawn": "deepseek_continue accepts allow_respawn (optional boolean, default false) as the explicit closed-agent recovery: only when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted does it automatically create a NEW agent and NEW OpenCode session with persisted lineage (parent_agent_id), reusing only the parent's topic, workspace path, workspace strategy and pinned model route; thread/turn correlation hints are preserved or derived; auditable activity is recorded on both agents; the response returns the NEW agentId/jobId; the closed agent is never reopened",
+    "respawnFailClosed": ["flag absent on a closed agent (409 not_continuable)", "explicit abort (409 not_continuable)", "no persisted result (409 not_continuable)", "busy agent", "permission-field answers (400)", "any scope change", "no provider fallback", "no live-config route"],
     "doctorWarnings": [
       "unconsumed terminal results",
       "terminal agents still open",

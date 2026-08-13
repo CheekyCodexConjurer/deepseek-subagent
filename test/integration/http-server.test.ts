@@ -66,6 +66,7 @@ test("HTTP maps visual_context to spawn and continue inputs", async () => {
         agent_id: "agent_visual",
         task: "continue from the screenshot",
         visual_context: "Interpretation: the banner indicates a failed build",
+        allow_respawn: true,
       }),
     });
     assert.equal(continueResponse.status, 202);
@@ -73,6 +74,47 @@ test("HTTP maps visual_context to spawn and continue inputs", async () => {
     assert.equal(calls.length, 2);
     assert.equal((calls[0]?.input as { visualContext?: string }).visualContext, "Direct observations: a red banner is visible");
     assert.equal((calls[1]?.input as { visualContext?: string }).visualContext, "Interpretation: the banner indicates a failed build");
+    assert.equal((calls[1]?.input as { allowRespawn?: boolean }).allowRespawn, true, "allow_respawn maps to the continue input");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP rejects a non-boolean allow_respawn with a typed 400", async () => {
+  const calls: Array<{ kind: string; input: unknown }> = [];
+  const service = {
+    continueJob: async (input: unknown) => {
+      calls.push({ kind: "continue", input });
+      return { accepted: true };
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-test-token",
+    dataDir: "C:\\deepseek-http-test-data",
+    configPath: "C:\\deepseek-http-test-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/continue`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        agent_id: "agent_1",
+        task: "continue",
+        allow_respawn: "yes",
+      }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, "invalid_request");
+    assert.equal(calls.length, 0, "the service is never reached with an invalid flag");
   } finally {
     await server.stop();
   }

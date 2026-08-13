@@ -219,6 +219,38 @@ test("MCP exposes visual_context as an optional string on spawn and continue", a
   }
 });
 
+test("MCP exposes allow_respawn as an optional boolean on continue only", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const bridgeClient = new BridgeHttpClient(config);
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.listTools();
+    const tools = result.tools;
+    const spawn = tools.find((tool) => tool.name === "deepseek_spawn");
+    const continueTool = tools.find((tool) => tool.name === "deepseek_continue");
+    const spawnProperties = (spawn?.inputSchema as { properties?: Record<string, { type?: string; default?: unknown }> } | undefined)?.properties ?? {};
+    const continueProperties = (continueTool?.inputSchema as { properties?: Record<string, { type?: string; default?: unknown }> } | undefined)?.properties ?? {};
+    assert.equal(continueProperties.allow_respawn?.type, "boolean");
+    assert.equal(continueProperties.allow_respawn?.default, undefined, "respawn is opt-in, never implicit");
+    assert.equal(spawnProperties.allow_respawn, undefined, "spawn has no respawn flag");
+    assert.match(continueTool?.description ?? "", /allow_respawn/);
+    assert.match(continueTool?.description ?? "", /NEW agent/i);
+    assert.match(continueTool?.description ?? "", /NEW OpenCode session/i);
+    assert.match(continueTool?.description ?? "", /never claims the closed session/i);
+    assert.match(continueTool?.description ?? "", /explicitly aborted/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("MCP accepted text warns and names the exact job when dispatch outcome is uncertain", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",

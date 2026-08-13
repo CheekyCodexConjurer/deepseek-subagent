@@ -243,3 +243,59 @@ test("persists correlation hints with provenance, counters, and migration column
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("lineage migration adds parent_agent_id and round-trips createAgent", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-lineage-"));
+  const store = await BridgeStore.open(directory);
+  let storeClosed = false;
+  try {
+    const parent = store.createAgent({
+      id: "agent_lineage_parent",
+      title: "Lineage Parent",
+      topic: "Lineage topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_lineage",
+      opencodeSessionId: "session_lineage_parent",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+      modelRoute: "flash-max",
+    });
+    const child = store.createAgent({
+      id: "agent_lineage_child",
+      title: "Lineage Child",
+      topic: "Lineage topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_lineage",
+      opencodeSessionId: "session_lineage_child",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+      modelRoute: "flash-max",
+      parentAgentId: "agent_lineage_parent",
+    });
+    assert.equal(parent.parentAgentId, null, "a root agent has no lineage");
+    assert.equal(child.parentAgentId, "agent_lineage_parent", "the child records its lineage");
+    const columns = store.db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+    assert.ok(columns.some((column) => column.name === "parent_agent_id"), "the column exists");
+    store.close();
+    storeClosed = true;
+
+    const reopened = await BridgeStore.open(directory);
+    try {
+      const marker = reopened.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 9").get();
+      assert.ok(marker, "migration version 9 must be recorded");
+      assert.equal(reopened.getAgent("agent_lineage_child")?.parentAgentId, "agent_lineage_parent");
+      assert.equal(reopened.getAgent("agent_lineage_parent")?.parentAgentId, null);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    if (!storeClosed) store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

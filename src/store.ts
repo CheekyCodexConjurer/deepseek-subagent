@@ -149,6 +149,17 @@ export class BridgeStore {
     if (!routeMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(7, ?)").run(new Date().toISOString());
     }
+    // Lineage: parent_agent_id links a respawned agent to the closed agent it
+    // was created from. It is a diagnostic/provenance column only; it never
+    // reopens the parent and never participates in state transitions.
+    const lineageColumns = this.db.prepare("PRAGMA table_info(agents)").all() as Row[];
+    if (!lineageColumns.some((column) => column.name === "parent_agent_id")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN parent_agent_id TEXT");
+    }
+    const lineageMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 9").get() as Row | undefined;
+    if (!lineageMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(9, ?)").run(new Date().toISOString());
+    }
     // Intrinsic retention gate: the explicit offline CLI flow writes a marker
     // into the database; a hand-edited retentionMode alone can never arm
     // online pruning on a legacy database.
@@ -204,9 +215,10 @@ export class BridgeStore {
     modelId: string;
     modelVariant: string | null;
     modelRoute?: string | null;
+    parentAgentId?: string | null;
   }): AgentRecord {
     const now = new Date().toISOString();
-    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,model_route,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,model_route,parent_agent_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
       input.id,
       input.title,
       input.topic,
@@ -219,6 +231,7 @@ export class BridgeStore {
       input.modelId,
       input.modelVariant,
       input.modelRoute ?? null,
+      input.parentAgentId ?? null,
       "created",
       now,
       now,
@@ -718,6 +731,7 @@ export class BridgeStore {
       modelId: stringValue(row, "model_id"),
       modelVariant: nullableString(row, "model_variant"),
       modelRoute: nullableString(row, "model_route"),
+      parentAgentId: nullableString(row, "parent_agent_id"),
       status: stringValue(row, "status") as AgentStatus,
       createdAt: stringValue(row, "created_at"),
       updatedAt: stringValue(row, "updated_at"),

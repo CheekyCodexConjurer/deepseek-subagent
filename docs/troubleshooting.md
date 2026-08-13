@@ -54,6 +54,8 @@ Retention is opt-in and defaults to `disabled`. `node dist/cli.js retention dry-
 
 A terminal follow result closes the job obligation only. The DeepSeek agent itself stays open and continuable: completed, failed and timed-out writers accept `deepseek_continue` until you call `deepseek_close` after reviewing the result. Aborted agents are not continuable and are auto-closed safely. The follow output states this explicitly so a closed obligation is never mistaken for a closed agent. Consumption is persisted separately: a terminal follow or a successful recover marks the result consumed (`result_consumed_at`); closing the agent never consumes an obligation and consuming never closes the agent.
 
+A closed agent is not continuable and is never reopened. If the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted, `deepseek_continue` with `allow_respawn: true` is the explicit recovery: it automatically creates a NEW agent and a NEW OpenCode session in the same persisted workspace/topic/strategy with the same pinned model route, records the lineage (`parent_agent_id`) and auditable activity on both agents, preserves or derives thread/turn correlation hints, and returns the NEW agent/job ids to follow. `allow_respawn` is rejected (typed 409/400) for explicitly aborted agents, agents closed without a persisted result, busy agents, permission-field answers and any scope change; there is no provider fallback and no live-config route. Keep writers open until review is final to avoid needing a respawn.
+
 ## Codex delivery is unavailable
 
 This is expected until a compatible Codex App Server connection is explicitly configured and live-tested. On Windows, the bridge accepts a local WebSocket endpoint in `codexAppServerSocket`, for example `ws://127.0.0.1:PORT`; the endpoint must be started separately with the installed Codex App Server. That server is not automatically the current Desktop process. The generated protocol can support thread/start and turn/steer, but schema availability does not prove that the current Desktop conversation can be correlated. Keep using the inbox until the probe proves both sides.
@@ -69,6 +71,8 @@ Follow and approval deadlines are persisted. A daemon restart resumes the remain
 ## Agent lifecycle after a terminal result
 
 A terminal follow result closes the job obligation only. The DeepSeek agent itself stays open and continuable: completed, failed and timed-out writers accept `deepseek_continue` until you call `deepseek_close` after reviewing the result. Aborted agents are not continuable and are auto-closed safely. The follow output states this explicitly so a closed obligation is never mistaken for a closed agent.
+
+A closed agent is never reopened; `deepseek_continue` with `allow_respawn: true` is the explicit lineage recovery described in the lifecycle section above.
 
 ## Unknown dispatch outcome
 

@@ -74,6 +74,16 @@ export interface ContinueInput {
   permissionId?: string;
   permissionReply?: "once" | "always" | "reject";
   permissionMessage?: string;
+  /**
+   * Opt-in recovery for a closed agent: when true and the agent is closed
+   * after a terminal job with a persisted result (and was NOT explicitly
+   * aborted), the continuation is accepted automatically by spawning a NEW
+   * agent/session with auditable lineage in the persisted workspace, topic,
+   * strategy and pinned model route. Never applicable to aborted agents,
+   * closed agents without a persisted result, busy agents or scope changes;
+   * a closed agent is never itself reopened.
+   */
+  allowRespawn?: boolean;
 }
 
 export interface ConsultInput {
@@ -107,6 +117,8 @@ export interface AgentRecord {
   modelId: string;
   modelVariant: string | null;
   modelRoute: string | null;
+  /** Lineage link to the agent this one was spawned from (closed-agent resume). */
+  parentAgentId: string | null;
   status: AgentStatus;
   createdAt: string;
   updatedAt: string;

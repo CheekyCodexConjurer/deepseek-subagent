@@ -416,9 +416,12 @@ export class BridgeService {
       if (existing) return this.acceptedRequest(existing);
       const agent = this.store.getAgent(input.agentId);
       if (!agent) throw new UnknownAgentError(input.agentId);
-      if (agent.status === "closed" || agent.status === "aborted") throw new ConflictError("Agent is not continuable", "not_continuable");
       const active = this.activeJob(agent.id);
       if (active && active.status !== "needs_approval") throw new BridgeBusyError(active.id);
+      if (agent.status === "closed" || agent.status === "aborted") {
+        if (!input.allowRespawn) throw new ConflictError("Agent is not continuable", "not_continuable");
+        return this.respawnClosedAgent(agent, input);
+      }
       const prompt = await buildWorkerPrompt({
         task: input.task,
         relation: input.relation,
@@ -444,6 +447,76 @@ export class BridgeService {
       if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
       return this.dispatch(agent, job, prompt);
     });
+  }
+
+  /**
+   * Closed-agent recovery with lineage. Only reachable with allow_respawn:
+   * a closed agent is NEVER reopened or made continuable; a brand-new agent
+   * and a brand-new OpenCode session are created in the parent's persisted
+   * workspace/topic/strategy with the parent's pinned route columns (never
+   * the live config registry, so no provider fallback and no redirect).
+   * Fails closed when the parent was explicitly aborted, has no terminal
+   * job with a persisted result, is busy, or when permission fields are
+   * supplied (a closed agent has no pending approval to answer).
+   */
+  private async respawnClosedAgent(agent: AgentRecord, input: ContinueInput): Promise<AcceptedOperation> {
+    if (agent.status === "aborted") throw new ConflictError("Agent was explicitly aborted; it cannot be resumed", "not_continuable");
+    if (input.permissionId || input.permissionReply || input.permissionMessage) {
+      throw new InvalidRequestError("permission fields are not applicable when resuming a closed agent", "invalid_request");
+    }
+    const lastJob = this.store.listJobs().find((job) => job.agentId === agent.id) ?? null;
+    if (!lastJob) throw new ConflictError("Agent has no completed job to resume from", "not_continuable");
+    if (lastJob.status === "aborted") {
+      throw new ConflictError("Agent was explicitly aborted; it cannot be resumed", "not_continuable");
+    }
+    if (!TERMINAL_JOB_STATUSES.has(lastJob.status) || !lastJob.resultPath) {
+      throw new ConflictError("Agent was closed without a persisted result; it cannot be resumed", "not_continuable");
+    }
+    const workspacePath = agent.workspacePath;
+    const title = normalizeTitle(agent.topic);
+    const childId = newId("agent");
+    const session = await this.clientOrThrow().createSession(workspacePath, title);
+    const child = this.store.createAgent({
+      id: childId,
+      title,
+      topic: agent.topic,
+      repositoryRoot: agent.repositoryRoot,
+      workspacePath,
+      workspaceStrategy: agent.workspaceStrategy,
+      opencodeServerId: this.managed?.serverId ?? agent.opencodeServerId,
+      opencodeSessionId: session.id,
+      modelProviderId: agent.modelProviderId,
+      modelId: agent.modelId,
+      modelVariant: agent.modelVariant,
+      modelRoute: agent.modelRoute,
+      parentAgentId: agent.id,
+    });
+    const prompt = await buildWorkerPrompt({
+      task: input.task,
+      relation: input.relation,
+      ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+    }, workspacePath, { maxLength: this.config.maxTaskLength });
+    const job = this.store.createJob({
+      id: newId("job"),
+      agentId: child.id,
+      kind: "continue",
+      requestId: input.requestId,
+      promptHash: hashPrompt(prompt),
+    });
+    // Correlation: explicit MCP hints of this request win; otherwise derive
+    // the parent's last-job hints so the same thread/turn provenance follows
+    // the lineage.
+    this.persistCorrelationHint(job, input.threadId, input.turnId);
+    if (!input.threadId && !input.turnId && (lastJob.hintThreadId || lastJob.hintTurnId)) {
+      this.store.setCorrelationHint(job.id, {
+        threadId: lastJob.hintThreadId,
+        turnId: lastJob.hintTurnId,
+        source: lastJob.hintSource ?? "inherited",
+      });
+    }
+    this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child.id + " after job " + lastJob.id);
+    this.recordActivity(child, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new OpenCode session " + session.id);
+    return this.dispatch(child, job, prompt);
   }
 
   async consult(input: ConsultInput): Promise<ProgressSnapshot> {

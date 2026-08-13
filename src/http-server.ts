@@ -389,6 +389,7 @@ function toContinueInput(body: unknown): ContinueInput {
     : enumValue(permissionReplyValue, ["once", "always", "reject"], "permissionReply") as ContinueInput["permissionReply"];
   const permissionMessage = optionalString(value.permissionMessage ?? value.permission_message);
   const visualContext = optionalString(value.visualContext ?? value.visual_context);
+  const allowRespawnValue = value.allowRespawn ?? value.allow_respawn;
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
@@ -400,6 +401,7 @@ function toContinueInput(body: unknown): ContinueInput {
     ...(permissionId ? { permissionId } : {}),
     ...(permissionReply ? { permissionReply } : {}),
     ...(permissionMessage ? { permissionMessage } : {}),
+    ...(allowRespawnValue === undefined ? {} : { allowRespawn: booleanValue(allowRespawnValue, "allowRespawn") }),
   };
 }
 
@@ -430,6 +432,11 @@ function toFollowInput(body: unknown): FollowInput {
 function enumValue(value: unknown, allowed: string[], name: string): string {
   if (typeof value === "string" && allowed.includes(value)) return value;
   throw new InvalidRequestError(name + " must be one of: " + allowed.join(", "));
+}
+
+function booleanValue(value: unknown, name: string): boolean {
+  if (typeof value === "boolean") return value;
+  throw new InvalidRequestError(name + " must be a boolean");
 }
 
 function integerInRange(value: unknown, minimum: number, maximum: number, name: string): number {

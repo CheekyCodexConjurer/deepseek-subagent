@@ -2411,6 +2411,219 @@ test("failed and timed-out writers remain continuable until closed", async () =>
   }
 });
 
+test("allow_respawn resumes a closed agent through a new lineage agent and session", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const parent = await service.spawn({
+      requestId: "request_respawn_parent",
+      topic: "Lineage fixture",
+      task: "Seed the parent",
+      cwd: directory,
+      mode: "analyze",
+      threadId: "thread_lineage",
+      turnId: "turn_lineage",
+    });
+    const parentSession = service.getAgent(parent.agentId)?.opencodeSessionId;
+    assert.ok(parentSession);
+    client.messages = [{
+      info: { id: "assistant_respawn_parent", role: "assistant", sessionID: parentSession },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: parent seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: parentSession } });
+    assert.equal(service.getJob(parent.jobId)?.status, "delivered");
+
+    await service.close(parent.agentId);
+    assert.equal(service.getAgent(parent.agentId)?.status, "closed");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_respawn_no_flag",
+      agentId: parent.agentId,
+      relation: "correction",
+      task: "Must be rejected without the flag",
+    }), /not continuable/);
+
+    const resumed = await service.continueJob({
+      requestId: "request_respawn_child",
+      agentId: parent.agentId,
+      relation: "correction",
+      task: "Fix the review findings",
+      allowRespawn: true,
+    });
+    assert.equal(resumed.status, "accepted");
+    assert.notEqual(resumed.agentId, parent.agentId, "the child is a new agent");
+    assert.notEqual(resumed.jobId, parent.jobId, "the child gets a new job obligation");
+
+    const parentRecord = service.getAgent(parent.agentId);
+    const child = service.getAgent(resumed.agentId);
+    assert.ok(parentRecord);
+    assert.ok(child);
+    assert.equal(child.parentAgentId, parent.agentId, "lineage is recorded on the child");
+    assert.equal(parentRecord.parentAgentId, null, "the parent has no lineage");
+    assert.equal(child.topic, parentRecord.topic, "topic is inherited");
+    assert.equal(child.workspacePath, parentRecord.workspacePath, "workspace is reused");
+    assert.equal(child.workspaceStrategy, parentRecord.workspaceStrategy, "strategy is inherited");
+    assert.equal(child.modelProviderId, parentRecord.modelProviderId, "pinned provider is inherited");
+    assert.equal(child.modelId, parentRecord.modelId, "pinned model is inherited");
+    assert.equal(child.modelRoute, parentRecord.modelRoute, "pinned route label is inherited");
+    assert.notEqual(child.opencodeSessionId, parentRecord.opencodeSessionId, "the closed session is never reused");
+    assert.equal(client.promptCalls.at(-1)?.sessionId, child.opencodeSessionId, "dispatch targets the new session");
+
+    const childJob = service.getJob(resumed.jobId);
+    assert.ok(childJob);
+    assert.equal(childJob.kind, "continue");
+    assert.equal(childJob.hintThreadId, "thread_lineage", "parent correlation hint is derived");
+    assert.equal(childJob.hintTurnId, "turn_lineage");
+    assert.equal(childJob.hintSource, "mcp", "the derived hint keeps its original provenance");
+
+    const parentResumeEvents = store.listActivity(parent.agentId, 20).filter((activity) => /resumed/.test(activity.summary));
+    const childLineageEvents = store.listActivity(child.id, 20).filter((activity) => /closed agent/.test(activity.summary));
+    assert.equal(parentResumeEvents.length, 1, "the parent has an auditable resume event");
+    assert.equal(childLineageEvents.length, 1, "the child has an auditable lineage event");
+
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_respawn_permission",
+      agentId: parent.agentId,
+      relation: "continuation",
+      task: "Permission fields do not apply to a resume",
+      allowRespawn: true,
+      permissionId: "permission_x",
+      permissionReply: "once",
+    }), /not applicable/i);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("allow_respawn with the same request_id creates exactly one lineage child", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-dedupe-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const parent = await service.spawn({
+      requestId: "request_respawn_dedupe_parent",
+      topic: "Dedupe fixture",
+      task: "Seed the parent",
+      cwd: directory,
+    });
+    const parentSession = service.getAgent(parent.agentId)?.opencodeSessionId;
+    assert.ok(parentSession);
+    client.messages = [{
+      info: { id: "assistant_respawn_dedupe", role: "assistant", sessionID: parentSession },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: dedupe seed turn" }],
+    }];
+    await client.emit({ type: "session.idle", properties: { sessionID: parentSession } });
+    await service.close(parent.agentId);
+
+    const input = {
+      requestId: "request_respawn_dedupe_same",
+      agentId: parent.agentId,
+      relation: "continuation" as const,
+      task: "Resume exactly once",
+      allowRespawn: true,
+    };
+    const first = await service.continueJob(input);
+    const second = await service.continueJob(input);
+    assert.equal(second.agentId, first.agentId, "the same lineage child is returned");
+    assert.equal(second.jobId, first.jobId, "the same obligation is returned");
+    const children = service.listAgents().filter((agent) => agent.parentAgentId === parent.agentId);
+    assert.equal(children.length, 1, "a duplicate recovery never creates a second child");
+    assert.equal(client.sessionCount, 2, "only the parent session plus one new session exist");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("allow_respawn never resumes an explicitly aborted agent", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-abort-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    const parent = await service.spawn({
+      requestId: "request_respawn_aborted_parent",
+      topic: "Aborted fixture",
+      task: "Seed the parent",
+      cwd: directory,
+    });
+    await service.abort(parent.agentId, "test stop");
+    assert.equal(service.getAgent(parent.agentId)?.status, "closed");
+    assert.equal(service.getJob(parent.jobId)?.status, "aborted");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_respawn_aborted_child",
+      agentId: parent.agentId,
+      relation: "continuation",
+      task: "Must not resume after an explicit abort",
+      allowRespawn: true,
+    }), /explicitly aborted/);
+    assert.equal(service.listAgents().length, 1, "no lineage child is created");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("allow_respawn fails closed when the closed agent has no persisted result", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-noresult-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+    client.promptErrors.push(new OpenCodeHttpError(503, "POST", "/prompt_async", "unavailable"));
+    await assert.rejects(() => service.spawn({
+      requestId: "request_respawn_noresult_parent",
+      topic: "No result fixture",
+      task: "Seed the parent",
+      cwd: directory,
+    }), /HTTP 503/);
+    const parent = store.listAgents()[0];
+    assert.ok(parent);
+    assert.equal(parent.status, "failed");
+    await service.close(parent.id);
+    assert.equal(service.getAgent(parent.id)?.status, "closed");
+    assert.equal(store.listJobs()[0]?.resultPath, null, "no result was ever persisted");
+    await assert.rejects(() => service.continueJob({
+      requestId: "request_respawn_noresult_child",
+      agentId: parent.id,
+      relation: "continuation",
+      task: "Must not resume without a persisted result",
+      allowRespawn: true,
+    }), /without a persisted result/);
+    assert.equal(service.listAgents().length, 1, "no lineage child is created");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("spawn and continue persist validated MCP thread/turn hints without authorizing delivery", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-hints-"));
   const store = await BridgeStore.open(directory);

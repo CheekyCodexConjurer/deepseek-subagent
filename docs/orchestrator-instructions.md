@@ -27,6 +27,8 @@ When delegating work to DeepSeek:
 
 A terminal `deepseek_follow` result consumes the job obligation (persisted); a `needs_approval` follow keeps the obligation pending and requires `deepseek_continue` with `permission_id` and `permission_reply`. Closing the agent with `deepseek_close` is separate from consuming the obligation: consume first, then close after review.
 
+Keep writers open until review and corrections are final: a closed agent is not continuable. If a closed agent must continue anyway, `deepseek_continue` accepts an explicit `allow_respawn: true` only when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted: the bridge then automatically spawns a NEW agent and a NEW OpenCode session in the same persisted workspace, topic, workspace strategy and pinned model route, records the lineage and activity on both agents, preserves or derives thread/turn correlation, and returns the NEW `agent_id`/`job_id` to follow. It never claims the closed session is the same session and never reopens the closed agent. `allow_respawn` fails closed for aborted agents, closed agents without a persisted result, busy agents, permission answers and scope changes; there is no provider fallback and no live-config route. Prefer keeping the agent open over respawning.
+
 Use deepseek_abort only when active work must stop. Use deepseek_close after the logical agent is no longer needed. Use deepseek_recover_result only when delivery was interrupted and a technical job id is known; a successful recover also consumes the obligation.
 
 The worker must report STATUS, SUMMARY, ASSUMPTIONS, CHANGES, FILES, TESTS, RISKS and UNRESOLVED. It must not claim an unrun validation and must not reveal private reasoning.
