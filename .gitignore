@@ -7,5 +7,6 @@ coverage/
 !.env.example
 data/
 tmp/
+.deepseek-worktrees/
 .DS_Store
 Thumbs.db
