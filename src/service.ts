@@ -1363,6 +1363,7 @@ export class BridgeService {
     }
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
+    this.store.updateJobStatus(job.id, "running");
     void this.runAntigravityAsync(agent, job, prompt, controller).catch((error: unknown) => {
       if (this.running) this.lastStreamError = redactSecrets(String(error));
     });
@@ -1391,7 +1392,6 @@ export class BridgeService {
         this.recordActivity(agent, current, "abort", "Antigravity process ended after the follow timeout; the timed-out job stays terminal");
         return;
       }
-      if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
       const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
       this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
       const completed = this.store.getJob(job.id) ?? job;

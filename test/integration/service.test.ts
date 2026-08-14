@@ -3509,6 +3509,9 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
     const job = store.getJob(accepted.jobId);
     assert.ok(job);
     assert.equal(job.status, "delivered");
+    assert.ok(job.startedAt, "startedAt must be persisted for antigravity jobs");
+    assert.ok(job.completedAt, "completedAt must be persisted for antigravity jobs");
+    assert.ok(Date.parse(job.startedAt) <= Date.parse(job.completedAt), "startedAt must not be later than completedAt");
     assert.ok(job.resultPath);
     const persisted = JSON.parse(await readFile(job.resultPath, "utf8")) as { envelope: ResultEnvelope };
     assert.equal(persisted.envelope.status, "completed");
@@ -3834,7 +3837,7 @@ test("an aborted Antigravity run is never recorded as a rejected dispatch and re
       !activities.some((activity) => /rejected the task dispatch/.test(activity.summary)),
       "an abort signal must never be recorded as a rejected dispatch",
     );
-    assert.equal(store.getJob(accepted.jobId)?.status, "dispatching", "stop() leaves the in-flight job as-is for startup recovery");
+    assert.equal(store.getJob(accepted.jobId)?.status, "running", "stop() leaves the in-flight job as-is for startup recovery");
     // The next daemon start terminalizes the stranded job.
     await service.start();
     await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
