@@ -7,7 +7,7 @@ import { FOLLOW_MAX_TOTAL_MINUTES } from "../../src/config.js";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeError, ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError } from "../../src/errors.js";
 import { BridgeBusyError } from "../../src/service.js";
-import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
 import type { BridgeService } from "../../src/service.js";
 
 async function freePort(): Promise<number> {
@@ -173,7 +173,11 @@ test("BridgeHttpClient surfaces fetch connection causes like ECONNREFUSED", asyn
     configPath: "C:\\deepseek-http-test-data\\config.json",
   });
   const client = new BridgeHttpClient(config);
-  await assert.rejects(() => client.call("/v1/jobs/anything"), /ECONNREFUSED/);
+  await assert.rejects(() => client.call("/v1/jobs/anything"), (error: unknown) => {
+    assert.ok(error instanceof BridgeTransportError, "connectivity failures are typed distinctly from HTTP rejections");
+    assert.match(error.message, /ECONNREFUSED/);
+    return true;
+  });
 });
 
 test("doctor health dispatcher stays far below the bridge follow timeouts", () => {
@@ -377,6 +381,161 @@ test("unauthorized requests return a structured typed 401 body", async () => {
     assert.equal(body.error, "Unauthorized");
     assert.equal(body.code, "unauthorized");
     assert.equal(body.status, 401);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("route endpoints are operator-only: the bearer token gate protects status and set", async () => {
+  let setCalls = 0;
+  const service = {
+    setActiveRoute: async () => {
+      setCalls += 1;
+      return { activeRoute: null, activeRouteError: null, defaultModelRoute: "flash-max", source: "operator-set", routes: [] };
+    },
+    routeStatus: async () => ({ activeRoute: null, activeRouteError: null, defaultModelRoute: "flash-max", source: "configured-default", routes: [] }),
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "route-token",
+    dataDir: "C:\\deepseek-route-auth-data",
+    configPath: "C:\\deepseek-route-auth-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    for (const [method, pathname, body] of [
+      ["GET", "/v1/routes/status", null],
+      ["GET", "/v1/routes", null],
+      ["POST", "/v1/routes/active", { route: "pro-max" }],
+    ] as const) {
+      const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}${pathname}`, {
+        method,
+        headers: {
+          authorization: "Bearer wrong-token",
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      assert.equal(response.status, 401);
+      const payload = await response.json() as Record<string, unknown>;
+      assert.equal(payload.code, "unauthorized");
+    }
+    assert.equal(setCalls, 0, "the service is never reached without the bearer token");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP route status and list expose the effective active route", async () => {
+  const status = {
+    activeRoute: { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, display: "Antigravity · Gemini 3.7 Flash High" },
+    activeRouteError: null,
+    defaultModelRoute: "flash-max",
+    source: "operator-set",
+    routes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  };
+  const service = {
+    routeStatus: () => status,
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "route-token",
+    dataDir: "C:\\deepseek-route-status-data",
+    configPath: "C:\\deepseek-route-status-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = { authorization: "Bearer " + config.daemonToken };
+    for (const pathname of ["/v1/routes/status", "/v1/routes"]) {
+      const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}${pathname}`, { headers });
+      assert.equal(response.status, 200);
+      const payload = await response.json() as { activeRoute: { name: string }; source: string; routes: unknown[] };
+      assert.equal(payload.activeRoute.name, "antigravity-flash-high");
+      assert.equal(payload.source, "operator-set");
+      assert.equal(payload.routes.length, 2);
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP route set switches the active route through the live daemon without restart", async () => {
+  const calls: string[] = [];
+  const service = {
+    setActiveRoute: (name: string) => {
+      calls.push(name);
+      return {
+        activeRoute: { name, providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", display: "DeepSeek V4 Pro · Max" },
+        activeRouteError: null,
+        defaultModelRoute: "flash-max",
+        source: "operator-set",
+        routes: [],
+      };
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "route-token",
+    dataDir: "C:\\deepseek-route-set-data",
+    configPath: "C:\\deepseek-route-set-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/routes/active`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ route: "pro-max" }),
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as Record<string, unknown>;
+    assert.deepEqual(calls, ["pro-max"]);
+    assert.equal((payload.activeRoute as { name: string }).name, "pro-max");
+    assert.equal(payload.source, "operator-set");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP route set surfaces typed 400 failures for unknown and disabled targets", async () => {
+  const service = {
+    setActiveRoute: () => {
+      throw new InvalidRequestError("Unknown model route: nonsense", "unknown_route", { route: "nonsense" });
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "route-token",
+    dataDir: "C:\\deepseek-route-error-data",
+    configPath: "C:\\deepseek-route-error-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/routes/active`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ route: "nonsense" }),
+    });
+    assert.equal(response.status, 400);
+    const payload = await response.json() as Record<string, unknown>;
+    assert.equal(payload.code, "unknown_route");
+    assert.deepEqual(payload.details, { route: "nonsense" });
   } finally {
     await server.stop();
   }

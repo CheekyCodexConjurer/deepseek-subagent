@@ -164,6 +164,11 @@ export class BridgeStore {
     // into the database; a hand-edited retentionMode alone can never arm
     // online pruning on a legacy database.
     this.db.exec("CREATE TABLE IF NOT EXISTS retention_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);");
+    // Operator-controlled active model route pointer. Additive state: the
+    // pointer lives in the database (never rewritten into config.json while a
+    // daemon is live); the effective route is this pointer when set, otherwise
+    // the configured default route.
+    this.db.exec("CREATE TABLE IF NOT EXISTS route_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);");
     const retentionMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 8").get() as Row | undefined;
     if (!retentionMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?)").run(new Date().toISOString());
@@ -174,6 +179,10 @@ export class BridgeStore {
     if (this.isProvablyEmpty()) {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_received_at ON events(received_at);");
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_agent_activity_created_at ON agent_activity(created_at);");
+    }
+    const routeStateMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 10").get() as Row | undefined;
+    if (!routeStateMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?)").run(new Date().toISOString());
     }
   }
 
@@ -200,6 +209,24 @@ export class BridgeStore {
   isRetentionPrepared(): boolean {
     const row = this.db.prepare("SELECT 1 AS found FROM retention_meta WHERE key = 'legacy_prepared'").get() as Row | undefined;
     return row !== undefined;
+  }
+
+  /**
+   * The operator-set active model route pointer, or null when no explicit
+   * pointer exists (the effective route is then the configured default).
+   * Written only by the daemon process through the authenticated loopback
+   * control plane; the CLI never writes it while the daemon is stopped.
+   */
+  getActiveRoute(): string | null {
+    const row = this.db.prepare("SELECT value FROM route_state WHERE key = 'active_route'").get() as Row | undefined;
+    const value = row?.value;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  setActiveRoute(route: string): void {
+    this.db.prepare(
+      "INSERT INTO route_state(key, value, updated_at) VALUES('active_route', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    ).run(route, new Date().toISOString());
   }
 
   createAgent(input: {

@@ -32,11 +32,15 @@ Check the configured binary and run the same-user OpenCode CLI. Managed mode sea
 
 ## Provider or model failure
 
-Dispatch resolves strictly through the configured route registry. The built-in default is the `flash-max` route (`opencode-go` / `deepseek-v4-flash` / `max`); `pro-max` is registered but disabled. `deepseek_spawn` accepts an optional `model_route`; an unknown or disabled route is rejected with a typed 400 (`unknown_route` / `route_disabled`) before any workspace or session side effect. There is no fallback route: the bridge never substitutes another provider or model. Inspect the persisted job error after a dispatch failure.
+Dispatch resolves strictly through the configured route registry. The built-in default is the `flash-max` route (`opencode-go` / `deepseek-v4-flash` / `max`); `pro-max` is registered but disabled and `antigravity-flash-high` is registered and enabled for operator selection. New spawns follow the operator-controlled active route (persisted in the bridge store; initially the configured default). `deepseek_spawn` accepts an optional `model_route`; an unknown or disabled route is rejected with a typed 400 (`unknown_route` / `route_disabled`) and any other registered route with a typed 403 (`route_override_denied`) before any workspace or session side effect. There is no fallback route: the bridge never substitutes another provider or model. Inspect the persisted job error after a dispatch failure.
+
+## Active route control
+
+Operators switch the route used by NEW spawns with `node dist/cli.js route set <route>`; `route list` shows the registered routes and `route status` shows the effective active route (both support `--json`). Route commands require the running daemon: the pointer is persisted inside the daemon process through the authenticated loopback endpoint and applies immediately, with no daemon restart. When the daemon is not running the commands fail closed with guidance and never write the store, so a stopped daemon cannot race a live one. The effective route is also exposed in `doctor`/`/health` output.
 
 ## Model route pinning
 
-The route chosen at spawn is persisted on the agent. Continue, approval resume/reply, graceful finalization, recovery and restart reconciliation always use that persisted route — changing the config default or disabling a route later never redirects an in-flight agent. Agents created before route pinning keep dispatching on their persisted flat provider/model/variant columns.
+The route chosen at spawn is persisted on the agent. Continue, approval resume/reply, graceful finalization, recovery and restart reconciliation always use that persisted route — changing the active route, the config default or disabling a route later never redirects an existing agent. Agents created before route pinning keep dispatching on their persisted flat provider/model/variant columns.
 
 ## Context files rejected with 400
 

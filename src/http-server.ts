@@ -93,12 +93,25 @@ export class BridgeHttpServer {
       writeJson(response, 200, { jobs: this.service.listJobs() });
       return;
     }
+    // Operator route control plane. These endpoints sit behind the bearer
+    // token gate: only the authenticated loopback daemon caller (the CLI) can
+    // read or change the active model route for new spawns.
+    if (method === "GET" && (url.pathname === "/v1/routes" || url.pathname === "/v1/routes/status")) {
+      writeJson(response, 200, this.service.routeStatus());
+      return;
+    }
     const body = method === "POST" ? await readJson(request).catch((error: unknown) => {
       throw invalidRequestError(error);
     }) : null;
     if (method === "POST" && url.pathname === "/v1/jobs/spawn") {
       const result = await this.service.spawn(toSpawnInput(body));
       writeJson(response, 202, result);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/v1/routes/active") {
+      const value = asRecord(body);
+      const result = this.service.setActiveRoute(requiredString(value.route ?? value.name, "route"));
+      writeJson(response, 200, result);
       return;
     }
     if (method === "POST" && url.pathname === "/v1/jobs/continue") {
@@ -228,7 +241,7 @@ async function bridgeFetch(url: string, init: BridgeFetchInit, dispatcher: Dispa
     // Surface nested fetch/Undici cause codes (for example ECONNREFUSED or
     // UND_ERR_HEADERS_TIMEOUT) so transport failures are distinguishable from
     // definite HTTP rejections.
-    throw new Error("Bridge HTTP request failed: " + describeFetchError(error), { cause: error });
+    throw new BridgeTransportError("Bridge HTTP request failed: " + describeFetchError(error), error);
   }
 }
 
@@ -275,6 +288,20 @@ export class BridgeHttpError extends Error {
     this.status = status;
     this.code = code;
     this.details = details;
+  }
+}
+
+/**
+ * A request could not reach or complete against the bridge daemon at the
+ * transport level (connection refused, reset, headers/body timeout). This is
+ * distinct from BridgeHttpError (a definite HTTP rejection) so callers such
+ * as the CLI can treat connectivity failures separately from structured and
+ * malformed-response failures.
+ */
+export class BridgeTransportError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "BridgeTransportError";
   }
 }
 

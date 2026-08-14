@@ -66,6 +66,9 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async
     assert.equal(tools[0]?.title, "DeepSeek Sub-Agent · Spawn");
     assert.match(tools[0]?.description ?? "", /asynchronous/i);
     assert.match(tools[0]?.description ?? "", /do not poll/i);
+    assert.doesNotMatch(tools[0]?.description ?? "", /DeepSeek V4 Flash/, "spawn description must be provider-neutral; the route decides the provider");
+    assert.match(tools[0]?.description ?? "", /active model route/i);
+    assert.match(tools[0]?.description ?? "", /route_override_denied/i);
     const consult = tools.find((tool) => tool.name === "deepseek_consult");
     const follow = tools.find((tool) => tool.name === "deepseek_follow");
     assert.equal(consult?.title, "DeepSeek Sub-Agent · Consult");
@@ -594,6 +597,34 @@ test("MCP exposes model_route as an optional string on spawn only", async () => 
     assert.ok("model_route" in spawnProperties, "spawn must accept model_route");
     assert.equal("model_route" in continueProperties, false, "model_route is only valid on spawn");
     assert.match(spawn?.description ?? "", /model_route/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP propagates route_override_denied as a typed 403 with retry false", async () => {
+  const failing = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/spawn") {
+        throw new BridgeHttpError(403, "route_override_denied", "Model route override denied: only the active route flash-max is selectable at spawn; pro-max is not active", { route: "pro-max", activeRoute: "flash-max" });
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(failing);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_spawn", arguments: { topic: "t", task: "t", model_route: "pro-max" } });
+    assert.equal(result.isError, true);
+    const structured = result.structuredContent as Record<string, unknown>;
+    assert.equal(structured.code, "route_override_denied");
+    assert.equal(structured.status, 403);
+    assert.equal(structured.retry, false);
+    assert.deepEqual(structured.details, { route: "pro-max", activeRoute: "flash-max" });
   } finally {
     await client.close();
     await server.close();

@@ -116,6 +116,25 @@ test("database health check uses the fast quick_check pragma", async () => {
   }
 });
 
+test("active route pointer is additive state: absent by default, persisted through reopen", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-route-"));
+  const dbPath = path.join(directory, "bridge.sqlite");
+  try {
+    const first = new BridgeStore(dbPath);
+    assert.equal(first.getActiveRoute(), null, "no explicit pointer means the configured default applies");
+    first.setActiveRoute("antigravity-flash-high");
+    assert.equal(first.getActiveRoute(), "antigravity-flash-high");
+    first.close();
+    const second = new BridgeStore(dbPath);
+    assert.equal(second.getActiveRoute(), "antigravity-flash-high", "pointer survives reopen without touching config.json");
+    second.setActiveRoute("flash-max");
+    assert.equal(second.getActiveRoute(), "flash-max", "the pointer is mutable");
+    second.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("rejects a duplicate Codex correlation after reopening the store", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-correlation-"));
   const store = await BridgeStore.open(directory);

@@ -13,10 +13,14 @@ export const DEFAULT_MODEL_ROUTE_NAME = "flash-max";
 export const DEFAULT_PROVIDER_ID = "opencode-go";
 
 /**
- * Built-in route registry. flash-max is enabled by default; pro-max is
- * registered but disabled until explicitly enabled by the user. Dispatches
- * resolve strictly through this registry: an unknown or disabled route fails
- * closed with a stable typed 400 and there is no silent fallback route.
+ * Built-in route registry. flash-max is enabled and default; pro-max is
+ * registered but disabled until explicitly enabled; antigravity-flash-high is
+ * registered and enabled for operator selection but never the default.
+ * Dispatches resolve strictly through this registry: an unknown or disabled
+ * route fails closed with a stable typed 400 and there is no silent fallback
+ * route. New spawns follow the operator-controlled active route (persisted in
+ * the bridge store; effectively the configured default until an operator sets
+ * it).
  */
 export const MODEL_ROUTE_REGISTRY: readonly ModelRoute[] = [
   {
@@ -37,6 +41,15 @@ export const MODEL_ROUTE_REGISTRY: readonly ModelRoute[] = [
     default: false,
     display: "DeepSeek V4 Pro · Max",
   },
+  {
+    name: "antigravity-flash-high",
+    providerId: "antigravity",
+    modelId: "gemini-3.7-flash-high",
+    variant: null,
+    enabled: true,
+    default: false,
+    display: "Antigravity · Gemini 3.7 Flash High",
+  },
 ];
 
 export function defaultConfigPath(): string {
@@ -53,6 +66,28 @@ function asNullableString(value: unknown): string | null {
 
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asAbsoluteStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string" && item.length > 0 && path.isAbsolute(item)))];
+}
+
+/**
+ * Optional antigravity executable override. The contract is ONE executable:
+ * a bare command name resolved through PATH, or an absolute path to the
+ * executable (which may contain spaces, for example a Windows install path).
+ * Shell-like command lines with arguments are rejected at load time: any
+ * value containing whitespace that is not an absolute path is "unset".
+ * Empty/whitespace/non-string values also mean "unset" and fall back to the
+ * default PATH lookup. The command is spawned argv-style with shell:false.
+ */
+function asNullableCommand(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  if (/\s/.test(trimmed) && !path.isAbsolute(trimmed)) return null;
+  return trimmed;
 }
 
 function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -162,6 +197,10 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     codexAppServerArgs: overrides.codexAppServerArgs ?? [],
     maxTaskLength: overrides.maxTaskLength ?? 120_000,
     maxResultLength: overrides.maxResultLength ?? 2_000_000,
+    antigravitySandbox: overrides.antigravitySandbox === true,
+    antigravityAddDirs: asAbsoluteStringArray(overrides.antigravityAddDirs),
+    antigravityAutoApprovePermissions: overrides.antigravityAutoApprovePermissions === true,
+    antigravityCommand: asNullableCommand(overrides.antigravityCommand),
     modelRoutes,
     defaultModelRoute: overrides.defaultModelRoute ?? defaultRouteName(modelRoutes),
     retentionMode: overrides.retentionMode ?? "disabled",
@@ -185,6 +224,9 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       ? raw.defaultModelRoute
       : defaultRouteName(modelRoutes);
     const retentionMode = asRetentionMode(raw.retentionMode, defaults.retentionMode);
+    const antigravitySandbox = raw.antigravitySandbox === true;
+    const antigravityAddDirs = asAbsoluteStringArray(raw.antigravityAddDirs);
+    const antigravityAutoApprovePermissions = raw.antigravityAutoApprovePermissions === true;
     return {
       ...defaults,
       dataDir: asString(raw.dataDir, defaults.dataDir),
@@ -217,6 +259,10 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
         : defaults.codexAppServerArgs,
       maxTaskLength: asNumber(raw.maxTaskLength, defaults.maxTaskLength),
       maxResultLength: asNumber(raw.maxResultLength, defaults.maxResultLength),
+      antigravitySandbox,
+      antigravityAddDirs,
+      antigravityAutoApprovePermissions,
+      antigravityCommand: asNullableCommand(raw.antigravityCommand),
       modelRoutes,
       defaultModelRoute: configuredDefaultRoute,
       retentionMode,

@@ -5,13 +5,13 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile } from "./security.js";
 import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
-import { BridgeHttpClient, BridgeHttpServer, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
 import { runMcp } from "./mcp.js";
 import { createLegacyPruneIndexes, evaluateRetentionPolicy, runRetentionPrune } from "./retention.js";
 import { BridgeService } from "./service.js";
 import { BridgeStore } from "./store.js";
 import { OpenCodeClient } from "./opencode/client.js";
-import type { BridgeConfig, DoctorCheck, DoctorReport, RetentionMode } from "./types.js";
+import type { BridgeConfig, DoctorCheck, DoctorReport, RetentionMode, RouteStatusInfo } from "./types.js";
 
 export const DOCTOR_PROBE_TIMEOUT_MS = 10_000;
 
@@ -97,6 +97,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     case "retention":
       await runRetentionCommand(config, parsed.rest[0], parsed.json, parsed.confirmRetention);
+      return;
+    case "route":
+      await runRouteCommand(config, parsed.rest[0], parsed.rest[1], parsed.json);
       return;
     default:
       throw new Error("Unknown command: " + parsed.command);
@@ -675,6 +678,75 @@ async function runRetentionCommand(config: BridgeConfig, mode: string | undefine
   output(json, { mode: "disabled", note: "no pruning runs; events and activity are retained indefinitely" }, "Retention disabled. No pruning runs.");
 }
 
+const ROUTE_COMMANDS = ["list", "status", "set"] as const;
+
+/**
+ * Operator route control plane. Every route command requires the running
+ * daemon: the active-route pointer is persisted inside the daemon process via
+ * the authenticated loopback endpoint, so the CLI never writes the database
+ * concurrently. When the daemon is not running, commands fail closed with
+ * guidance instead of touching the store, and a live-daemon `route set`
+ * applies without any daemon restart.
+ */
+export async function runRouteCommand(
+  config: BridgeConfig,
+  subcommand: string | undefined,
+  routeName: string | undefined,
+  json: boolean,
+  client: BridgeHttpClient = new BridgeHttpClient(config),
+): Promise<void> {
+  if (!subcommand || !(ROUTE_COMMANDS as readonly string[]).includes(subcommand)) {
+    throw new Error("route requires one of: list, status, set <route>");
+  }
+  try {
+    if (subcommand === "list") {
+      const status = await client.get<RouteStatusInfo>("/v1/routes/status");
+      output(json, status, renderRouteList(status));
+      return;
+    }
+    if (subcommand === "status") {
+      const status = await client.get<RouteStatusInfo>("/v1/routes/status");
+      output(json, status, renderRouteStatus(status));
+      return;
+    }
+    if (!routeName) throw new Error("route set requires a route name; use `route list` to see registered routes");
+    const status = await client.call<RouteStatusInfo>("/v1/routes/active", { route: routeName });
+    output(json, status,
+      "Active model route set to " + (status.activeRoute?.display ?? routeName) +
+        " (" + status.source + "). Applies to new spawns immediately; existing agents keep their pinned route.");
+  } catch (error) {
+    // Only genuine connectivity failures (daemon unavailable) get the offline
+    // fail-closed guidance. Structured HTTP rejections (BridgeHttpError) and
+    // malformed/live-response failures surface accurately and untouched.
+    if (error instanceof BridgeHttpError) throw error;
+    if (error instanceof BridgeTransportError) {
+      throw new Error("The route control plane requires the running daemon; start it with `deepseek-subagent start`. No route state was written while the daemon was stopped: " + redactSecrets(String(error)));
+    }
+    throw error;
+  }
+}
+
+function renderRouteList(status: RouteStatusInfo): string {
+  const lines = status.routes.map((route) => {
+    const markers = [
+      route.enabled ? "enabled" : "disabled",
+      route.name === status.activeRoute?.name ? "ACTIVE" : null,
+    ].filter(Boolean).join(", ");
+    return route.name + " · " + route.display + " · " + markers;
+  });
+  return lines.join("\n") + "\nEffective active route: " + (status.activeRoute?.name ?? "(unresolved)") + " (" + status.source + ")";
+}
+
+function renderRouteStatus(status: RouteStatusInfo): string {
+  const active = status.activeRoute
+    ? status.activeRoute.display + " (" + status.activeRoute.name + ")"
+    : "(unresolved: " + (status.activeRouteError ?? "unknown error") + ")";
+  return "Active route: " + active +
+    "\nSource: " + status.source +
+    "\nConfigured default: " + status.defaultModelRoute +
+    "\nRegistered routes: " + status.routes.map((route) => route.name + (route.enabled ? "" : " (disabled)")).join(", ");
+}
+
 async function ensureConfig(configPath: string): Promise<BridgeConfig> {
   const config = await loadConfig(configPath);
   await ensurePrivateDir(config.dataDir);
@@ -880,8 +952,9 @@ function printHelp(): void {
   console.log([
     "DeepSeek Sub-Agent local bridge",
     "",
-    "Commands: daemon, mcp, install, start, stop, restart, doctor, logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>",
+    "Commands: daemon, mcp, install, start, stop, restart, doctor, logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>",
     "retention enabled on an existing database requires --confirm after reviewing `retention dry-run`. Run retention commands while the daemon is stopped.",
+    "route commands require the running daemon: route list shows registered routes, route status shows the effective active route, route set <route> switches it for new spawns without a daemon restart (existing agents keep their pinned route).",
     "Use --json for machine-readable output or --verbose for technical IDs in human listings. Secrets are always redacted.",
   ].join("\n"));
 }

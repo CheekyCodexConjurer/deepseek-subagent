@@ -1,9 +1,10 @@
-export type BridgeErrorStatus = 400 | 401 | 404 | 409 | 500;
+export type BridgeErrorStatus = 400 | 401 | 403 | 404 | 409 | 500;
 
 export type BridgeErrorCode =
   | "invalid_request"
   | "unknown_route"
   | "route_disabled"
+  | "route_override_denied"
   | "context_file_invalid"
   | "job_agent_mismatch"
   | "permission_required"
@@ -69,6 +70,19 @@ export class ConflictError extends BridgeError {
   constructor(message: string, code: BridgeErrorCode = "state_conflict") {
     super(409, code, message);
     this.name = "ConflictError";
+  }
+}
+
+/**
+ * Route changes are operator-only through the authenticated control plane.
+ * An ordinary spawn caller naming a registered, enabled route that is NOT the
+ * currently active route fails closed with this typed 403; there is no
+ * fallback and no silent route override.
+ */
+export class RouteOverrideDeniedError extends BridgeError {
+  constructor(message: string, details?: unknown) {
+    super(403, "route_override_denied", message, details);
+    this.name = "RouteOverrideDeniedError";
   }
 }
 

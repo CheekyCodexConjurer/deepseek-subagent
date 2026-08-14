@@ -15,10 +15,13 @@ import {
 } from "./codex/adapter.js";
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
-import { assistantTextAfterBaseline, formatHumanResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
-import { ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError, UnknownJobError } from "./errors.js";
+import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
+import type { AntigravityRunResult } from "./antigravity/types.js";
+import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
+  ActiveRouteSource,
   AgentRecord,
   BridgeConfig,
   ConsultInput,
@@ -26,6 +29,7 @@ import type {
   FollowInput,
   FollowResult,
   JobRecord,
+  ModelRoute,
   OpenCodeClientLike,
   OpenCodeEvent,
   OpenCodeMessage,
@@ -33,6 +37,7 @@ import type {
   ProgressSnapshot,
   ResolvedRoute,
   ResultEnvelope,
+  RouteStatusInfo,
   SpawnInput,
 } from "./types.js";
 
@@ -43,6 +48,7 @@ export interface ServiceDependencies {
   manager?: OpenCodeManagerLike;
   codex?: CodexDeliveryAdapter;
   inbox?: InboxDelivery;
+  antigravity?: AntigravityProviderLike;
 }
 
 export interface OpenCodeManagerLike {
@@ -92,6 +98,8 @@ export interface ServiceStatus {
   correlation: { hints: number; bindings: number };
   retention: { mode: string; dbState: string; pruningEnabled: boolean };
   lastStreamError: string | null;
+  activeRoute: ResolvedRoute | null;
+  activeRouteSource: ActiveRouteSource;
 }
 
 const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "following", "finalizing", "needs_approval"]);
@@ -193,6 +201,7 @@ export class BridgeService {
   private readonly store: BridgeStore;
   private readonly manager: OpenCodeManagerLike;
   private readonly inbox: InboxDelivery;
+  private readonly antigravity: AntigravityProviderLike;
   private codex: CodexDeliveryAdapter;
   private managed: ManagedOpenCodeLike | null = null;
   private client: OpenCodeClientLike | null = null;
@@ -212,6 +221,7 @@ export class BridgeService {
   private readonly eventProcessing = new Set<string>();
   private readonly eventRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly followLifecycles = new Map<string, FollowLifecycle>();
+  private readonly antigravityAbortControllers = new Map<string, AbortController>();
   private retentionTimer: NodeJS.Timeout | null = null;
   private retentionState: RetentionPolicyState | null = null;
 
@@ -227,6 +237,12 @@ export class BridgeService {
       )
       : new UnavailableCodexDeliveryAdapter("Same-chat push is experimental and disabled by default");
     this.inbox = dependencies.inbox ?? new InboxDelivery(config.dataDir);
+    this.antigravity = dependencies.antigravity ?? new AntigravityAdapter({
+      ...(config.antigravityCommand ? { command: config.antigravityCommand } : {}),
+      sandbox: config.antigravitySandbox,
+      addDirs: config.antigravityAddDirs,
+      dangerouslySkipPermissions: config.antigravityAutoApprovePermissions,
+    });
   }
 
   async start(): Promise<void> {
@@ -285,6 +301,8 @@ export class BridgeService {
       }
     }
     this.followLifecycles.clear();
+    for (const controller of this.antigravityAbortControllers.values()) controller.abort();
+    this.antigravityAbortControllers.clear();
     this.streamAbort?.abort();
     this.streamAbort = null;
     if (this.streamTask) {
@@ -306,6 +324,7 @@ export class BridgeService {
 
   status(): ServiceStatus {
     const defaultRoute = this.config.modelRoutes.find((route) => route.name === this.config.defaultModelRoute);
+    const active = this.safeActiveRoute();
     return {
       running: this.running,
       opencodeUrl: this.managed?.baseUrl ?? null,
@@ -322,6 +341,8 @@ export class BridgeService {
       },
       retention: this.retentionState ?? { mode: this.config.retentionMode, dbState: "legacy", pruningEnabled: false },
       lastStreamError: this.lastStreamError,
+      activeRoute: active,
+      activeRouteSource: this.effectiveRouteSource(),
     };
   }
 
@@ -377,7 +398,12 @@ export class BridgeService {
         maxLength: this.config.maxTaskLength,
       });
       const title = normalizeTitle(input.topic);
-      const session = await this.clientOrThrow().createSession(createdWorkspace, title);
+      const isAntigravity = route.providerId === "antigravity";
+      // The Antigravity provider runs the agy executable directly in the
+      // prepared workspace; it has no OpenCode session, so none is created.
+      const session = isAntigravity
+        ? null
+        : await this.clientOrThrow().createSession(createdWorkspace, title);
       const agent = this.store.createAgent({
         id: agentId,
         title,
@@ -385,14 +411,16 @@ export class BridgeService {
         repositoryRoot,
         workspacePath: createdWorkspace,
         workspaceStrategy: strategy,
-        opencodeServerId: this.managed?.serverId ?? "unknown",
-        opencodeSessionId: session.id,
+        opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown"),
+        opencodeSessionId: session?.id ?? "antigravity:" + agentId,
         modelProviderId: route.providerId,
         modelId: route.modelId,
         modelVariant: route.variant,
         modelRoute: route.name,
       });
-      this.recordActivity(agent, null, "dispatch", "Created OpenCode session for the DeepSeek task");
+      this.recordActivity(agent, null, "dispatch", isAntigravity
+        ? "Created an Antigravity agent for the task (no OpenCode session)"
+        : "Created OpenCode session for the DeepSeek task");
       const job = this.store.createJob({
         id: newId("job"),
         agentId: agent.id,
@@ -475,7 +503,10 @@ export class BridgeService {
     const workspacePath = agent.workspacePath;
     const title = normalizeTitle(agent.topic);
     const childId = newId("agent");
-    const session = await this.clientOrThrow().createSession(workspacePath, title);
+    const isAntigravity = agent.modelProviderId === "antigravity";
+    const session = isAntigravity
+      ? null
+      : await this.clientOrThrow().createSession(workspacePath, title);
     const child = this.store.createAgent({
       id: childId,
       title,
@@ -483,8 +514,8 @@ export class BridgeService {
       repositoryRoot: agent.repositoryRoot,
       workspacePath,
       workspaceStrategy: agent.workspaceStrategy,
-      opencodeServerId: this.managed?.serverId ?? agent.opencodeServerId,
-      opencodeSessionId: session.id,
+      opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? agent.opencodeServerId),
+      opencodeSessionId: session?.id ?? "antigravity:" + childId,
       modelProviderId: agent.modelProviderId,
       modelId: agent.modelId,
       modelVariant: agent.modelVariant,
@@ -515,7 +546,7 @@ export class BridgeService {
       });
     }
     this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child.id + " after job " + lastJob.id);
-    this.recordActivity(child, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new OpenCode session " + session.id);
+    this.recordActivity(child, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new " + (session?.id ? "OpenCode session " + session.id : "Antigravity run (no OpenCode session)"));
     return this.dispatch(child, job, prompt);
   }
 
@@ -566,7 +597,12 @@ export class BridgeService {
     this.requireRunning();
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new UnknownAgentError(agentId);
-    const active = this.activeJob(agentId);
+    // A "created" job is the pre-dispatch window (job created, dispatch not
+    // reached yet). Aborting it must terminalize the job so the dispatch
+    // guard never launches the provider for an aborted agent.
+    const active = this.activeJob(agentId)
+      ?? this.store.listJobs().find((job) => job.agentId === agentId && job.status === "created")
+      ?? null;
     if (!active) {
       // A stopped agent is non-continuable; auto-close it so the obligation
       // ends and the agent is not left in an open intermediate state.
@@ -576,10 +612,22 @@ export class BridgeService {
     this.clearApprovalTimer(agentId);
     this.store.setApprovalDeadline(active.id, null);
     let remoteError: string | null = null;
-    try {
-      await this.clientOrThrow().abort(agent.opencodeSessionId);
-    } catch (error) {
-      remoteError = redactSecrets(String(error));
+    if (agent.modelProviderId === "antigravity") {
+      const controller = this.antigravityAbortControllers.get(active.id);
+      if (controller) {
+        controller.abort();
+        this.recordActivity(agent, active, "abort", "Sent abort signal to the active Antigravity process tree");
+      } else if (active.status === "created") {
+        this.recordActivity(agent, active, "abort", "Abort landed before Antigravity dispatch; the launch will be prevented");
+      } else {
+        this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
+      }
+    } else {
+      try {
+        await this.clientOrThrow().abort(agent.opencodeSessionId);
+      } catch (error) {
+        remoteError = redactSecrets(String(error));
+      }
     }
     const localReason = reason ?? (remoteError ? "Abort requested; remote abort failed: " + remoteError : "Aborted by orchestrator");
     if (active.status !== "aborted") this.store.updateJobStatus(active.id, "aborted", localReason);
@@ -670,29 +718,100 @@ export class BridgeService {
   }
 
   /**
-   * Resolves the route for a new spawn. An explicit model_route must be
-   * registered AND enabled, otherwise the dispatch fails closed with a typed
-   * 400 before any side effect; there is no silent fallback route. Without an
-   * explicit route the configured default route applies (and also fails
-   * closed if it is disabled).
+   * The effective active route name: the operator-set pointer persisted in the
+   * bridge store when one exists, otherwise the configured default route. New
+   * spawns always resolve through this pointer; it never affects existing
+   * agents, whose dispatch identity comes from their persisted spawn columns.
    */
-  private resolveRouteForSpawn(modelRoute: string | undefined): ResolvedRoute {
-    const routes = this.config.modelRoutes;
-    if (modelRoute !== undefined) {
-      const route = routes.find((candidate) => candidate.name === modelRoute);
-      if (!route) {
-        throw new InvalidRequestError("Unknown model route: " + modelRoute, "unknown_route", { route: modelRoute });
-      }
-      if (!route.enabled) {
-        throw new InvalidRequestError("Model route is disabled: " + modelRoute, "route_disabled", { route: modelRoute });
-      }
-      return { name: route.name, providerId: route.providerId, modelId: route.modelId, variant: route.variant, display: route.display };
+  private effectiveRouteName(): string {
+    return this.store.getActiveRoute() ?? this.config.defaultModelRoute;
+  }
+
+  private effectiveRouteSource(): ActiveRouteSource {
+    return this.store.getActiveRoute() === null ? "configured-default" : "operator-set";
+  }
+
+  /** Registry lookup that fails closed with typed 400 for unknown/disabled routes. */
+  private resolveRouteByName(name: string): ResolvedRoute {
+    const route = this.config.modelRoutes.find((candidate) => candidate.name === name);
+    if (!route) {
+      throw new InvalidRequestError("Unknown model route: " + name, "unknown_route", { route: name });
     }
-    const route = routes.find((candidate) => candidate.name === this.config.defaultModelRoute) ?? routes.find((candidate) => candidate.default);
-    if (!route || !route.enabled) {
-      throw new InvalidRequestError("The default model route is disabled: " + this.config.defaultModelRoute, "route_disabled", { route: this.config.defaultModelRoute });
+    if (!route.enabled) {
+      throw new InvalidRequestError("Model route is disabled: " + name, "route_disabled", { route: name });
     }
     return { name: route.name, providerId: route.providerId, modelId: route.modelId, variant: route.variant, display: route.display };
+  }
+
+  /** Non-throwing active-route resolution for health/status output. */
+  private safeActiveRoute(): ResolvedRoute | null {
+    try {
+      return this.resolveRouteByName(this.effectiveRouteName());
+    } catch {
+      return null;
+    }
+  }
+
+  listRoutes(): ModelRoute[] {
+    return this.config.modelRoutes.map((route) => ({ ...route }));
+  }
+
+  routeStatus(): RouteStatusInfo {
+    let activeRoute: ResolvedRoute | null = null;
+    let activeRouteError: string | null = null;
+    try {
+      activeRoute = this.resolveRouteByName(this.effectiveRouteName());
+    } catch (error) {
+      activeRouteError = redactSecrets(String(error));
+    }
+    return {
+      activeRoute,
+      activeRouteError,
+      defaultModelRoute: this.config.defaultModelRoute,
+      source: this.effectiveRouteSource(),
+      routes: this.listRoutes(),
+    };
+  }
+
+  /**
+   * Operator control plane: sets the active route pointer for NEW spawns.
+   * The target must be registered AND enabled (typed 400 otherwise). The
+   * pointer is persisted to the store BEFORE it becomes effective: the
+   * effective route reads the persisted pointer, so persistence is the apply
+   * and there is no separate in-memory copy to drift. Applies without any
+   * daemon restart. Existing agents are never affected — they keep their
+   * persisted spawn-time route.
+   */
+  setActiveRoute(name: string): RouteStatusInfo {
+    this.resolveRouteByName(name);
+    this.store.setActiveRoute(name);
+    return this.routeStatus();
+  }
+
+  /**
+   * Resolves the route for a new spawn. An explicit model_route must be
+   * registered AND enabled, otherwise the dispatch fails closed with a typed
+   * 400 before any side effect; there is no silent fallback route. Ordinary
+   * callers may only name the route that is currently active: any other
+   * registered, enabled route is denied with a typed route_override_denied
+   * (403) — route changes are operator-only through the control plane. An
+   * explicit route matching the active route is accepted for compatibility.
+   * Without an explicit route the effective active route applies (and also
+   * fails closed if it is disabled).
+   */
+  private resolveRouteForSpawn(modelRoute: string | undefined): ResolvedRoute {
+    if (modelRoute !== undefined) {
+      const route = this.resolveRouteByName(modelRoute);
+      const activeName = this.effectiveRouteName();
+      if (route.name !== activeName) {
+        throw new RouteOverrideDeniedError(
+          "Model route override denied: only the active route " + activeName + " is selectable at spawn; " + route.name + " is not active",
+          { route: route.name, activeRoute: activeName },
+        );
+      }
+      return route;
+    }
+    return this.resolveRouteByName(this.effectiveRouteName());
   }
 
   /**
@@ -707,12 +826,15 @@ export class BridgeService {
    * keeping legacy agents compatible.
    */
   private resolveAgentRoute(agent: AgentRecord): ResolvedRoute {
+    const baseDisplay = staticModelDisplayName(agent.modelId, agent.modelVariant);
     return {
       name: agent.modelRoute ?? "legacy",
       providerId: agent.modelProviderId,
       modelId: agent.modelId,
       variant: agent.modelVariant,
-      display: staticModelDisplayName(agent.modelId, agent.modelVariant),
+      display: agent.modelProviderId === "antigravity"
+        ? "Antigravity · " + baseDisplay
+        : baseDisplay,
     };
   }
 
@@ -781,7 +903,10 @@ export class BridgeService {
       ?? (isGracefulFinalization ? deadlineAt + effectiveGraceMinutes * 60_000 : null);
     if (["dispatching", "running"].includes(current.status)) {
       this.store.updateJobStatus(job.id, "following");
-      this.recordActivity(this.store.getAgent(job.agentId), this.store.getJob(job.id), "event", "Follow mode started; waiting for an OpenCode completion event");
+      const followAgent = this.store.getAgent(job.agentId);
+      this.recordActivity(followAgent, this.store.getJob(job.id), "event", followAgent?.modelProviderId === "antigravity"
+        ? "Follow mode started; waiting for the Antigravity run to complete"
+        : "Follow mode started; waiting for an OpenCode completion event");
     }
     const after = this.store.setFollowWindow(job.id, {
       startedAt: new Date(startedAt).toISOString(),
@@ -894,6 +1019,10 @@ export class BridgeService {
   }
 
   private async requestGracefulFinalize(agent: AgentRecord, job: JobRecord): Promise<void> {
+    if (agent.modelProviderId === "antigravity") {
+      this.recordActivity(agent, job, "finalize", "Antigravity has no OpenCode session to finalize; the follow deadline settles the job");
+      return;
+    }
     const client = this.clientOrThrow();
     try {
       await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent));
@@ -930,13 +1059,26 @@ export class BridgeService {
     const reason = "Follow deadline and graceful-finalize grace period expired";
     this.store.updateJobStatus(job.id, "timed_out", reason);
     if (agent.status === "working") this.store.updateAgentStatus(agent.id, "timed_out", reason);
-    this.recordActivity(agent, this.store.getJob(job.id), "deadline", "Grace period expired; the worker will be aborted and partial evidence captured");
+    const isAntigravity = agent.modelProviderId === "antigravity";
+    this.recordActivity(agent, this.store.getJob(job.id), "deadline", isAntigravity
+      ? "Follow grace period expired; the Antigravity process will be aborted"
+      : "Grace period expired; the worker will be aborted and partial evidence captured");
     let abortError: string | null = null;
-    try {
-      await this.clientOrThrow().abort(agent.opencodeSessionId);
-    } catch (error) {
-      abortError = redactSecrets(String(error));
-      this.recordActivity(agent, this.store.getJob(job.id), "error", "Worker abort failed after the follow grace period");
+    if (isAntigravity) {
+      const controller = this.antigravityAbortControllers.get(job.id);
+      if (controller) {
+        controller.abort();
+        this.recordActivity(agent, this.store.getJob(job.id), "abort", "Sent abort signal to the Antigravity process tree after the follow grace period");
+      } else {
+        this.recordActivity(agent, this.store.getJob(job.id), "error", "Antigravity process was no longer controllable at the follow grace expiry");
+      }
+    } else {
+      try {
+        await this.clientOrThrow().abort(agent.opencodeSessionId);
+      } catch (error) {
+        abortError = redactSecrets(String(error));
+        this.recordActivity(agent, this.store.getJob(job.id), "error", "Worker abort failed after the follow grace period");
+      }
     }
     const timedOut = this.store.getJob(job.id) ?? job;
     const stored = await this.captureTimedOutEvidence(agent, timedOut);
@@ -961,6 +1103,10 @@ export class BridgeService {
   }
 
   private async captureTimedOutEvidence(agent: AgentRecord, job: JobRecord): Promise<Awaited<ReturnType<typeof persistResult>> | null> {
+    if (agent.modelProviderId === "antigravity") {
+      this.recordActivity(agent, job, "error", "Antigravity has no session messages to capture as timeout evidence");
+      return null;
+    }
     try {
       const messages = await this.clientOrThrow().listMessages(agent.opencodeSessionId);
       const diff = await this.clientOrThrow().getDiff(agent.opencodeSessionId);
@@ -991,14 +1137,15 @@ export class BridgeService {
         envelope = null;
       }
     }
+    const followStatus = envelope?.status ?? mapJobToFollowStatus(job.status);
     return this.followResultForState(agent, job, {
       ...(envelope ? { envelope } : {}),
-      status: envelope?.status ?? mapJobToFollowStatus(job.status),
+      status: followStatus,
       resultAvailable: envelope !== null,
-      deadlineReached: Boolean(job.gracefulFinalizeAttempted || envelope?.deadlineReached || envelope?.status === "timed_out"),
+      deadlineReached: Boolean(job.gracefulFinalizeAttempted || envelope?.deadlineReached || followStatus === "timed_out"),
       gracefulFinalize: Boolean(job.gracefulFinalizeAttempted || envelope?.gracefulFinalize),
-      partial: Boolean(envelope?.partial || envelope?.status === "completed_partial" || envelope?.status === "timed_out"),
-      workerAborted: Boolean(envelope?.workerAborted || envelope?.status === "timed_out"),
+      partial: Boolean(envelope?.partial || followStatus === "completed_partial" || followStatus === "timed_out"),
+      workerAborted: Boolean(envelope?.workerAborted || followStatus === "timed_out"),
     });
   }
 
@@ -1135,6 +1282,9 @@ export class BridgeService {
   }
 
   private async dispatch(agent: AgentRecord, job: JobRecord, prompt: string): Promise<AcceptedOperation> {
+    if (agent.modelProviderId === "antigravity") {
+      return this.dispatchAntigravity(agent, job, prompt);
+    }
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
     if (job.kind === "continue" && !job.lastAssistantMessageId) {
@@ -1181,6 +1331,108 @@ export class BridgeService {
         await this.resolveFollow(job.id, { status: "failed", error: message });
       }
       throw new Error(message);
+    }
+  }
+
+  /**
+   * Antigravity dispatch path: preserves the MCP asynchronous contract. The
+   * spawn resolves with an accepted pending obligation immediately after job
+   * creation; the agy executable runs once via the AntigravityAdapter (never
+   * OpenCode, never a session) in a background task, and completion/result
+   * persistence/delivery happen asynchronously so deepseek_follow observes
+   * them. Exactly one spawn per dispatch; any failure marks the job/agent
+   * failed and settles waiting followers. There is never a fallback to
+   * OpenCode or any other provider.
+   *
+   * Pre-dispatch abort race: an abort that lands between job creation and
+   * this point (job still "created", agent already closed/aborted) must
+   * prevent the agy launch entirely — the abort path marks the job aborted
+   * and closes the agent, and the guard below detects that terminal state
+   * before launching, so a closed/aborted agent is never transitioned back
+   * to working and no result is ever delivered for an aborted job.
+   */
+  private dispatchAntigravity(agent: AgentRecord, job: JobRecord, prompt: string): AcceptedOperation {
+    const controller = new AbortController();
+    this.antigravityAbortControllers.set(job.id, controller);
+    const currentJob = this.store.getJob(job.id);
+    const currentAgent = this.store.getAgent(agent.id);
+    if (currentJob?.status === "aborted" || currentAgent?.status === "closed" || currentAgent?.status === "aborted" || controller.signal.aborted) {
+      this.antigravityAbortControllers.delete(job.id);
+      this.recordActivity(currentAgent ?? agent, currentJob ?? job, "abort", "Antigravity launch prevented: the agent was aborted before dispatch started");
+      return this.accepted(currentJob ?? job);
+    }
+    this.store.updateAgentStatus(agent.id, "working");
+    this.store.updateJobStatus(job.id, "dispatching");
+    void this.runAntigravityAsync(agent, job, prompt, controller).catch((error: unknown) => {
+      if (this.running) this.lastStreamError = redactSecrets(String(error));
+    });
+    return this.accepted(this.store.getJob(job.id) ?? job);
+  }
+
+  /**
+   * Background Antigravity execution: awaits agy, persists the literal result
+   * envelope, completes the job, delivers it and settles any waiting follow.
+   * Runs fire-and-forget after spawn acceptance; never throws to the caller.
+   */
+  private async runAntigravityAsync(agent: AgentRecord, job: JobRecord, prompt: string, controller: AbortController): Promise<void> {
+    try {
+      const result: AntigravityRunResult = await this.antigravity.runPrompt({
+        prompt,
+        cwd: agent.workspacePath,
+        model: agent.modelId,
+        signal: controller.signal,
+      });
+      const current = this.store.getJob(job.id);
+      if (controller.signal.aborted || current?.status === "aborted") {
+        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        return;
+      }
+      if (current?.status === "timed_out") {
+        this.recordActivity(agent, current, "abort", "Antigravity process ended after the follow timeout; the timed-out job stays terminal");
+        return;
+      }
+      if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
+      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
+      const completed = this.store.getJob(job.id) ?? job;
+      if (["running", "following", "finalizing"].includes(completed.status)) {
+        this.store.updateJobStatus(job.id, "completed");
+      }
+      const completedAgent = this.store.getAgent(agent.id) ?? agent;
+      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
+      this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, {
+          status: "completed",
+          resultAvailable: true,
+          envelope: stored.envelope,
+        });
+      }
+      const pending = this.store.getJob(job.id) ?? job;
+      if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
+      const deliveryJob = this.store.getJob(job.id) ?? job;
+      await this.deliverEnvelope(stored.envelope, deliveryJob);
+    } catch (error) {
+      const message = redactSecrets(String(error));
+      const current = this.store.getJob(job.id);
+      // A cancellation is never a rejected dispatch: when the abort signal is
+      // set, classify the outcome as an abort even if the job row has not been
+      // marked aborted yet (abort() marks it immediately afterwards; a stop()
+      // leaves the stranded job to startup recovery). The job/agent failure
+      // guards below stay untouched for genuine dispatch rejections.
+      if (current?.status === "aborted" || controller.signal.aborted) {
+        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        return;
+      }
+      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
+      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch");
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, { status: "failed", error: message });
+      }
+    } finally {
+      if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
   }
 
@@ -1530,6 +1782,7 @@ export class BridgeService {
   private async reconcileJob(job: JobRecord): Promise<void> {
     const agent = this.store.getAgent(job.agentId);
     if (!agent || !this.client) return;
+    if (agent.modelProviderId === "antigravity") return;
     const messages = await this.client.listMessages(agent.opencodeSessionId);
     const assistants = messages.filter((message) => message.info?.role === "assistant");
     if (assistants.length === 0 || messages.at(-1)?.info?.role !== "assistant") return;
@@ -1555,6 +1808,22 @@ export class BridgeService {
 
   private async recoverPendingJobs(): Promise<void> {
     for (const job of this.store.recoverPendingJobs()) {
+      const agent = this.store.getAgent(job.agentId);
+      if (agent?.modelProviderId === "antigravity" && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
+        // The Antigravity run lives in the daemon's in-memory provider and
+        // process handle. After a daemon loss there is no way to recover,
+        // await or abort it, so the stranded job is terminalized with a clear
+        // failure reason instead of remaining dispatching/working forever.
+        // (The orphaned child, if any, is not controllable; it is not the
+        // job's state.) In-process follow/abort semantics are untouched: this
+        // branch only runs at startup recovery.
+        const reason = "Antigravity run stranded: the daemon process that owned the in-memory run was lost; the job cannot be recovered";
+        this.recordActivity(agent, job, "error", reason);
+        this.store.updateJobStatus(job.id, "failed", reason);
+        const currentAgent = this.store.getAgent(agent.id);
+        if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+        continue;
+      }
       if (["dispatching", "running"].includes(job.status)) {
         await this.reconcileJob(job).catch((error) => {
           this.lastStreamError = redactSecrets(String(error));
@@ -1827,7 +2096,9 @@ function staticModelDisplayName(modelId: string, variant: string | null): string
     ? "DeepSeek V4 Flash"
     : modelId === "deepseek-v4-pro"
       ? "DeepSeek V4 Pro"
-      : modelId;
+      : modelId === "gemini-3.7-flash-high"
+        ? "Gemini 3.7 Flash High"
+        : modelId;
   return variant === "max" ? base + " · Max" : base;
 }
 

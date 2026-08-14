@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { writePrivateFile, redactSecrets, redactUnknown, truncate } from "./security.js";
+import type { AntigravityRunResult } from "./antigravity/types.js";
 import type { AgentRecord, JobRecord, OpenCodeMessage, ResultEnvelope } from "./types.js";
 
 const PROTOCOL_HEADINGS = ["STATUS", "SUMMARY", "ASSUMPTIONS", "CHANGES", "FILES", "TESTS", "RISKS", "UNRESOLVED"];
@@ -106,6 +107,53 @@ export async function persistResult(
   return { envelope, resultPath, parsed };
 }
 
+/**
+ * Persists a result produced by the Antigravity provider as a bridge result
+ * file (same layout as persistResult: { envelope, rawAssistantText, messages,
+ * diff, savedAt }) so follow/recover/deliver work unchanged. There are no
+ * OpenCode messages or diffs; rawAssistantText carries the summary and diff
+ * carries the run provenance only.
+ */
+export async function persistAntigravityResult(
+  dataDir: string,
+  agent: AgentRecord,
+  job: JobRecord,
+  result: AntigravityRunResult,
+  maxLength: number,
+): Promise<{ envelope: ResultEnvelope; resultPath: string }> {
+  const resultPath = path.join(dataDir, "results", job.id + ".json");
+  const envelope: ResultEnvelope = {
+    version: 1,
+    agentId: redactSecrets(agent.id),
+    jobId: redactSecrets(job.id),
+    topic: redactSecrets(agent.topic),
+    status: result.status,
+    opencodeSessionId: redactSecrets(agent.opencodeSessionId),
+    model: redactSecrets(result.model),
+    modelDisplayName: redactSecrets(result.modelDisplayName),
+    workspace: redactSecrets(result.workspace),
+    summary: truncate(redactSecrets(result.summary), 4_000),
+    files: result.files.slice(0, 100).map((value) => redactSecrets(value)),
+    tests: result.tests.slice(0, 100).map((value) => redactSecrets(value)),
+    risks: result.risks.slice(0, 100).map((value) => redactSecrets(value)),
+    diffSummary: truncate(redactSecrets(result.diffSummary), 10_000),
+    fullResultPath: redactSecrets(resultPath),
+    orchestratorInstruction: redactSecrets("Continue this agent only with deepseek_continue after reviewing this result."),
+  };
+  await mkdir(path.dirname(resultPath), { recursive: true });
+  await writePrivateFile(
+    resultPath,
+    JSON.stringify({
+      envelope,
+      rawAssistantText: truncate(redactSecrets(result.summary), maxLength),
+      messages: [],
+      diff: { source: "antigravity", runId: result.runId === null ? null : redactSecrets(result.runId) },
+      savedAt: new Date().toISOString(),
+    }, null, 2) + "\n",
+  );
+  return { envelope, resultPath };
+}
+
 export function sanitizePersistedResult(value: unknown, maxLength = 100_000): unknown {
   if (!isRecord(value)) return {};
   const output: Record<string, unknown> = {};
@@ -208,11 +256,12 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 export function formatHumanResult(envelope: ResultEnvelope): string {
+  const isAntigravity = envelope.modelDisplayName.startsWith("Antigravity · ");
   const lines = [
     "DeepSeek Sub-Agent · " + truncate(envelope.topic.replace(/[\r\n]+/g, " "), 240) + " · " + humanState(envelope.status),
     envelope.modelDisplayName,
     "",
-    "[OPENCODE_SUBAGENT_RESULT v1]",
+    isAntigravity ? "[ANTIGRAVITY_SUBAGENT_RESULT v1]" : "[OPENCODE_SUBAGENT_RESULT v1]",
     "SUMMARY",
     envelope.summary || "No summary was returned.",
   ];
@@ -330,7 +379,11 @@ function summarizeDiff(diff: unknown): string {
 }
 
 function displayModel(modelId: string, variant: string | null): string {
-  const base = modelId === "deepseek-v4-flash" ? "DeepSeek V4 Flash" : modelId;
+  const base = modelId === "deepseek-v4-flash"
+    ? "DeepSeek V4 Flash"
+    : modelId === "gemini-3.7-flash-high"
+      ? "Gemini 3.7 Flash High"
+      : modelId;
   return variant === "max" ? base + " · Max" : base;
 }
 

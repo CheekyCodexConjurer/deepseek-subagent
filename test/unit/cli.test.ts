@@ -3,9 +3,136 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, readCodexMcpToolTimeout, runCapture, terminateProcessTree, withStore } from "../../src/cli.js";
+import { collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, readCodexMcpToolTimeout, runCapture, runRouteCommand, terminateProcessTree, withStore } from "../../src/cli.js";
+import { createDefaultConfig } from "../../src/config.js";
+import { BridgeHttpError, BridgeTransportError } from "../../src/http-server.js";
 import { BridgeStore } from "../../src/store.js";
 import type { DoctorCheck } from "../../src/types.js";
+
+const routeStatusFixture = {
+  activeRoute: { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", display: "DeepSeek V4 Flash · Max" },
+  activeRouteError: null,
+  defaultModelRoute: "flash-max",
+  source: "configured-default",
+  routes: [
+    { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+    { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+  ],
+};
+
+test("route list and route status map to the daemon status endpoint", async () => {
+  const calls: string[] = [];
+  const client = {
+    get: async (pathname: string) => {
+      calls.push("GET " + pathname);
+      return routeStatusFixture;
+    },
+    call: async () => {
+      throw new Error("must not be reached");
+    },
+  } as unknown as import("../../src/http-server.js").BridgeHttpClient;
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-list",
+    configPath: "C:\\deepseek-cli-route-list\\config.json",
+  });
+  await runRouteCommand(config, "list", undefined, true, client);
+  await runRouteCommand(config, "status", undefined, true, client);
+  assert.deepEqual(calls, ["GET /v1/routes/status", "GET /v1/routes/status"]);
+});
+
+test("route set maps to the daemon switch endpoint with the route name", async () => {
+  const calls: Array<{ pathname: string; body: unknown }> = [];
+  const client = {
+    get: async () => {
+      throw new Error("must not be reached");
+    },
+    call: async (pathname: string, body: unknown) => {
+      calls.push({ pathname, body });
+      return { ...routeStatusFixture, activeRoute: routeStatusFixture.routes[1], source: "operator-set" };
+    },
+  } as unknown as import("../../src/http-server.js").BridgeHttpClient;
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-set",
+    configPath: "C:\\deepseek-cli-route-set\\config.json",
+  });
+  await runRouteCommand(config, "set", "antigravity-flash-high", true, client);
+  assert.deepEqual(calls, [{ pathname: "/v1/routes/active", body: { route: "antigravity-flash-high" } }]);
+});
+
+test("route requires a known subcommand and route set requires a route name", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-invalid",
+    configPath: "C:\\deepseek-cli-route-invalid\\config.json",
+  });
+  await assert.rejects(() => runRouteCommand(config, "toggle", undefined, true), /route requires one of: list, status, set/);
+  await assert.rejects(() => runRouteCommand(config, "set", undefined, true), /route set requires a route name/);
+});
+
+test("route commands fail closed when the daemon is not running and never write the store", async () => {
+  const client = {
+    get: async () => {
+      throw new BridgeTransportError("Bridge HTTP request failed: connect ECONNREFUSED 127.0.0.1:42653 (cause: ECONNREFUSED)");
+    },
+    call: async () => {
+      throw new BridgeTransportError("Bridge HTTP request failed: connect ECONNREFUSED 127.0.0.1:42653 (cause: ECONNREFUSED)");
+    },
+  } as unknown as import("../../src/http-server.js").BridgeHttpClient;
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-offline",
+    configPath: "C:\\deepseek-cli-route-offline\\config.json",
+  });
+  await assert.rejects(
+    () => runRouteCommand(config, "set", "pro-max", true, client),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      assert.match(message, /requires the running daemon/);
+      assert.match(message, /No route state was written while the daemon was stopped/);
+      return true;
+    },
+  );
+});
+
+test("route commands surface malformed live responses accurately, never as offline guidance", async () => {
+  const malformed = {
+    get: async () => "not a route status object",
+    call: async () => "not a route status object",
+  } as unknown as import("../../src/http-server.js").BridgeHttpClient;
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-malformed",
+    configPath: "C:\\deepseek-cli-route-malformed\\config.json",
+  });
+  for (const subcommand of ["list", "status"] as const) {
+    await assert.rejects(
+      () => runRouteCommand(config, subcommand, undefined, true, malformed),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.doesNotMatch(message, /requires the running daemon/, "a live but malformed response must not look like a stopped daemon");
+        assert.doesNotMatch(message, /No route state was written/, "malformed responses must never produce the offline guidance");
+        return true;
+      },
+    );
+  }
+});
+
+test("route commands pass typed daemon errors through untouched", async () => {
+  const client = {
+    get: async () => {
+      throw new Error("must not be reached");
+    },
+    call: async () => {
+      throw new BridgeHttpError(400, "unknown_route", "Unknown model route: nonsense", { route: "nonsense" });
+    },
+  } as unknown as import("../../src/http-server.js").BridgeHttpClient;
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-cli-route-typed",
+    configPath: "C:\\deepseek-cli-route-typed\\config.json",
+  });
+  await assert.rejects(() => runRouteCommand(config, "set", "nonsense", true, client), (error: unknown) => {
+    assert.ok(error instanceof BridgeHttpError);
+    assert.equal(error.code, "unknown_route");
+    return true;
+  });
+});
 
 test("doctor timeout parser accepts hyphen and underscore Codex MCP section names", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-timeout-"));

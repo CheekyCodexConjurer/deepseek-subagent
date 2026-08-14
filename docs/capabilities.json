@@ -35,20 +35,39 @@
         "enabled": false,
         "default": false,
         "display": "DeepSeek V4 Pro · Max"
+      },
+      {
+        "name": "antigravity-flash-high",
+        "provider": "antigravity",
+        "model": "gemini-3.7-flash-high",
+        "variant": null,
+        "enabled": true,
+        "default": false,
+        "display": "Antigravity · Gemini 3.7 Flash High"
       }
     ],
-    "modelRouteOnSpawn": "optional; unknown or disabled routes fail closed with a typed 400 before any side effect; no fallback route",
-    "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults",
+    "activeRoute": {
+      "pointer": "the operator-set active model route is persisted in the bridge SQLite store (route_state table), additively; config.json is never rewritten while a daemon is live",
+      "effective": "the stored pointer when set, otherwise the configured defaultModelRoute; initial default is flash-max",
+      "operatorControl": "route list / route status / route set <route> via the authenticated loopback daemon and CLI; requires the daemon running",
+      "noRestart": "route set applies to new spawns immediately, without a daemon restart",
+      "offlineBehavior": "route commands fail closed when the daemon is not running; the CLI never writes the route pointer outside the daemon process (no concurrent DB write)",
+      "noOverride": "an ordinary deepseek_spawn caller supplying a model_route different from the active route fails closed with a typed 403 route_override_denied; a matching explicit route is accepted for compatibility",
+      "noFallback": "no automatic fallback route ever applies"
+    },
+    "modelRouteOnSpawn": "optional; must name the route currently active on the bridge. Unknown or disabled routes fail closed with a typed 400 (unknown_route / route_disabled) before any side effect; other registered routes fail closed with a typed 403 (route_override_denied); no fallback route",
+    "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults, and never the mutable active-route pointer",
     "legacyCompatibility": "agents without a pinned route keep dispatching on their persisted flat provider/model/variant columns"
   },
   "errors": {
     "typed": true,
-    "statusCodes": ["400", "401", "404", "409", "500"],
+    "statusCodes": ["400", "401", "403", "404", "409", "500"],
     "propagation": "stable machine-readable codes flow through HTTP bodies and MCP structuredContent without text sniffing",
     "codes": [
       "invalid_request",
       "unknown_route",
       "route_disabled",
+      "route_override_denied",
       "context_file_invalid",
       "unknown_agent",
       "unknown_job",
@@ -70,6 +89,15 @@
   },
   "visualContext": {
     "semantics": "textual only; optional string on spawn and continue, no default. The orchestrator inspects visuals itself and sends three labeled parts ('Direct observations:', 'Interpretation:', 'Uncertainty:'). DeepSeek never receives pixels; direct observations are evidence, interpretation is a hypothesis, and details absent from the context must not be invented"
+  },
+  "antigravity": {
+    "asyncContract": "deepseek_spawn returns an accepted pending obligation immediately after job creation; agy runs asynchronously and deepseek_follow observes completion/failure/abort; abort between job creation and dispatch prevents the launch and never re-activates a closed/aborted agent; no provider fallback",
+    "sandbox": "antigravitySandbox (boolean, default false) enables agy --sandbox; never implied by other flags",
+    "command": "antigravityCommand (string, default null): per-bridge override for the agy executable, a bare command name (PATH lookup) or an absolute path to a trusted local executable; null keeps the default agy.exe/agy PATH lookup; a single executable, never a shell command line; whitespace-containing non-absolute values are rejected at config load, while absolute executable paths with spaces remain allowed; avoids global PATH changes",
+    "addDirs": "antigravityAddDirs (absolute string paths, default []) mounts explicit writable directories into the sandbox; relative entries are dropped at load",
+    "autoApprove": "antigravityAutoApprovePermissions (boolean, default false) passes --dangerously-skip-permissions so agy never blocks on interactive permission prompts; independent of antigravitySandbox (an unsandboxed run can carry auto-approval and a sandboxed run can omit it) and never broadens the sandbox",
+    "recovery": "antigravity runs live inside the daemon process; after a daemon loss, stranded active antigravity jobs (dispatching/running/following/finalizing) are terminalized as failed with a clear reason at startup recovery, never left dispatching/working; an orphaned child process is not controllable; in-process follow/abort semantics are unchanged",
+    "secrets": "the bridge never reads, writes or exposes Antigravity credentials or secrets"
   },
   "obligations": {
     "consumption": "terminal results become consumed when follow/recover returns a usable final result (persisted per job); needs_approval stays pending",

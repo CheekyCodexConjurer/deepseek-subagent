@@ -33,6 +33,32 @@ test("human result starts with the friendly identity and includes the private re
   assert.doesNotMatch(text.split("\n", 3).join("\n"), /agent_internal|job_internal|session_internal/);
 });
 
+test("human result header is provider-aware and never labels an Antigravity result as OpenCode", () => {
+  const opencode: ResultEnvelope = {
+    version: 1,
+    agentId: "agent_header",
+    jobId: "job_header",
+    topic: "Header",
+    status: "completed",
+    opencodeSessionId: "session_header",
+    model: "opencode-go/deepseek-v4-flash · max",
+    modelDisplayName: "DeepSeek V4 Flash · Max",
+    workspace: "E:\\workspace",
+    summary: "summary",
+    files: [],
+    tests: [],
+    risks: [],
+    diffSummary: "none",
+    fullResultPath: "C:\\results\\job_header.json",
+    orchestratorInstruction: "Continue this agent only with deepseek_continue after reviewing this result.",
+  };
+  assert.match(formatHumanResult(opencode), /\[OPENCODE_SUBAGENT_RESULT v1\]/);
+  const antigravity: ResultEnvelope = { ...opencode, model: "gemini-3.7-flash-high", modelDisplayName: "Antigravity · gemini-3.7-flash-high", opencodeSessionId: "antigravity:agent_header" };
+  const text = formatHumanResult(antigravity);
+  assert.match(text, /\[ANTIGRAVITY_SUBAGENT_RESULT v1\]/);
+  assert.doesNotMatch(text, /\[OPENCODE_SUBAGENT_RESULT/);
+});
+
 test("persisted result redacts structured and raw evidence fields", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-result-redaction-"));
   const agent = {

@@ -20,6 +20,24 @@ export interface ResolvedRoute {
   variant: string | null;
   display: string;
 }
+
+/** How the currently effective active route was determined. */
+export type ActiveRouteSource = "configured-default" | "operator-set";
+
+/**
+ * Operator-visible active-route state. The effective route is the operator-set
+ * pointer persisted in the bridge store when one exists, otherwise the
+ * configured default route. `activeRoute` is null (with `activeRouteError`)
+ * only when the effective route cannot resolve from the registry.
+ */
+export interface RouteStatusInfo {
+  activeRoute: ResolvedRoute | null;
+  activeRouteError: string | null;
+  defaultModelRoute: string;
+  source: ActiveRouteSource;
+  routes: ModelRoute[];
+}
+
 export type JobStatus =
   | "created"
   | "dispatching"
@@ -336,6 +354,10 @@ export interface BridgeConfig {
   codexAppServerArgs: string[];
   maxTaskLength: number;
   maxResultLength: number;
+  antigravitySandbox: boolean;
+  antigravityAddDirs: string[];
+  antigravityAutoApprovePermissions: boolean;
+  antigravityCommand: string | null;
   modelRoutes: ModelRoute[];
   defaultModelRoute: string;
   retentionMode: RetentionMode;

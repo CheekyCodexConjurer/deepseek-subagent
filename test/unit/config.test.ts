@@ -78,6 +78,71 @@ test("route registry ships flash-max enabled by default and pro-max registered b
   assert.equal(MODEL_ROUTE_REGISTRY.some((route) => route.name === "pro-max" && !route.enabled), true);
 });
 
+test("antigravity route is registered, enabled for selection, and never becomes the default", () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\deepseek-config-antigravity",
+    configPath: "C:\\deepseek-config-antigravity\\config.json",
+  });
+  const route = config.modelRoutes.find((candidate) => candidate.name === "antigravity-flash-high");
+  assert.ok(route);
+  assert.equal(route.providerId, "antigravity");
+  assert.equal(route.modelId, "gemini-3.7-flash-high");
+  assert.equal(route.variant, null);
+  assert.equal(route.enabled, true, "selectable by the operator control plane");
+  assert.equal(route.default, false, "never the default");
+  assert.equal(config.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME, "flash-max stays the initial effective default");
+  assert.equal(MODEL_ROUTE_REGISTRY.find((candidate) => candidate.name === "antigravity-flash-high")?.enabled, true);
+});
+
+test("antigravity permission auto-approval is opt-in, independent of the sandbox, and path-limited", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-antigravity-permissions-"));
+  const configPath = path.join(directory, "config.json");
+  try {
+    const defaults = createDefaultConfig({ dataDir: directory, configPath });
+    assert.equal(defaults.antigravitySandbox, false);
+    assert.deepEqual(defaults.antigravityAddDirs, []);
+    assert.equal(defaults.antigravityAutoApprovePermissions, false);
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravitySandbox: true, antigravityAutoApprovePermissions: false })
+        .antigravityAutoApprovePermissions,
+      false,
+      "sandbox alone never implies auto-approval",
+    );
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravitySandbox: false, antigravityAutoApprovePermissions: true })
+        .antigravityAutoApprovePermissions,
+      true,
+      "auto-approval is preserved without the sandbox",
+    );
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravitySandbox: false, antigravityAutoApprovePermissions: true })
+        .antigravitySandbox,
+      false,
+      "auto-approval never implies the sandbox",
+    );
+    await writeFile(configPath, JSON.stringify({
+      ...defaults,
+      antigravitySandbox: true,
+      antigravityAddDirs: [directory, "relative-path", directory],
+      antigravityAutoApprovePermissions: true,
+    }), "utf8");
+    const enabled = await loadConfig(configPath);
+    assert.equal(enabled.antigravitySandbox, true);
+    assert.deepEqual(enabled.antigravityAddDirs, [directory]);
+    assert.equal(enabled.antigravityAutoApprovePermissions, true);
+    await writeFile(configPath, JSON.stringify({
+      ...defaults,
+      antigravitySandbox: false,
+      antigravityAutoApprovePermissions: true,
+    }), "utf8");
+    const unsandboxed = await loadConfig(configPath);
+    assert.equal(unsandboxed.antigravitySandbox, false);
+    assert.equal(unsandboxed.antigravityAutoApprovePermissions, true, "unsandboxed runs keep explicit auto-approval");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("old flat config stays backward compatible and keeps the default route", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-flat-"));
   const configPath = path.join(directory, "config.json");
@@ -136,6 +201,71 @@ test("explicit modelRoutes registry wins over flat defaults and is persisted", a
     assert.equal(loaded.defaultModelRoute, "pro-max");
     assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.enabled, true);
     assert.equal(loaded.modelRoutes.length, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("antigravityCommand defaults to null, validates proportionally, and survives a load round trip", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-antigravity-command-"));
+  const configPath = path.join(directory, "config.json");
+  try {
+    const defaults = createDefaultConfig({ dataDir: directory, configPath });
+    assert.equal(defaults.antigravityCommand, null, "omitted command keeps the default PATH lookup");
+    const explicit = createDefaultConfig({
+      dataDir: directory,
+      configPath,
+      antigravityCommand: "C:\\Users\\lab\\antigravity\\staging\\agy.exe",
+    });
+    assert.equal(explicit.antigravityCommand, "C:\\Users\\lab\\antigravity\\staging\\agy.exe", "an absolute Windows path is preserved");
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravityCommand: "   " }).antigravityCommand,
+      null,
+      "whitespace-only is treated as unset",
+    );
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravityCommand: "agy-custom" }).antigravityCommand,
+      "agy-custom",
+      "a bare command name is preserved for PATH lookup",
+    );
+    if (process.platform === "win32") {
+      assert.equal(
+        createDefaultConfig({
+          dataDir: directory,
+          configPath,
+          antigravityCommand: "C:\\Program Files\\Antigravity Lab\\agy.exe",
+        }).antigravityCommand,
+        "C:\\Program Files\\Antigravity Lab\\agy.exe",
+        "an absolute executable path containing spaces is preserved",
+      );
+      assert.equal(
+        createDefaultConfig({ dataDir: directory, configPath, antigravityCommand: "C:\\agy.exe --sandbox" }).antigravityCommand,
+        "C:\\agy.exe --sandbox",
+        "an absolute-prefixed value is one argv (a Windows filename may contain spaces); only non-absolute command lines are rejected",
+      );
+    }
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravityCommand: "agy --sandbox" }).antigravityCommand,
+      null,
+      "a shell-like command line with arguments is rejected",
+    );
+    assert.equal(
+      createDefaultConfig({ dataDir: directory, configPath, antigravityCommand: "lab tools\\agy.exe" }).antigravityCommand,
+      null,
+      "a relative path with spaces is not a bare name nor an absolute path and is rejected",
+    );
+    await writeFile(configPath, JSON.stringify({
+      ...defaults,
+      antigravityCommand: "C:\\Users\\lab\\antigravity\\staging\\agy.exe",
+    }), "utf8");
+    const loaded = await loadConfig(configPath);
+    assert.equal(loaded.antigravityCommand, "C:\\Users\\lab\\antigravity\\staging\\agy.exe");
+    await writeFile(configPath, JSON.stringify({ ...defaults, antigravityCommand: 42 }), "utf8");
+    const nonString = await loadConfig(configPath);
+    assert.equal(nonString.antigravityCommand, null, "non-string values fail closed to unset");
+    await writeFile(configPath, JSON.stringify({ ...defaults, antigravityCommand: "" }), "utf8");
+    const empty = await loadConfig(configPath);
+    assert.equal(empty.antigravityCommand, null, "empty values fail closed to unset");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
