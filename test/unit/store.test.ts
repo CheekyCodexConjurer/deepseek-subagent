@@ -97,7 +97,7 @@ test("persists agents, jobs, bindings and idempotent events", async () => {
   }
 });
 
-test("database health check uses the fast quick_check pragma", async () => {
+test("default integrity check performs a fast access/schema check without quick_check", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-health-"));
   const store = await BridgeStore.open(directory);
   try {
@@ -108,8 +108,28 @@ test("database health check uses the fast quick_check pragma", async () => {
       return prepare.call(store.db, sql);
     }) as typeof prepare;
     assert.equal(store.integrityCheck(), "ok");
-    assert.ok(statements.includes("PRAGMA quick_check"), "health check must run PRAGMA quick_check");
-    assert.ok(!statements.includes("PRAGMA integrity_check"), "health check must not run a full integrity scan");
+    assert.ok(statements.some((sql) => sql.includes("schema_migrations")), "health check must run fast schema/access check");
+    assert.ok(!statements.includes("PRAGMA quick_check"), "default check must not run PRAGMA quick_check");
+    assert.ok(!statements.includes("PRAGMA integrity_check"), "default check must not run PRAGMA integrity_check");
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("full integrity check runs PRAGMA quick_check", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-health-full-"));
+  const store = await BridgeStore.open(directory);
+  try {
+    const prepare = store.db.prepare;
+    const statements: string[] = [];
+    store.db.prepare = ((sql: string) => {
+      statements.push(sql);
+      return prepare.call(store.db, sql);
+    }) as typeof prepare;
+    assert.equal(store.integrityCheck({ full: true }), "ok");
+    assert.ok(statements.includes("PRAGMA quick_check"), "full check must run PRAGMA quick_check");
+    assert.ok(!statements.includes("PRAGMA integrity_check"), "full check must not run a full integrity scan");
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });

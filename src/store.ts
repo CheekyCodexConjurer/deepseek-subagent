@@ -60,9 +60,13 @@ export class BridgeStore {
     this.db.close();
   }
 
-  integrityCheck(): string {
-    const row = this.db.prepare("PRAGMA quick_check").get() as Row | undefined;
-    return row?.quick_check === undefined ? "unknown" : String(row.quick_check);
+  integrityCheck(options?: { full?: boolean | undefined }): string {
+    if (options?.full) {
+      const row = this.db.prepare("PRAGMA quick_check").get() as Row | undefined;
+      return row?.quick_check === undefined ? "unknown" : String(row.quick_check);
+    }
+    const row = this.db.prepare("SELECT 1 AS ok FROM schema_migrations LIMIT 1").get() as Row | undefined;
+    return row?.ok === 1 ? "ok" : "unknown";
   }
 
   migrate(): void {

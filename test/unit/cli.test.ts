@@ -202,6 +202,25 @@ test("doctorDatabaseCheck reports a healthy database with correlation counts", a
     assert.equal(seen.length, 2);
     assert.equal(seen[0].name, "database");
     assert.equal(seen[0].status, "ok");
+    assert.equal(seen[0].detail, "ok");
+    assert.equal(seen[1].name, "correlation");
+    assert.equal(seen[1].status, "ok");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctorDatabaseCheck with full: true performs PRAGMA quick_check", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-db-check-full-"));
+  try {
+    const dbPath = path.join(directory, "bridge.sqlite");
+    new BridgeStore(dbPath).close();
+    const seen: DoctorCheck[] = [];
+    await doctorDatabaseCheck(dbPath, (check) => seen.push(check), { full: true });
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].name, "database");
+    assert.equal(seen[0].status, "ok");
+    assert.equal(seen[0].detail, "ok");
     assert.equal(seen[1].name, "correlation");
     assert.equal(seen[1].status, "ok");
   } finally {

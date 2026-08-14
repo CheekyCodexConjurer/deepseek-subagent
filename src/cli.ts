@@ -20,6 +20,7 @@ interface CliArgs {
   rest: string[];
   json: boolean;
   verbose: boolean;
+  full: boolean;
   configPath: string;
   removeCodex: boolean;
   purgeData: boolean;
@@ -56,7 +57,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       await runDaemon(config);
       return;
     case "doctor":
-      await outputDoctor(config, parsed.json);
+      await outputDoctor(config, parsed.json, parsed.full);
       return;
     case "start":
       await startDaemon(config, parsed.json);
@@ -173,7 +174,7 @@ async function stopDaemon(config: BridgeConfig, json: boolean): Promise<void> {
   output(json, { stopped: true }, "DeepSeek Sub-Agent daemon stopped.");
 }
 
-async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> {
+async function outputDoctor(config: BridgeConfig, json: boolean, full = false): Promise<void> {
   const checks: DoctorCheck[] = [];
   const push = (check: DoctorCheck): void => {
     checks.push(check);
@@ -314,8 +315,12 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
     push({ name: "bridge_daemon", status: "warning", detail: "not reachable: " + redactSecrets(String(error)) });
   }
   const databasePath = path.join(config.dataDir, "bridge.sqlite");
-  console.error("[doctor] checking database (synchronous SQLite quick_check; it can take a moment under IO/lock contention)");
-  await doctorDatabaseCheck(databasePath, push);
+  if (full) {
+    console.error("[doctor] checking database (synchronous SQLite quick_check; it can take a moment under IO/lock contention)");
+  } else {
+    console.error("[doctor] checking database (fast schema/access check; use --full for SQLite quick_check)");
+  }
+  await doctorDatabaseCheck(databasePath, push, { full });
   console.error("[doctor] checking obligations and terminal-result consumption");
   await doctorObligationChecks(databasePath, push);
   console.error("[doctor] checking retention policy");
@@ -329,9 +334,9 @@ async function outputDoctor(config: BridgeConfig, json: boolean): Promise<void> 
   output(json, report, checks.map((check) => check.name + "=" + check.status + " (" + check.detail + ")").join("\n"));
 }
 
-// Runs the synchronous SQLite doctor checks and guarantees the store handle is
-// closed even when a check throws. The synchronous quick_check cannot be
-// interrupted from the caller, so the honest contract is: run it, report its
+// Runs synchronous SQLite store operations and guarantees the store handle is
+// closed even when a callback throws. Synchronous SQLite checks cannot be
+// interrupted from the caller, so the honest contract is: run them, report their
 // result, and never leak the handle.
 export function withStore<T>(databasePath: string, fn: (store: BridgeStore) => T): T {
   const store = new BridgeStore(databasePath);
@@ -342,14 +347,18 @@ export function withStore<T>(databasePath: string, fn: (store: BridgeStore) => T
   }
 }
 
-export async function doctorDatabaseCheck(databasePath: string, push: (check: DoctorCheck) => void): Promise<void> {
+export async function doctorDatabaseCheck(
+  databasePath: string,
+  push: (check: DoctorCheck) => void,
+  options: { full?: boolean | undefined } = {},
+): Promise<void> {
   if (!(await canRead(databasePath))) {
     push({ name: "database", status: "warning", detail: "database has not been created yet" });
     return;
   }
   try {
     withStore(databasePath, (store) => {
-      const integrity = store.integrityCheck();
+      const integrity = store.integrityCheck({ full: options.full });
       push({ name: "database", status: integrity === "ok" ? "ok" : "error", detail: integrity });
       const hintCount = store.countJobsWithCorrelationHints();
       const bindingCount = store.countCodexBindings();
@@ -771,6 +780,7 @@ function parseArgs(argv: string[]): CliArgs {
   let configPath = defaultConfigPath();
   let json = false;
   let verbose = false;
+  let full = false;
   let removeCodex = false;
   let purgeData = false;
   let confirmPurge = false;
@@ -780,6 +790,7 @@ function parseArgs(argv: string[]): CliArgs {
     const value = argv[index];
     if (value === "--json") json = true;
     else if (value === "--verbose") verbose = true;
+    else if (value === "--full") full = true;
     else if (value === "--remove-codex") removeCodex = true;
     else if (value === "--purge-data") purgeData = true;
     else if (value === "--confirm-purge") confirmPurge = true;
@@ -790,7 +801,7 @@ function parseArgs(argv: string[]): CliArgs {
       configPath = path.resolve(next);
     } else rest.push(value as string);
   }
-  return { command, rest, json, verbose, configPath, removeCodex, purgeData, confirmPurge, confirmRetention };
+  return { command, rest, json, verbose, full, configPath, removeCodex, purgeData, confirmPurge, confirmRetention };
 }
 
 function output(json: boolean, value: unknown, human: string): void {
@@ -952,7 +963,8 @@ function printHelp(): void {
   console.log([
     "DeepSeek Sub-Agent local bridge",
     "",
-    "Commands: daemon, mcp, install, start, stop, restart, doctor, logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>",
+    "Commands: daemon, mcp, install, start, stop, restart, doctor [--full], logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>",
+    "doctor performs a fast schema/access check by default; use --full to run SQLite PRAGMA quick_check.",
     "retention enabled on an existing database requires --confirm after reviewing `retention dry-run`. Run retention commands while the daemon is stopped.",
     "route commands require the running daemon: route list shows registered routes, route status shows the effective active route, route set <route> switches it for new spawns without a daemon restart (existing agents keep their pinned route).",
     "Use --json for machine-readable output or --verbose for technical IDs in human listings. Secrets are always redacted.",
