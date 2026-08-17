@@ -6,8 +6,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
-import { BridgeHttpClient, BridgeHttpError } from "./http-server.js";
-import { canRead, ensurePrivateDir, redactSecrets } from "./security.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-server.js";
+import { canRead, ensurePrivateDir, newId, redactSecrets } from "./security.js";
 import type { BridgeConfig } from "./types.js";
 
 const DISPLAY_NAME = "DeepSeek Sub-Agent";
@@ -28,39 +28,87 @@ export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   console.error(DISPLAY_NAME + " MCP server connected; daemon readiness is bootstrapped on the first tool call.");
 }
 
+export interface LazyDaemonBootstrap {
+  (): Promise<void>;
+  invalidate(): void;
+  recover(): Promise<void>;
+}
+
 /**
- * Returns a memoized single-flight daemon readiness bootstrap. The first tool
- * operation triggers the daemon health check and, if offline, the one-time
- * recovery start. Concurrent first operations share the same bootstrap.
- * A failure resets the memo so a later operation can retry, and each tool call
- * surfaces a clear readiness error.
+ * Returns a memoized single-flight daemon readiness bootstrap with in-band
+ * recovery. The first tool operation triggers the daemon health check and,
+ * if offline, the one-time recovery start. Concurrent first operations share
+ * the same bootstrap. If a post-bootstrap transport loss occurs, recovery
+ * invalidates stale readiness, shares a single start attempt across concurrent
+ * failures, and retries the original HTTP call once.
  */
 export function createLazyDaemonBootstrap(
   config: BridgeConfig,
   client: DaemonHealthClient,
   options: DaemonBootstrapOptions = {},
-): () => Promise<void> {
-  let readyPromise: Promise<void> | null = null;
-  return () => {
-    if (!readyPromise) {
-      readyPromise = ensureDaemonRunning(config, client, options).catch((error) => {
-        readyPromise = null;
+): LazyDaemonBootstrap {
+  let pendingPromise: Promise<void> | null = null;
+  let isReady = false;
+
+  const run = (): Promise<void> => {
+    if (isReady) return Promise.resolve();
+    if (pendingPromise) return pendingPromise;
+    pendingPromise = (async () => {
+      try {
+        await ensureDaemonRunning(config, client, options);
+        isReady = true;
+      } catch (error) {
+        isReady = false;
         throw new Error("DeepSeek Sub-Agent daemon is not ready: " + redactSecrets(String(error)));
-      });
-    }
-    return readyPromise;
+      } finally {
+        pendingPromise = null;
+      }
+    })();
+    return pendingPromise;
   };
+
+  const invalidate = (): void => {
+    isReady = false;
+  };
+
+  const recover = (): Promise<void> => {
+    invalidate();
+    return run();
+  };
+
+  const bootstrap: LazyDaemonBootstrap = Object.assign(() => run(), {
+    invalidate,
+    recover,
+  });
+
+  return bootstrap;
 }
 
 class LazyReadyClient {
+  private readonly recoverFn: (() => Promise<void>) | undefined;
+
   constructor(
     private readonly client: Pick<BridgeHttpClient, "call">,
     private readonly ensureReady: () => Promise<void>,
-  ) {}
+    recover?: () => Promise<void>,
+  ) {
+    this.recoverFn = recover
+      ?? (typeof (ensureReady as { recover?: unknown }).recover === "function"
+        ? () => (ensureReady as LazyDaemonBootstrap).recover()
+        : undefined);
+  }
 
   async call<T>(pathname: string, body?: unknown): Promise<T> {
     await this.ensureReady();
-    return this.client.call<T>(pathname, body);
+    try {
+      return await this.client.call<T>(pathname, body);
+    } catch (error) {
+      if (error instanceof BridgeTransportError && this.recoverFn) {
+        await this.recoverFn();
+        return await this.client.call<T>(pathname, body);
+      }
+      throw error;
+    }
   }
 }
 
@@ -132,9 +180,13 @@ async function startDetachedDaemon(config: BridgeConfig): Promise<void> {
   }
 }
 
+export interface McpServerOptions {
+  ensureReady?: LazyDaemonBootstrap | (() => Promise<void>);
+}
+
 export function createMcpServer(
   client: BridgeHttpClient,
-  options: { ensureReady?: () => Promise<void> } = {},
+  options: McpServerOptions = {},
 ): McpServer {
   const server = new McpServer({
     name: "deepseek-subagent",
@@ -173,7 +225,11 @@ export function createMcpServer(
     },
   }, async (args) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", args);
+      const payload = {
+        ...args,
+        request_id: args.request_id ?? newId("request"),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload);
       return acceptedResult(result);
     } catch (error) {
       return errorResult(error);
@@ -210,7 +266,11 @@ export function createMcpServer(
     },
   }, async (args) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", args);
+      const payload = {
+        ...args,
+        request_id: args.request_id ?? newId("request"),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload);
       return acceptedResult(result);
     } catch (error) {
       return errorResult(error);

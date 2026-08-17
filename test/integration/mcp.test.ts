@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeHttpClient, BridgeHttpError } from "../../src/http-server.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "../../src/http-server.js";
 import { createLazyDaemonBootstrap, createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
 
 function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<string, unknown>> } {
@@ -666,6 +666,369 @@ test("MCP propagates structured error codes without sniffing message text", asyn
     const busyStructured = busyResult.structuredContent as Record<string, unknown>;
     assert.equal(busyStructured.code, "busy");
     assert.equal(busyStructured.retry, false);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP post-bootstrap transport failure triggers one recovery and a successful retry", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = true;
+  let starts = 0;
+  let callAttempts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async () => {
+      callAttempts += 1;
+      if (callAttempts === 1) {
+        return { agentId: "agent_1", jobId: "job_1", topic: "t", status: "running", elapsedSeconds: 1, lastActivityAgoSeconds: 1, currentActivity: "Working", recentActivity: [], filesTouched: [], testSummary: "", resultAvailable: false };
+      }
+      if (callAttempts === 2) {
+        ready = false;
+        throw new BridgeTransportError("connect ECONNREFUSED");
+      }
+      return { agentId: "agent_1", jobId: "job_1", topic: "t", status: "running", elapsedSeconds: 2, lastActivityAgoSeconds: 1, currentActivity: "Working", recentActivity: [], filesTouched: [], testSummary: "", resultAvailable: false };
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        ready = true;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const first = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(first.isError, undefined);
+    assert.equal(starts, 0);
+    assert.equal(callAttempts, 1);
+
+    const second = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(second.isError, undefined);
+    assert.equal(starts, 1, "recovery must invoke detached start exactly once");
+    assert.equal(callAttempts, 3, "must retry the original call once after recovery");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP concurrent post-bootstrap transport failures share one recovery attempt", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = true;
+  let starts = 0;
+  let callCount = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return { agentId: "agent_1", jobId: "job_1", topic: "t", status: "running", elapsedSeconds: 1, lastActivityAgoSeconds: 1, currentActivity: "Working", recentActivity: [], filesTouched: [], testSummary: "", resultAvailable: false };
+      }
+      if (callCount === 2 || callCount === 3) {
+        ready = false;
+        throw new BridgeTransportError("connect ECONNREFUSED");
+      }
+      return { agentId: "agent_1", jobId: "job_1", topic: "t", status: "running", elapsedSeconds: 2, lastActivityAgoSeconds: 1, currentActivity: "Working", recentActivity: [], filesTouched: [], testSummary: "", resultAvailable: false };
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        ready = true;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const initial = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(initial.isError, undefined);
+    assert.equal(starts, 0);
+
+    const op1 = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    const op2 = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    const [res1, res2] = await Promise.all([op1, op2]);
+
+    assert.equal(res1.isError, undefined);
+    assert.equal(res2.isError, undefined);
+    assert.equal(starts, 1, "concurrent transport failures must share a single recovery start");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP non-transport error never triggers recovery", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let starts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async () => {
+      throw new BridgeHttpError(404, "unknown_agent", "Agent not found");
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_abort", arguments: { agent_id: "nonexistent" } });
+    assert.equal(result.isError, true);
+    assert.equal((result.structuredContent as Record<string, unknown>)?.code, "unknown_agent");
+    assert.equal(starts, 0, "non-transport error must never trigger recovery start");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP spawn and continue retry preserves and reuses the stable request_id across recovery", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = true;
+  let starts = 0;
+  const recordedSpawnPayloads: Array<Record<string, unknown>> = [];
+  const recordedContinuePayloads: Array<Record<string, unknown>> = [];
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      if (pathname === "/v1/jobs/spawn") {
+        recordedSpawnPayloads.push(body as Record<string, unknown>);
+        if (recordedSpawnPayloads.length === 1) {
+          ready = false;
+          throw new BridgeTransportError("connect ECONNREFUSED");
+        }
+        return { accepted: true, status: "accepted", topic: "t", modelDisplayName: "m", agentId: "a1", jobId: "j1", state: "Starting" };
+      }
+      if (pathname === "/v1/jobs/continue") {
+        recordedContinuePayloads.push(body as Record<string, unknown>);
+        if (recordedContinuePayloads.length === 1) {
+          ready = false;
+          throw new BridgeTransportError("connect ECONNREFUSED");
+        }
+        return { accepted: true, status: "accepted", topic: "t", modelDisplayName: "m", agentId: "a1", jobId: "j2", state: "Starting" };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        ready = true;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    // 1. Spawn without supplied request_id
+    const spawnRes = await client.callTool({ name: "deepseek_spawn", arguments: { topic: "topic", task: "task" } });
+    assert.equal(spawnRes.isError, undefined);
+    assert.equal(recordedSpawnPayloads.length, 2, "spawn should have been called twice (initial + retry)");
+    const generatedRequestId = recordedSpawnPayloads[0]?.request_id;
+    assert.ok(typeof generatedRequestId === "string" && (generatedRequestId as string).startsWith("request_"));
+    assert.equal(recordedSpawnPayloads[1]?.request_id, generatedRequestId, "retry must reuse the exact same generated request_id");
+
+    // 2. Continue with supplied request_id
+    const continueRes = await client.callTool({ name: "deepseek_continue", arguments: { agent_id: "a1", task: "task", request_id: "custom_req_999" } });
+    assert.equal(continueRes.isError, undefined);
+    assert.equal(recordedContinuePayloads.length, 2, "continue should have been called twice (initial + retry)");
+    assert.equal(recordedContinuePayloads[0]?.request_id, "custom_req_999");
+    assert.equal(recordedContinuePayloads[1]?.request_id, "custom_req_999", "retry must preserve supplied request_id");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP post-bootstrap recovery remains bounded to one retry and propagates persistent failures", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = true;
+  let starts = 0;
+  let callAttempts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async () => {
+      callAttempts += 1;
+      ready = false;
+      throw new BridgeTransportError("connect ECONNREFUSED");
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        ready = true;
+      },
+      timeoutMs: 200,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(result.isError, true);
+    assert.equal(starts, 1, "must attempt recovery exactly once");
+    assert.equal(callAttempts, 2, "must attempt initial call and exactly one retry (no infinite loop)");
+    const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(text, /ECONNREFUSED/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP recovery failure propagates readiness error and resets memo", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let ready = true;
+  let starts = 0;
+  let callAttempts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      if (!ready) throw new Error("connect ECONNREFUSED");
+      return { status: { running: true } };
+    },
+  };
+  const bridgeClient = {
+    call: async () => {
+      callAttempts += 1;
+      ready = false;
+      throw new BridgeTransportError("connect ECONNREFUSED");
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: createLazyDaemonBootstrap(config, healthClient, {
+      start: async () => {
+        starts += 1;
+        throw new Error("daemon failed to start");
+      },
+      timeoutMs: 20,
+      retryMs: 1,
+    }),
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(result.isError, true);
+    assert.equal(starts, 1);
+    assert.equal(callAttempts, 1, "if recovery fails, the retried call is not made");
+    const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(text, /daemon is not ready/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP plain ensureReady callback without recovery propagates transport error without retrying", async () => {
+  let readinessCalls = 0;
+  let callAttempts = 0;
+  const customEnsureReady = async (): Promise<void> => {
+    readinessCalls += 1;
+  };
+  const bridgeClient = {
+    call: async () => {
+      callAttempts += 1;
+      throw new BridgeTransportError("connect ECONNREFUSED");
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient, {
+    ensureReady: customEnsureReady,
+  });
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
+    assert.equal(result.isError, true);
+    assert.equal(readinessCalls, 1, "plain ensureReady must be called only once for initial readiness check");
+    assert.equal(callAttempts, 1, "plain ensureReady must not trigger retry on BridgeTransportError");
+    const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(text, /ECONNREFUSED/);
   } finally {
     await client.close();
     await server.close();
