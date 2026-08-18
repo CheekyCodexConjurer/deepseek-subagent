@@ -1,9 +1,10 @@
-import { access, open, readFile, unlink } from "node:fs/promises";
+import { access, open, readFile, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile } from "./security.js";
+import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile, writePrivateFileExclusive } from "./security.js";
 import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
 import { runMcp } from "./mcp.js";
@@ -107,19 +108,128 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 }
 
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export async function acquireDaemonLock(dataDir: string, pid = process.pid): Promise<() => Promise<void>> {
+  await ensurePrivateDir(dataDir);
+  const pidPath = path.join(dataDir, "daemon.pid");
+
+  const maxAttempts = 5;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const acquiredFirst = await writePrivateFileExclusive(pidPath, String(pid) + "\n");
+    if (acquiredFirst) {
+      return createDaemonLockReleaser(pidPath, pid);
+    }
+
+    let existingContent: string;
+    try {
+      existingContent = await readFile(pidPath, "utf8");
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        // Lock file was released or claimed by another contender right after exclusive write failed; retry.
+        continue;
+      }
+      throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
+    }
+
+    const trimmed = existingContent.trim();
+    if (!trimmed || !/^\d+$/.test(trimmed)) {
+      throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
+    }
+
+    const existingPid = Number.parseInt(trimmed, 10);
+    if (!Number.isInteger(existingPid) || existingPid <= 0) {
+      throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
+    }
+
+    if (isProcessAlive(existingPid)) {
+      throw new Error(`DeepSeek Sub-Agent daemon is already running (PID ${existingPid}). Duplicate daemon instance prevented.`);
+    }
+
+    // Existing PID is dead (stale lock). Attempt atomic CAS takeover via atomic rename to a unique temp file.
+    const staleClaimPath = path.join(
+      dataDir,
+      `daemon.pid.stale.${pid}.${Date.now()}.${randomBytes(6).toString("hex")}`,
+    );
+
+    let claimedStale = false;
+    try {
+      await rename(pidPath, staleClaimPath);
+      claimedStale = true;
+    } catch {
+      claimedStale = false;
+    }
+
+    if (claimedStale) {
+      try {
+        const claimedContent = await readFile(staleClaimPath, "utf8").catch(() => "");
+        const claimedPid = Number.parseInt(claimedContent.trim(), 10);
+        if (Number.isInteger(claimedPid) && claimedPid > 0 && isProcessAlive(claimedPid)) {
+          await rename(staleClaimPath, pidPath).catch(() => undefined);
+          throw new Error(`DeepSeek Sub-Agent daemon is already running (PID ${claimedPid}). Duplicate daemon instance prevented.`);
+        }
+      } finally {
+        await unlink(staleClaimPath).catch(() => undefined);
+      }
+
+      const acquiredSecond = await writePrivateFileExclusive(pidPath, String(pid) + "\n");
+      if (acquiredSecond) {
+        return createDaemonLockReleaser(pidPath, pid);
+      }
+      continue;
+    }
+
+    // Lost the stale claim race; wait briefly so the winner can finish writing its new PID, then retry.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
+}
+
+function createDaemonLockReleaser(pidPath: string, pid: number): () => Promise<void> {
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try {
+      const current = await readFile(pidPath, "utf8").catch(() => "");
+      const currentPid = Number.parseInt(current.trim(), 10);
+      if (currentPid === pid) {
+        await unlink(pidPath).catch(() => undefined);
+      }
+    } catch {
+      // Ignore errors on cleanup
+    }
+  };
+}
+
 async function runDaemon(config: BridgeConfig): Promise<void> {
-  await ensurePrivateDir(config.dataDir);
-  await saveConfig(config);
+  const releaseLock = await acquireDaemonLock(config.dataDir);
   const service = new BridgeService(config);
   const http = new BridgeHttpServer(config, service);
-  await service.start();
-  await http.start();
-  await writePrivateFile(path.join(config.dataDir, "daemon.pid"), String(process.pid) + "\n");
+  try {
+    await saveConfig(config);
+    await service.start();
+    await http.start();
+  } catch (error) {
+    await http.stop().catch(() => undefined);
+    await service.stop().catch(() => undefined);
+    await releaseLock();
+    throw error;
+  }
   console.error("DeepSeek Sub-Agent daemon listening on " + config.daemonHost + ":" + config.daemonPort);
   const shutdown = async () => {
     await http.stop();
     await service.stop();
-    await unlink(path.join(config.dataDir, "daemon.pid")).catch(() => undefined);
+    await releaseLock();
   };
   const onSignal = () => {
     void shutdown().then(() => process.exit(0));

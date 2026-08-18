@@ -4,7 +4,7 @@
 // Fake `agy` executable for tests without quota. Behavior selected by the
 // AGY_FIXTURE environment variable. Always validates the argument contract
 // observed in the smoke: `--model gemini-3.7-flash-high -p <prompt>
-// --print-timeout 15m`.
+// --print-timeout <timeout>`.
 
 const args = process.argv.slice(2);
 const promptIndex = args.indexOf("-p");
@@ -16,7 +16,8 @@ const valid =
   promptIndex >= 2 &&
   prompt.trim().length > 0 &&
   args[args.length - 2] === "--print-timeout" &&
-  args[args.length - 1] === "15m";
+  typeof args[args.length - 1] === "string" &&
+  /^\d+[smhd]$/.test(args[args.length - 1]);
 
 if (!valid) {
   process.stderr.write("agy: invalid argument contract: " + JSON.stringify(args) + "\n");

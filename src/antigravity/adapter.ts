@@ -1,4 +1,4 @@
-import { AGY_COMMAND, buildAgyArgs } from "./args.js";
+import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, buildAgyArgs } from "./args.js";
 import { parseAgyOutput } from "./parser.js";
 import { AntigravityProcessError, runAgy, type SpawnLike } from "./runner.js";
 import { InvalidRequestError } from "../errors.js";
@@ -41,6 +41,8 @@ export interface AntigravityProviderLike {
  * - cancellation (AbortSignal) and timeout kill the process tree and reject
  *   with a typed error;
  * - an empty prompt fails closed with the bridge's typed 400 before spawning;
+ * - prompts exceeding the safe argument limit fail closed with typed 400 before spawning;
+ * - execution timeout aligns with --print-timeout;
  * - JSON output with an unknown or missing status fails closed (invalid
  *   output): completion is never assumed from a JSON payload that does not
  *   declare a recognized status. Plain-text stdout is treated as a completed
@@ -69,9 +71,17 @@ export class AntigravityAdapter implements AntigravityProviderLike {
 
   async runPrompt(options: AntigravityRunOptions): Promise<AntigravityRunResult> {
     if (!options.prompt.trim()) throw new InvalidRequestError("Task must not be empty");
+    if (options.prompt.length > AGY_MAX_PROMPT_LENGTH) {
+      throw new InvalidRequestError(
+        "Task prompt length (" + options.prompt.length + ") exceeds the maximum safe argument length (" +
+          AGY_MAX_PROMPT_LENGTH + " characters); reduce prompt size to fit within command-line limits",
+      );
+    }
     const model = options.model ?? this.model;
+    const effectiveTimeoutMs = options.timeoutMs ?? this.timeoutMs;
     const args = buildAgyArgs(options.prompt, {
       model,
+      timeoutMs: effectiveTimeoutMs,
       sandbox: this.sandbox,
       addDirs: this.addDirs,
       dangerouslySkipPermissions: this.dangerouslySkipPermissions,
@@ -79,7 +89,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     const captured = await runAgy(args, {
       command: this.command,
       cwd: options.cwd,
-      timeoutMs: options.timeoutMs ?? this.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
       ...(options.signal ? { signal: options.signal } : {}),
       ...(this.spawnFn ? { spawnFn: this.spawnFn } : {}),
     });

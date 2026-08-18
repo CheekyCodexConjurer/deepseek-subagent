@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { buildAgyArgs } from "../../src/antigravity/args.js";
+import { AGY_MAX_PROMPT_LENGTH, buildAgyArgs, formatPrintTimeout } from "../../src/antigravity/args.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { extractAgyJson, parseAgyOutput, parseAgyStatus } from "../../src/antigravity/parser.js";
 import { AntigravityProcessError, runAgy } from "../../src/antigravity/runner.js";
@@ -373,4 +373,95 @@ test("AntigravityAdapter never falls back: exactly one spawn on error, timeout a
     clearTimeout(timer);
   }
   assert.equal(slowCalls.length, 1);
+});
+
+test("formatPrintTimeout formats milliseconds to minutes or seconds correctly", () => {
+  assert.equal(formatPrintTimeout(900_000), "15m");
+  assert.equal(formatPrintTimeout(300_000), "5m");
+  assert.equal(formatPrintTimeout(60_000), "1m");
+  assert.equal(formatPrintTimeout(30_000), "30s");
+  assert.equal(formatPrintTimeout(1_000), "1s");
+  assert.equal(formatPrintTimeout(500), "1s");
+});
+
+test("buildAgyArgs derives --print-timeout from timeoutMs when printTimeout is not specified", () => {
+  const args = buildAgyArgs("test task", { timeoutMs: 300_000 });
+  assert.deepEqual(args, [
+    "--model",
+    "gemini-3.7-flash-high",
+    "-p",
+    "test task",
+    "--print-timeout",
+    "5m",
+  ]);
+});
+
+test("extractAgyJson does not confuse embedded markdown json code blocks with protocol envelopes", () => {
+  const markdownText = `Here is the configuration you requested:
+\`\`\`json
+{
+  "key": "value",
+  "port": 8080
+}
+\`\`\`
+All tests have passed.`;
+  assert.equal(extractAgyJson(markdownText), null);
+  const parsed = parseAgyOutput(markdownText, "");
+  assert.equal(parsed.hasJson, false);
+  assert.equal(parsed.status, null);
+  assert.equal(parsed.summary, markdownText);
+});
+
+test("extractAgyJson extracts whole-stdout and whole-fenced envelopes", () => {
+  const wholeJson = JSON.stringify({ status: "completed", summary: "done" });
+  assert.deepEqual(extractAgyJson(wholeJson), { status: "completed", summary: "done" });
+
+  const wholeFenced = `\`\`\`json\n{"status":"completed","summary":"done"}\n\`\`\``;
+  assert.deepEqual(extractAgyJson(wholeFenced), { status: "completed", summary: "done" });
+
+  const markerJson = `AGY_JSON:\n{"status":"completed","summary":"done"}`;
+  assert.deepEqual(extractAgyJson(markerJson), { status: "completed", summary: "done" });
+});
+
+test("AntigravityAdapter succeeds on legitimate text response with embedded markdown code blocks", async () => {
+  const markdownOutput = `Task completed successfully.
+\`\`\`json
+{
+  "api": "v1",
+  "active": true
+}
+\`\`\`
+No further action needed.`;
+  // Use a custom spawn mock returning text with embedded json
+  const customAdapter = new AntigravityAdapter({
+    command: "node",
+    spawnFn: () => {
+      const child = spawn(process.execPath, ["-e", `process.stdout.write(${JSON.stringify(markdownOutput)}); process.exit(0);`], {
+        cwd: process.cwd(),
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return child;
+    },
+  });
+  const result = await customAdapter.runPrompt({ prompt: "give config", cwd: process.cwd() });
+  assert.equal(result.status, "completed");
+  assert.equal(result.summary, markdownOutput);
+});
+
+test("AntigravityAdapter fails closed on prompt exceeding safe command line length before spawning", async () => {
+  const calls: string[] = [];
+  const adapter = new AntigravityAdapter({ command: "node", spawnFn: fixtureSpawn("ok", calls) });
+  const oversizedPrompt = "a".repeat(AGY_MAX_PROMPT_LENGTH + 1);
+  await assert.rejects(
+    () => adapter.runPrompt({ prompt: oversizedPrompt, cwd: process.cwd() }),
+    (error: unknown) => {
+      assert.ok(error instanceof InvalidRequestError);
+      assert.equal(error.code, "invalid_request");
+      assert.match(error.message, /exceeds the maximum safe argument length/);
+      return true;
+    },
+  );
+  assert.equal(calls.length, 0);
 });

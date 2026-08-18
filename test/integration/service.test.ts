@@ -4512,3 +4512,177 @@ test("enabled retention never auto-prunes a legacy database without the offline 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("startup recovery routes dispatching job with resultPath through valid transitions without error", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-dispatching-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const agent = store.createAgent({
+      id: "agent_recover_dispatching",
+      title: "Recover Dispatching",
+      topic: "Recover Dispatching Topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_rec_disp",
+      opencodeSessionId: "session_rec_disp",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+      modelRoute: "flash-max",
+    });
+    const job = store.createJob({
+      id: "job_recover_dispatching",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "request_recover_dispatching",
+      promptHash: "hash_rec_disp",
+    });
+    store.updateJobStatus(job.id, "dispatching");
+    assert.equal(store.getJob(job.id)?.status, "dispatching");
+
+    const resultPath = path.join(directory, "results", `${job.id}.json`);
+    await mkdir(path.dirname(resultPath), { recursive: true });
+    const envelope: ResultEnvelope = {
+      version: 1,
+      agentId: agent.id,
+      jobId: job.id,
+      topic: agent.topic,
+      status: "completed",
+      opencodeSessionId: agent.opencodeSessionId,
+      model: "opencode-go/deepseek-v4-flash",
+      modelDisplayName: "DeepSeek V4 Flash",
+      workspace: directory,
+      summary: "Recovered dispatching result",
+      files: [],
+      tests: [],
+      risks: [],
+      diffSummary: "",
+      fullResultPath: resultPath,
+      orchestratorInstruction: "",
+    };
+    await writeFile(resultPath, JSON.stringify({ envelope, rawAssistantText: "STATUS: completed\nSUMMARY: Recovered dispatching result" }), "utf8");
+    store.setJobResult(job.id, resultPath, envelope.summary);
+
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+
+    // Starting the service should recover the dispatching job with resultPath
+    // without throwing "Invalid job transition: dispatching -> completed".
+    await service.start();
+    const recoveredJob = store.getJob(job.id);
+    assert.ok(recoveredJob);
+    assert.equal(recoveredJob.status, "delivered", "recovered dispatching job must transition through running/completed to delivery_pending/delivered");
+    assert.ok(inbox.delivered.includes(job.id), "envelope was delivered");
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup recovery preserves completed_partial and timed_out statuses when job has resultPath", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-partial-timeout-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const agent = store.createAgent({
+      id: "agent_partial_timeout",
+      title: "Partial Timeout",
+      topic: "Partial Timeout Topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_pt",
+      opencodeSessionId: "session_pt",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+      modelRoute: "flash-max",
+    });
+
+    const partialJob = store.createJob({
+      id: "job_partial_rec",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "request_partial_rec",
+      promptHash: "hash_pt_1",
+    });
+    store.updateJobStatus(partialJob.id, "dispatching");
+    store.updateJobStatus(partialJob.id, "running");
+    store.updateJobStatus(partialJob.id, "following");
+    store.updateJobStatus(partialJob.id, "completed_partial");
+    const partialResultPath = path.join(directory, "results", `${partialJob.id}.json`);
+    await mkdir(path.dirname(partialResultPath), { recursive: true });
+    const partialEnvelope: ResultEnvelope = {
+      version: 1,
+      agentId: agent.id,
+      jobId: partialJob.id,
+      topic: agent.topic,
+      status: "completed_partial",
+      opencodeSessionId: agent.opencodeSessionId,
+      model: "opencode-go/deepseek-v4-flash",
+      modelDisplayName: "DeepSeek V4 Flash",
+      workspace: directory,
+      summary: "Partial result",
+      files: [],
+      tests: [],
+      risks: [],
+      diffSummary: "",
+      fullResultPath: partialResultPath,
+      orchestratorInstruction: "",
+      partial: true,
+    };
+    await writeFile(partialResultPath, JSON.stringify({ envelope: partialEnvelope, rawAssistantText: "partial output" }), "utf8");
+    store.setJobResult(partialJob.id, partialResultPath, partialEnvelope.summary);
+
+    const timedOutJob = store.createJob({
+      id: "job_timeout_rec",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "request_timeout_rec",
+      promptHash: "hash_pt_2",
+    });
+    store.updateJobStatus(timedOutJob.id, "dispatching");
+    store.updateJobStatus(timedOutJob.id, "running");
+    store.updateJobStatus(timedOutJob.id, "timed_out");
+    const timedOutResultPath = path.join(directory, "results", `${timedOutJob.id}.json`);
+    const timedOutEnvelope: ResultEnvelope = {
+      version: 1,
+      agentId: agent.id,
+      jobId: timedOutJob.id,
+      topic: agent.topic,
+      status: "timed_out",
+      opencodeSessionId: agent.opencodeSessionId,
+      model: "opencode-go/deepseek-v4-flash",
+      modelDisplayName: "DeepSeek V4 Flash",
+      workspace: directory,
+      summary: "Timed out result",
+      files: [],
+      tests: [],
+      risks: [],
+      diffSummary: "",
+      fullResultPath: timedOutResultPath,
+      orchestratorInstruction: "",
+      deadlineReached: true,
+    };
+    await writeFile(timedOutResultPath, JSON.stringify({ envelope: timedOutEnvelope, rawAssistantText: "timed out output" }), "utf8");
+    store.setJobResult(timedOutJob.id, timedOutResultPath, timedOutEnvelope.summary);
+
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+
+    await service.start();
+    assert.equal(store.getJob(partialJob.id)?.status, "delivered");
+    assert.equal(store.getJob(timedOutJob.id)?.status, "delivered");
+    assert.ok(inbox.delivered.includes(partialJob.id));
+    assert.ok(inbox.delivered.includes(timedOutJob.id));
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

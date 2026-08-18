@@ -49,22 +49,21 @@ function firstStringList(record: Record<string, unknown>, keys: string[]): strin
 }
 
 /**
- * Extracts a JSON payload from agy output: the whole stdout when it parses as
- * JSON, otherwise a ```json fenced block, otherwise a JSON object after an
- * explicit marker line. Returns null when none is present.
+ * Extracts a protocol JSON payload from agy output: only when the output is
+ * an intentional envelope (the entire stdout parses as JSON, the entire stdout
+ * is wrapped in a single ```json fence, or an explicit AGY_JSON: marker line is
+ * present). Embedded markdown code blocks within a larger text response are
+ * NOT treated as protocol envelopes so legitimate text answers with JSON
+ * examples parse as valid text results. Returns null when none is present.
  */
 export function extractAgyJson(stdout: string): Record<string, unknown> | null {
   const trimmed = stdout.trim();
   if (!trimmed) return null;
-  const candidates: string[] = [];
-  candidates.push(trimmed);
-  const fenced = /```json[ \t]*\r?\n([\s\S]*?)\r?\n?```/.exec(stdout);
-  if (fenced?.[1]) candidates.push(fenced[1]);
+
   const marker = /^[ \t]*AGY_JSON:[ \t]*\r?\n?([\s\S]*)$/m.exec(stdout);
-  if (marker?.[1]) candidates.push(marker[1]);
-  for (const candidate of candidates) {
+  if (marker?.[1]) {
     try {
-      const value: unknown = JSON.parse(candidate);
+      const value: unknown = JSON.parse(marker[1].trim());
       if (value && typeof value === "object" && !Array.isArray(value)) {
         return value as Record<string, unknown>;
       }
@@ -72,6 +71,30 @@ export function extractAgyJson(stdout: string): Record<string, unknown> | null {
       // Try the next candidate shape.
     }
   }
+
+  const wholeFenced = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n?\s*```$/i.exec(trimmed);
+  if (wholeFenced?.[1]) {
+    try {
+      const value: unknown = JSON.parse(wholeFenced[1].trim());
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+      }
+    } catch {
+      // Try the next candidate shape.
+    }
+  }
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const value: unknown = JSON.parse(trimmed);
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+      }
+    } catch {
+      // Not valid JSON.
+    }
+  }
+
   return null;
 }
 

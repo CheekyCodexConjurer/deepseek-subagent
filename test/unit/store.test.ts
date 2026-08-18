@@ -338,3 +338,41 @@ test("lineage migration adds parent_agent_id and round-trips createAgent", async
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("recoverPendingJobs includes jobs with persisted results in terminal or delivery_pending states", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-recover-"));
+  const store = await BridgeStore.open(directory);
+  try {
+    store.createAgent({
+      id: "agent_rec",
+      title: "Rec",
+      topic: "Rec topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_rec",
+      opencodeSessionId: "session_rec",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.7-flash-high",
+      modelVariant: null,
+    });
+    const job = store.createJob({
+      id: "job_rec",
+      agentId: "agent_rec",
+      kind: "spawn",
+      requestId: "req_rec",
+      promptHash: "hash_rec",
+    });
+    store.updateJobStatus(job.id, "dispatching");
+    store.updateJobStatus(job.id, "running");
+    store.updateJobStatus(job.id, "completed");
+    store.setJobResult(job.id, path.join(directory, "result.json"), "Summary");
+    store.updateJobStatus(job.id, "delivery_pending");
+
+    const pending = store.recoverPendingJobs();
+    assert.ok(pending.some((item) => item.id === "job_rec" && item.resultPath !== null));
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

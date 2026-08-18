@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, readCodexMcpToolTimeout, runCapture, runRouteCommand, terminateProcessTree, withStore } from "../../src/cli.js";
+import { acquireDaemonLock, collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, isProcessAlive, readCodexMcpToolTimeout, runCapture, runRouteCommand, terminateProcessTree, withStore } from "../../src/cli.js";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpError, BridgeTransportError } from "../../src/http-server.js";
 import { BridgeStore } from "../../src/store.js";
@@ -360,6 +360,127 @@ test("stale follow windows flag only expired non-auto-armed windows, never fresh
     const staleCheck = seen.find((check) => check.name === "stale_follow_windows");
     assert.equal(staleCheck?.status, "warning");
     store.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("isProcessAlive accurately detects running process and non-existent PID", () => {
+  assert.equal(isProcessAlive(process.pid), true);
+  // Extremely large PID that doesn't exist
+  assert.equal(isProcessAlive(9999999), false);
+});
+
+test("acquireDaemonLock exclusive lock prevents second acquisition and cleans up on release", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-lock-"));
+  try {
+    const releaseFirst = await acquireDaemonLock(directory, process.pid);
+    await assert.rejects(
+      () => acquireDaemonLock(directory, process.pid),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /already running/);
+        assert.match(message, /Duplicate daemon instance prevented/);
+        return true;
+      },
+    );
+    await releaseFirst();
+
+    // After release, acquisition succeeds again
+    const releaseSecond = await acquireDaemonLock(directory, process.pid);
+    await releaseSecond();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock safely recovers from stale dead PID", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-stale-lock-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    await writeFile(pidPath, "9999999\n", "utf8");
+
+    const release = await acquireDaemonLock(directory, process.pid);
+    assert.ok(typeof release === "function");
+    await release();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock concurrent contenders result in exactly one winner", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-race-lock-"));
+  try {
+    const contenders = [1, 2, 3, 4, 5];
+    const results = await Promise.allSettled(
+      contenders.map(() => acquireDaemonLock(directory, process.pid)),
+    );
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<() => Promise<void>> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+    assert.equal(fulfilled.length, 1, "exactly one contender acquires the lock");
+    assert.equal(rejected.length, 4, "all other contenders are rejected");
+    for (const rej of rejected) {
+      assert.match(rej.reason?.message ?? "", /Duplicate daemon instance prevented|already running/);
+    }
+    await fulfilled[0].value();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock concurrent contenders recovering from stale dead PID result in exactly one winner", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-stale-race-lock-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    await writeFile(pidPath, "9999999\n", "utf8");
+
+    const contenders = [1, 2, 3, 4, 5, 6];
+    const results = await Promise.allSettled(
+      contenders.map(() => acquireDaemonLock(directory, process.pid)),
+    );
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<() => Promise<void>> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+    assert.equal(fulfilled.length, 1, "exactly one contender acquires the lock after stale recovery");
+    assert.equal(rejected.length, 5, "all other contenders are rejected");
+    for (const rej of rejected) {
+      assert.match(rej.reason?.message ?? "", /Duplicate daemon instance prevented|already running|lock file is held by another process/);
+    }
+
+    // Verify winner has valid PID written
+    const content = await readFile(pidPath, "utf8");
+    assert.equal(Number.parseInt(content.trim(), 10), process.pid);
+
+    // Release winner's lock
+    await fulfilled[0].value();
+
+    // After release, acquisition succeeds again cleanly
+    const releaseSubsequent = await acquireDaemonLock(directory, process.pid);
+    await releaseSubsequent();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock fails closed when lock file content is empty or unreadable during creation", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-empty-lock-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    await writeFile(pidPath, "", "utf8");
+
+    await assert.rejects(
+      () => acquireDaemonLock(directory, process.pid),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /lock file is held by another process/);
+        return true;
+      },
+    );
+
+    // Verify file was NOT unlinked / assumed stale
+    const content = await readFile(pidPath, "utf8");
+    assert.equal(content, "");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

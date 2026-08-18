@@ -1424,6 +1424,12 @@ export class BridgeService {
         this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
         return;
       }
+      // If the result was already persisted or completed, never downgrade to failed.
+      if (current?.resultPath || ["completed", "completed_partial", "delivery_pending", "delivered"].includes(current?.status ?? "")) {
+        this.recordActivity(agent, current ?? job, "error", "Delivery failed for persisted Antigravity result: " + message);
+        this.lastStreamError = message;
+        return;
+      }
       if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
@@ -1773,8 +1779,7 @@ export class BridgeService {
         if (current?.status === "delivery_pending") this.store.updateJobStatus(job.id, "delivered");
       } catch (fallbackError) {
         this.store.updateDelivery(delivery.id, "failed", message + "; inbox: " + redactSecrets(String(fallbackError)));
-        const current = this.store.getJob(job.id);
-        if (current?.status === "delivery_pending") this.store.updateJobStatus(job.id, "failed", message);
+        this.lastStreamError = "Delivery failed: " + message + "; inbox: " + redactSecrets(String(fallbackError));
       }
     }
   }
@@ -1809,6 +1814,25 @@ export class BridgeService {
   private async recoverPendingJobs(): Promise<void> {
     for (const job of this.store.recoverPendingJobs()) {
       const agent = this.store.getAgent(job.agentId);
+      if (job.resultPath) {
+        if (job.status === "dispatching" || job.status === "needs_approval") {
+          this.store.updateJobStatus(job.id, "running");
+          this.store.updateJobStatus(job.id, "completed");
+          this.store.updateJobStatus(job.id, "delivery_pending");
+        } else if (["running", "following", "finalizing"].includes(job.status)) {
+          this.store.updateJobStatus(job.id, "completed");
+          this.store.updateJobStatus(job.id, "delivery_pending");
+        } else if (["completed", "completed_partial", "timed_out"].includes(job.status)) {
+          this.store.updateJobStatus(job.id, "delivery_pending");
+        }
+        const pending = this.store.getJob(job.id);
+        if (pending?.status === "delivery_pending") {
+          await this.deliverPersistedJob(pending).catch((error) => {
+            this.lastStreamError = redactSecrets(String(error));
+          });
+        }
+        continue;
+      }
       if (agent?.modelProviderId === "antigravity" && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
         // The Antigravity run lives in the daemon's in-memory provider and
         // process handle. After a daemon loss there is no way to recover,
@@ -1834,12 +1858,6 @@ export class BridgeService {
           normalizeFollowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
           normalizeFollowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
         );
-      } else if (["completed", "completed_partial", "timed_out"].includes(job.status) && job.resultPath) {
-        this.store.updateJobStatus(job.id, "delivery_pending");
-        const pending = this.store.getJob(job.id);
-        if (pending) await this.deliverPersistedJob(pending).catch((error) => {
-          this.lastStreamError = redactSecrets(String(error));
-        });
       } else if (job.status === "timed_out" && !job.resultPath) {
         const agent = this.store.getAgent(job.agentId);
         if (agent) {
