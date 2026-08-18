@@ -197,7 +197,7 @@ export function createMcpServer(
 
   server.registerTool("deepseek_spawn", {
     title: DISPLAY_NAME + " · Spawn",
-    description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The model route is pinned when the agent is created: model_route is optional and must name the route currently active on the bridge (initially the configured default, flash-max); an unknown or disabled route is rejected with a typed 400 and any other registered route is denied with a typed route_override_denied error, because route changes are operator-only — before any workspace or session side effect, with no fallback to another route. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
+    description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The bridge, not the caller, selects and pins the active model route at spawn. Changing routes is an operator-only control-plane action; ordinary MCP callers must never send a remembered/default route name. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       request_id: z.string().min(1).optional(),
@@ -210,7 +210,6 @@ export function createMcpServer(
       visual_context: z.string().optional(),
       thread_id: z.string().optional(),
       turn_id: z.string().optional(),
-      model_route: z.string().min(1).optional(),
     },
     outputSchema: {
       accepted: z.boolean(),

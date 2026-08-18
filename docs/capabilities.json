@@ -52,10 +52,10 @@
       "operatorControl": "route list / route status / route set <route> via the authenticated loopback daemon and CLI; requires the daemon running",
       "noRestart": "route set applies to new spawns immediately, without a daemon restart",
       "offlineBehavior": "route commands fail closed when the daemon is not running; the CLI never writes the route pointer outside the daemon process (no concurrent DB write)",
-      "noOverride": "an ordinary deepseek_spawn caller supplying a model_route different from the active route fails closed with a typed 403 route_override_denied; a matching explicit route is accepted for compatibility",
+      "noOverride": "the MCP deepseek_spawn tool never exposes or forwards model_route; it always uses the active route, while legacy/direct HTTP callers still fail closed on a conflicting override",
       "noFallback": "no automatic fallback route ever applies"
     },
-    "modelRouteOnSpawn": "optional; must name the route currently active on the bridge. Unknown or disabled routes fail closed with a typed 400 (unknown_route / route_disabled) before any side effect; other registered routes fail closed with a typed 403 (route_override_denied); no fallback route",
+    "modelRouteOnSpawn": "not available on the MCP spawn tool; it always uses the active route. The legacy/direct HTTP contract still validates an explicitly named route with typed unknown_route, route_disabled or route_override_denied failures and never falls back",
     "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults, and never the mutable active-route pointer",
     "legacyCompatibility": "agents without a pinned route keep dispatching on their persisted flat provider/model/variant columns"
   },

@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { defaultWorkspace, assertInside } from "./security.js";
-import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT } from "./prompts.js";
+import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions } from "./prompts.js";
 import { BridgeStore } from "./store.js";
 import { newId, normalizeTitle, redactSecrets, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
 import { InboxDelivery } from "./delivery/inbox.js";
@@ -16,6 +16,7 @@ import {
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
+import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
 import type { AntigravityRunResult } from "./antigravity/types.js";
 import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
@@ -42,6 +43,16 @@ import type {
 } from "./types.js";
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
+
+function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean): PromptBuildOptions {
+  return {
+    maxLength: config.maxTaskLength,
+    ...(isAntigravity ? {
+      contextFileDelivery: "reference" as const,
+      maxPromptLength: AGY_MAX_PROMPT_LENGTH,
+    } : {}),
+  };
+}
 
 export interface ServiceDependencies {
   store?: BridgeStore;
@@ -393,12 +404,21 @@ export class BridgeService {
       const contextFiles = strategy === "worktree"
         ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles)
         : validatedContextFiles;
-      const createdWorkspace = await prepareWorkspace(repositoryRoot, strategy, agentId);
-      const prompt = await buildWorkerPrompt({ ...input, contextFiles, mode, workspaceStrategy: strategy }, createdWorkspace, {
-        maxLength: this.config.maxTaskLength,
-      });
-      const title = normalizeTitle(input.topic);
       const isAntigravity = route.providerId === "antigravity";
+      const promptOptions = workerPromptOptions(this.config, isAntigravity);
+      // Antigravity reads context files from the planned workspace instead of
+      // embedding their contents in argv. This makes the complete prompt
+      // check possible before a worktree/session/job is created.
+      const antigravityPrompt = isAntigravity
+        ? await buildWorkerPrompt({ ...input, contextFiles, mode, workspaceStrategy: strategy }, workspacePath, promptOptions)
+        : null;
+      const createdWorkspace = await prepareWorkspace(repositoryRoot, strategy, agentId);
+      const prompt = antigravityPrompt ?? await buildWorkerPrompt(
+        { ...input, contextFiles, mode, workspaceStrategy: strategy },
+        createdWorkspace,
+        promptOptions,
+      );
+      const title = normalizeTitle(input.topic);
       // The Antigravity provider runs the agy executable directly in the
       // prepared workspace; it has no OpenCode session, so none is created.
       const session = isAntigravity
@@ -454,7 +474,7 @@ export class BridgeService {
         task: input.task,
         relation: input.relation,
         ...(input.visualContext ? { visualContext: input.visualContext } : {}),
-      }, agent.workspacePath, { maxLength: this.config.maxTaskLength });
+      }, agent.workspacePath, workerPromptOptions(this.config, agent.modelProviderId === "antigravity"));
       if (active?.status === "needs_approval") {
         if (input.permissionId || input.permissionReply || input.permissionMessage) {
           if (!input.permissionId || !input.permissionReply) {
@@ -504,6 +524,11 @@ export class BridgeService {
     const title = normalizeTitle(agent.topic);
     const childId = newId("agent");
     const isAntigravity = agent.modelProviderId === "antigravity";
+    const prompt = await buildWorkerPrompt({
+      task: input.task,
+      relation: input.relation,
+      ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+    }, workspacePath, workerPromptOptions(this.config, isAntigravity));
     const session = isAntigravity
       ? null
       : await this.clientOrThrow().createSession(workspacePath, title);
@@ -522,11 +547,6 @@ export class BridgeService {
       modelRoute: agent.modelRoute,
       parentAgentId: agent.id,
     });
-    const prompt = await buildWorkerPrompt({
-      task: input.task,
-      relation: input.relation,
-      ...(input.visualContext ? { visualContext: input.visualContext } : {}),
-    }, workspacePath, { maxLength: this.config.maxTaskLength });
     const job = this.store.createJob({
       id: newId("job"),
       agentId: child.id,

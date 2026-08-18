@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { InvalidRequestError } from "./errors.js";
 import { redactSecrets, truncate, validateContextFiles } from "./security.js";
 import type { AgentMode, SpawnInput, WorkspaceStrategy } from "./types.js";
 
@@ -11,6 +12,14 @@ const MODE_RULES: Record<AgentMode, string> = {
 
 export interface PromptBuildOptions {
   maxLength: number;
+  /**
+   * Inline context is useful for OpenCode sessions. The Antigravity CLI gets
+   * its prompt via argv, so it receives workspace-local file references and
+   * reads their contents itself instead of risking a command-line overflow.
+   */
+  contextFileDelivery?: "inline" | "reference";
+  /** Optional provider-specific upper bound for the complete prompt. */
+  maxPromptLength?: number;
 }
 
 export const MAX_VISUAL_CONTEXT_LENGTH = 20_000;
@@ -59,7 +68,7 @@ export async function buildWorkerPrompt(
   const absoluteContext = validateContextFiles(workspacePath, context);
   const contextText = absoluteContext.length === 0
     ? "No additional context files were supplied."
-    : await readContextFiles(absoluteContext);
+    : await readContextFiles(absoluteContext, options.contextFileDelivery ?? "inline");
   const relation = "relation" in input && input.relation ? input.relation : "new task";
   const visualContextText = visualContextSection(input.visualContext);
   const operatingRuleLines = mode
@@ -69,7 +78,7 @@ export async function buildWorkerPrompt(
         "Any prior GRACEFUL_FINALIZE_PROMPT stop was scoped to the expired job; this accepted continuation authorizes the current task without broadening the session's original permissions.",
       ];
 
-  return [
+  const prompt = [
     "You are a local DeepSeek sub-agent orchestrated by Codex.",
     "This is a bounded task. Follow the requested scope and do not invent follow-up work.",
     "Never reveal private chain-of-thought or hidden reasoning. Report concise evidence and conclusions.",
@@ -98,6 +107,13 @@ export async function buildWorkerPrompt(
     "Task:",
     task,
   ].join("\n");
+  if (options.maxPromptLength !== undefined && prompt.length > options.maxPromptLength) {
+    throw new InvalidRequestError(
+      "Task prompt length (" + prompt.length + ") exceeds the maximum safe argument length (" +
+        options.maxPromptLength + " characters); reduce task, visual context, or the number of context file references",
+    );
+  }
+  return prompt;
 }
 
 function visualContextSection(value: string | undefined): string | null {
@@ -153,7 +169,14 @@ function parseVisualContext(text: string): Record<VisualContextPart, string> {
   return parts;
 }
 
-async function readContextFiles(files: string[]): Promise<string> {
+async function readContextFiles(files: string[], delivery: "inline" | "reference"): Promise<string> {
+  if (delivery === "reference") {
+    return [
+      "The following trusted context files are available inside the workspace.",
+      "Read them directly before acting when relevant; their contents are intentionally not copied into this command prompt so it stays within the CLI safe-size limit.",
+      ...files.map((file) => "FILE: " + path.normalize(file)),
+    ].join("\n");
+  }
   const sections: string[] = [];
   for (const file of files) {
     const content = await readFile(file, "utf8");

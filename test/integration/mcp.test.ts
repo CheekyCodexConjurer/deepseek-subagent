@@ -68,7 +68,7 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async
     assert.match(tools[0]?.description ?? "", /do not poll/i);
     assert.doesNotMatch(tools[0]?.description ?? "", /DeepSeek V4 Flash/, "spawn description must be provider-neutral; the route decides the provider");
     assert.match(tools[0]?.description ?? "", /active model route/i);
-    assert.match(tools[0]?.description ?? "", /route_override_denied/i);
+    assert.match(tools[0]?.description ?? "", /operator-only/i);
     const consult = tools.find((tool) => tool.name === "deepseek_consult");
     const follow = tools.find((tool) => tool.name === "deepseek_follow");
     assert.equal(consult?.title, "DeepSeek Sub-Agent · Consult");
@@ -578,7 +578,7 @@ test("MCP obligation metadata: descriptions, readOnlyHint and output schemas", a
   }
 });
 
-test("MCP exposes model_route as an optional string on spawn only", async () => {
+test("MCP spawn does not expose a model-route override", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
     configPath: "C:\\\\deepseek-test-data\\\\config.json",
@@ -594,9 +594,45 @@ test("MCP exposes model_route as an optional string on spawn only", async () => 
     const continueTool = tools.tools.find((tool) => tool.name === "deepseek_continue");
     const spawnProperties = (spawn?.inputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
     const continueProperties = (continueTool?.inputSchema as { properties?: Record<string, unknown> })?.properties ?? {};
-    assert.ok("model_route" in spawnProperties, "spawn must accept model_route");
-    assert.equal("model_route" in continueProperties, false, "model_route is only valid on spawn");
-    assert.match(spawn?.description ?? "", /model_route/i);
+    assert.equal("model_route" in spawnProperties, false, "ordinary MCP callers must use the bridge active route");
+    assert.equal("model_route" in continueProperties, false, "continuations keep their already-pinned route");
+    assert.match(spawn?.description ?? "", /active model route/i);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP drops a legacy model_route argument and dispatches on the active route", async () => {
+  let payload: Record<string, unknown> | null = null;
+  const bridge = {
+    call: async (pathname: string, body: unknown) => {
+      assert.equal(pathname, "/v1/jobs/spawn");
+      payload = body as Record<string, unknown>;
+      return {
+        accepted: true,
+        status: "accepted",
+        topic: "t",
+        modelDisplayName: "Antigravity · Gemini 3.7 Flash High",
+        agentId: "agent_active_route",
+        jobId: "job_active_route",
+        state: "Starting",
+      };
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridge);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result = await client.callTool({
+      name: "deepseek_spawn",
+      arguments: { topic: "t", task: "t", model_route: "flash-max" },
+    });
+    assert.notEqual(result.isError, true);
+    assert.ok(payload);
+    assert.equal("model_route" in payload, false);
   } finally {
     await client.close();
     await server.close();

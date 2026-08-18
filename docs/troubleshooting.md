@@ -32,7 +32,7 @@ Check the configured binary and run the same-user OpenCode CLI. Managed mode sea
 
 ## Provider or model failure
 
-Dispatch resolves strictly through the configured route registry. The built-in default is the `flash-max` route (`opencode-go` / `deepseek-v4-flash` / `max`); `pro-max` is registered but disabled and `antigravity-flash-high` is registered and enabled for operator selection. New spawns follow the operator-controlled active route (persisted in the bridge store; initially the configured default). `deepseek_spawn` accepts an optional `model_route`; an unknown or disabled route is rejected with a typed 400 (`unknown_route` / `route_disabled`) and any other registered route with a typed 403 (`route_override_denied`) before any workspace or session side effect. There is no fallback route: the bridge never substitutes another provider or model. Inspect the persisted job error after a dispatch failure.
+Dispatch resolves strictly through the configured route registry. The built-in default is the `flash-max` route (`opencode-go` / `deepseek-v4-flash` / `max`); `pro-max` is registered but disabled and `antigravity-flash-high` is registered and enabled for operator selection. New MCP spawns follow the operator-controlled active route (persisted in the bridge store; initially the configured default) and cannot select a route themselves. Use `route set <route>` as the operator when changing providers. There is no fallback route: the bridge never substitutes another provider or model. Inspect the persisted job error after a dispatch failure.
 
 ## Active route control
 
@@ -45,6 +45,8 @@ The route chosen at spawn is persisted on the agent. Continue, approval resume/r
 ## Context files rejected with 400
 
 Context files are validated before any side effect: they must be inside the workspace, must exist, must be regular readable files, and must not exceed `maxContextFileBytes` (1 MB default). The rejection is a typed 400 (`context_file_invalid`) and no session or worktree is created. Oversized input is rejected, never truncated.
+
+For Antigravity, context-file contents are not copied into the `agy` command line: the worker receives trusted paths inside its workspace and reads them directly. If the complete task, visual context and path list still exceed the safe 30,000-character prompt limit, the bridge returns a typed 400 before creating a job; shorten those inputs rather than retrying the same request.
 
 ## Obligation and consumption warnings
 

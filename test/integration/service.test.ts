@@ -15,16 +15,18 @@ import { OpenCodeHttpError, OpenCodeTransportError } from "../../src/opencode/cl
 import { BridgeStore } from "../../src/store.js";
 import { BridgeBusyError, BridgeService, FollowCancelledError, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
-import { AGY_COMMAND } from "../../src/antigravity/args.js";
+import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH } from "../../src/antigravity/args.js";
 import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
 
 const execFileAsync = promisify(execFile);
 
 const agyFixturePath = fileURLToPath(new URL("../fixtures/agy.cjs", import.meta.url));
 
-function agyFixtureSpawn(behavior: string, calls: string[] = []) {
+function agyFixtureSpawn(behavior: string, calls: string[] = [], prompts: string[] = []) {
   return (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv; shell: false; windowsHide: boolean; stdio: ReadonlyArray<"ignore" | "pipe"> }) => {
     calls.push(command);
+    const promptIndex = args.indexOf("-p");
+    if (promptIndex >= 0) prompts.push(args[promptIndex + 1] ?? "");
     return spawn(process.execPath, [agyFixturePath, ...args], {
       cwd: options.cwd,
       env: { ...process.env, ...(options.env ?? {}), AGY_FIXTURE: behavior },
@@ -350,6 +352,79 @@ test("spawn returns after dispatch, completes on idle, deduplicates, and continu
       relation: "continuation",
       task: "This must wait",
     }), /busy/);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Antigravity references large context files from the workspace instead of overflowing the CLI prompt", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-context-budget-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
+  await writeFile(path.join(directory, "large-context.txt"), "x".repeat(AGY_MAX_PROMPT_LENGTH), "utf8");
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls, prompts) }),
+  });
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_agy_large_context",
+      topic: "Large context",
+      task: "Inspect the supplied context file.",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["large-context.txt"],
+    });
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "delivered", 2_000);
+    assert.equal(agyCalls.length, 1, "the worker must be launched once instead of failing prompt validation");
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0].length <= AGY_MAX_PROMPT_LENGTH, "the agy command argument stays within its safe limit");
+    assert.match(prompts[0], /FILE: .*large-context\.txt/);
+    assert.doesNotMatch(prompts[0], /x{100}/, "the file content is read by the worker from disk, not copied into argv");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Antigravity rejects an oversized complete prompt before creating a job or process", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-prompt-preflight-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls) }),
+  });
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    await assert.rejects(() => service.spawn({
+      requestId: "request_agy_oversized_prompt",
+      topic: "Oversized prompt",
+      task: "x".repeat(AGY_MAX_PROMPT_LENGTH),
+      cwd: directory,
+      mode: "analyze",
+    }), (error: unknown) => {
+      assert.ok(error instanceof BridgeError);
+      assert.equal(error.status, 400);
+      assert.match(error.message, /maximum safe argument length/);
+      return true;
+    });
+    assert.equal(store.listAgents().length, 0);
+    assert.equal(store.listJobs().length, 0);
+    assert.equal(agyCalls.length, 0);
   } finally {
     await service.stop();
     store.close();
