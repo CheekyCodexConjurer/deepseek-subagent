@@ -44,7 +44,7 @@ The route chosen at spawn is persisted on the agent. Continue, approval resume/r
 
 ## Context files rejected with 400
 
-Context files are validated before any side effect: they must be inside the workspace, must exist, must be regular readable files, and must not exceed `maxContextFileBytes` (1 MB default). The rejection is a typed 400 (`context_file_invalid`) and no session or worktree is created. Oversized input is rejected, never truncated.
+Context files are validated before any side effect: they must be inside the workspace (or the strictly allowlisted canonical global Gemini governance context file), must exist, must be regular readable files, and must not exceed `maxContextFileBytes` (1 MB default). The rejection is a typed 400 (`context_file_invalid`) and no session or worktree is created. Oversized input is rejected, never truncated.
 
 For Antigravity, context-file contents are not copied into the `agy` command line: the worker receives trusted paths inside its workspace and reads them directly. If the complete task, visual context and path list still exceed the safe 30,000-character prompt limit, the bridge returns a typed 400 before creating a job; shorten those inputs rather than retrying the same request.
 

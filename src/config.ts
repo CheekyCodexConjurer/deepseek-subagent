@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_MAX_CONTEXT_FILE_BYTES, defaultUserDataRoot, ensurePrivateDir, isLoopbackHost, writePrivateFile } from "./security.js";
+import { DEFAULT_MAX_CONTEXT_FILE_BYTES, defaultGlobalGeminiContextPath, defaultUserDataRoot, ensurePrivateDir, isLoopbackHost, writePrivateFile } from "./security.js";
 import type { BridgeConfig, ModelRoute, RetentionMode } from "./types.js";
 
 export const FOLLOW_MAX_WAIT_MINUTES = 60;
@@ -205,6 +205,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     defaultModelRoute: overrides.defaultModelRoute ?? defaultRouteName(modelRoutes),
     retentionMode: overrides.retentionMode ?? "disabled",
     maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
+    globalGeminiContextPath: overrides.globalGeminiContextPath ?? defaultGlobalGeminiContextPath(),
   };
 }
 
@@ -267,6 +268,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       defaultModelRoute: configuredDefaultRoute,
       retentionMode,
       maxContextFileBytes: boundedInteger(raw.maxContextFileBytes, defaults.maxContextFileBytes, 1_024, 64_000_000),
+      globalGeminiContextPath: asString(raw.globalGeminiContextPath, defaults.globalGeminiContextPath),
     };
   } catch {
     return defaults;

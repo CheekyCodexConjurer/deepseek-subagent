@@ -86,6 +86,39 @@ export function assertLoopbackUrl(rawUrl: string): URL {
   return url;
 }
 
+export function isInside(root: string, candidate: string): boolean {
+  const absoluteRoot = path.resolve(root);
+  const absoluteCandidate = path.resolve(candidate);
+  const relative = path.relative(absoluteRoot, absoluteCandidate);
+  return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+export function isSamePath(pathA: string, pathB: string): boolean {
+  const resolvedA = path.resolve(pathA);
+  const resolvedB = path.resolve(pathB);
+  if (process.platform === "win32") {
+    return resolvedA.toLowerCase() === resolvedB.toLowerCase();
+  }
+  return resolvedA === resolvedB;
+}
+
+export function defaultGlobalGeminiContextPath(): string {
+  return path.join(os.homedir(), ".gemini", "config", "GEMINI.md");
+}
+
+export function shouldIncludeGlobalGeminiContext(task: string, topic = ""): boolean {
+  const content = `${topic}\n${task}`;
+  const patterns = [
+    /\bmcps?\b/i,
+    /\bmcp[-_]/i,
+    /\bprompt[-_]?pad\b/i,
+    /\bagents\.md\b/i,
+    /\bgemini\.md\b/i,
+    /\bskills?\b/i,
+  ];
+  return patterns.some((pattern) => pattern.test(content));
+}
+
 export function assertInside(root: string, candidate: string): string {
   const absoluteRoot = path.resolve(root);
   const absoluteCandidate = path.resolve(candidate);
@@ -96,8 +129,21 @@ export function assertInside(root: string, candidate: string): string {
   throw new Error("Path escapes allowed root: " + candidate);
 }
 
-export function validateContextFiles(root: string, files: string[]): string[] {
-  return files.map((file) => assertInside(root, path.isAbsolute(file) ? file : path.join(root, file)));
+export function validateContextFiles(
+  root: string,
+  files: string[],
+  allowedExternalFiles: string[] = [defaultGlobalGeminiContextPath()],
+): string[] {
+  return files.map((file) => {
+    const candidate = path.isAbsolute(file) ? path.resolve(file) : path.resolve(root, file);
+    if (isInside(root, candidate)) {
+      return candidate;
+    }
+    if (allowedExternalFiles.some((allowed) => isSamePath(allowed, candidate))) {
+      return candidate;
+    }
+    throw new Error("Path escapes allowed root: " + candidate);
+  });
 }
 
 export const DEFAULT_MAX_CONTEXT_FILE_BYTES = 1_000_000;
@@ -113,21 +159,23 @@ export interface ContextFileValidationErrorDetails {
 
 /**
  * Validates every context file before any workspace/worktree/session/job side
- * effect: containment inside the workspace root, existence, regular readable
- * file, and bounded size. Oversized input is rejected with a stable typed 400,
- * never silently truncated.
+ * effect: containment inside the workspace root (or an explicitly allowlisted
+ * external global context file), existence, regular readable file, and
+ * bounded size. Oversized input is rejected with a stable typed 400, never
+ * silently truncated.
  */
 export async function validateContextFilesStrict(
   root: string,
   files: string[],
   maxBytes = DEFAULT_MAX_CONTEXT_FILE_BYTES,
+  allowedExternalFiles: string[] = [defaultGlobalGeminiContextPath()],
 ): Promise<string[]> {
   const resolved: string[] = [];
   for (const file of files) {
-    let candidate: string;
-    try {
-      candidate = assertInside(root, path.isAbsolute(file) ? file : path.join(root, file));
-    } catch (error) {
+    const candidate = path.isAbsolute(file) ? path.resolve(file) : path.resolve(root, file);
+    const inside = isInside(root, candidate);
+    const isAllowedExternal = !inside && allowedExternalFiles.some((allowed) => isSamePath(allowed, candidate));
+    if (!inside && !isAllowedExternal) {
       throw new InvalidRequestError(
         "context file is outside the requested workspace: " + file,
         "context_file_invalid",

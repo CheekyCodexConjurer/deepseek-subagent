@@ -2,10 +2,9 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { defaultWorkspace, assertInside } from "./security.js";
+import { canRead, defaultWorkspace, assertInside, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
 import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions } from "./prompts.js";
 import { BridgeStore } from "./store.js";
-import { newId, normalizeTitle, redactSecrets, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
 import { InboxDelivery } from "./delivery/inbox.js";
 import {
   CodexAppServerDeliveryAdapter,
@@ -44,13 +43,14 @@ import type {
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
 
-function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean): PromptBuildOptions {
+function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean, allowedExternalFiles?: string[]): PromptBuildOptions {
   return {
     maxLength: config.maxTaskLength,
     ...(isAntigravity ? {
       contextFileDelivery: "reference" as const,
       maxPromptLength: AGY_MAX_PROMPT_LENGTH,
     } : {}),
+    ...(allowedExternalFiles ? { allowedExternalFiles } : {}),
   };
 }
 
@@ -396,16 +396,24 @@ export class BridgeService {
       // Strict existence/regular-file/size validation runs against the
       // repository root (the worktree does not exist yet); the mapped paths
       // below are then used by the worker inside the created worktree.
+      const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
+      const candidateContextFiles = await this.resolveCandidateContextFiles(
+        input.task,
+        input.topic,
+        input.contextFiles ?? [],
+        this.config.globalGeminiContextPath,
+      );
       const validatedContextFiles = await validateContextFilesStrict(
         repositoryRoot,
-        input.contextFiles ?? [],
+        candidateContextFiles,
         this.config.maxContextFileBytes,
+        allowedExternalFiles,
       );
       const contextFiles = strategy === "worktree"
-        ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles)
+        ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles, allowedExternalFiles)
         : validatedContextFiles;
       const isAntigravity = route.providerId === "antigravity";
-      const promptOptions = workerPromptOptions(this.config, isAntigravity);
+      const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
       // Antigravity reads context files from the planned workspace instead of
       // embedding their contents in argv. This makes the complete prompt
       // check possible before a worktree/session/job is created.
@@ -869,15 +877,61 @@ export class BridgeService {
   }
 
   /**
+   * Resolves candidate context files for a task, automatically including the
+   * canonical global GEMINI.md governance context file when the task/topic
+   * involves MCP, PromptPad, or AGENTS.md/GEMINI.md/skills governance,
+   * preserving explicit files and deduplicating them in order.
+   */
+  private async resolveCandidateContextFiles(
+    task: string,
+    topic: string,
+    explicitFiles: string[],
+    globalGeminiPath: string,
+  ): Promise<string[]> {
+    const files = [...explicitFiles];
+    if (shouldIncludeGlobalGeminiContext(task, topic)) {
+      const resolvedGlobal = path.resolve(globalGeminiPath);
+      const exists = await canRead(resolvedGlobal);
+      if (exists) {
+        const alreadyPresent = files.some((f) => isSamePath(f, resolvedGlobal));
+        if (!alreadyPresent) {
+          files.push(resolvedGlobal);
+        }
+      }
+    }
+    const seen = new Set<string>();
+    const deduplicated: string[] = [];
+    for (const f of files) {
+      const normalized = path.resolve(f);
+      const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduplicated.push(f);
+      }
+    }
+    return deduplicated;
+  }
+
+  /**
    * Maps already-validated repository-root context paths into the would-be
    * worktree (the worktree mirrors the repository root, so the repo-relative
    * path is the worktree-relative path). This keeps worker-visible paths
    * inside the worktree (no main-repository path leakage) and rejects, with a
    * typed 400, files that would not exist inside the worktree (for example
    * untracked files under .deepseek-worktrees) before any side effect.
+   * Explicitly allowlisted global files outside the repository are preserved
+   * as their canonical external paths.
    */
-  private mapContextIntoWorktree(workspacePath: string, repositoryRoot: string, files: string[]): string[] {
+  private mapContextIntoWorktree(
+    workspacePath: string,
+    repositoryRoot: string,
+    files: string[],
+    allowedExternalFiles: string[] = [],
+  ): string[] {
     return files.map((file) => {
+      if (allowedExternalFiles.some((allowed) => isSamePath(allowed, file))) {
+        return file;
+      }
       const relative = path.relative(repositoryRoot, file);
       if (relative === ".deepseek-worktrees" || relative.startsWith(".deepseek-worktrees" + path.sep)) {
         throw new InvalidRequestError(

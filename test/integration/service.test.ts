@@ -4761,3 +4761,180 @@ test("startup recovery preserves completed_partial and timed_out statuses when j
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("MCP or governance task automatically includes global GEMINI.md when present", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-gov-"));
+  const globalDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-global-gemini-"));
+  const globalGeminiPath = path.join(globalDir, "GEMINI.md");
+  await writeFile(globalGeminiPath, "# Global Gemini Governance Rules\n", "utf8");
+
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    globalGeminiContextPath: globalGeminiPath,
+  }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+  });
+  try {
+    await service.start();
+
+    // 1. MCP task should include the global file
+    const mcpAccepted = await service.spawn({
+      requestId: "request_gov_mcp",
+      topic: "MCP Configuration",
+      task: "Configure the weather MCP server",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(mcpAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 1);
+    const mcpPrompt = client.promptCalls[0]?.task ?? "";
+    assert.ok(mcpPrompt.includes(path.normalize(globalGeminiPath)), "MCP task must include global GEMINI.md path");
+
+    // 2. PromptPad task should include the global file
+    const promptPadAccepted = await service.spawn({
+      requestId: "request_gov_promptpad",
+      topic: "PromptPad Integration",
+      task: "Update PromptPad templates for prompt formatting",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(promptPadAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 2);
+    const promptPadPrompt = client.promptCalls[1]?.task ?? "";
+    assert.ok(promptPadPrompt.includes(path.normalize(globalGeminiPath)), "PromptPad task must include global GEMINI.md path");
+
+    // 3. Skill governance task should include the global file
+    const skillAccepted = await service.spawn({
+      requestId: "request_gov_skill",
+      topic: "Skill management",
+      task: "Create a new skill for repository automation",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(skillAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 3);
+    const skillPrompt = client.promptCalls[2]?.task ?? "";
+    assert.ok(skillPrompt.includes(path.normalize(globalGeminiPath)), "Skill task must include global GEMINI.md path");
+
+    // 4. AGENTS.md / GEMINI.md task should include the global file
+    const agentsAccepted = await service.spawn({
+      requestId: "request_gov_agents",
+      topic: "Agents governance",
+      task: "Review AGENTS.md instructions and rules",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(agentsAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 4);
+    const agentsPrompt = client.promptCalls[3]?.task ?? "";
+    assert.ok(agentsPrompt.includes(path.normalize(globalGeminiPath)), "AGENTS.md task must include global GEMINI.md path");
+
+    // 5. Normal task must NOT include the global file
+    const normalAccepted = await service.spawn({
+      requestId: "request_gov_normal",
+      topic: "Normal Task",
+      task: "Fix math addition function bug in calculate.ts",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(normalAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 5);
+    const normalPrompt = client.promptCalls[4]?.task ?? "";
+    assert.equal(normalPrompt.includes(path.normalize(globalGeminiPath)), false, "Normal task must not include global GEMINI.md");
+    assert.ok(normalPrompt.includes("No additional context files were supplied."));
+
+    // 6. Explicit context files preservation and deduplication
+    await writeFile(path.join(directory, "local.txt"), "local content\n", "utf8");
+    const explicitAccepted = await service.spawn({
+      requestId: "request_gov_dedup",
+      topic: "MCP with explicit files",
+      task: "Configure MCP server with local notes",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["local.txt", globalGeminiPath],
+    });
+    assert.equal(explicitAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 6);
+    const dedupPrompt = client.promptCalls[5]?.task ?? "";
+    assert.ok(dedupPrompt.includes(path.normalize(path.join(directory, "local.txt"))), "explicit local file preserved");
+    // Global file must appear exactly once, not duplicated
+    const occurrences = dedupPrompt.split(path.normalize(globalGeminiPath)).length - 1;
+    assert.equal(occurrences, 1, "global GEMINI.md must not be duplicated");
+
+    // 7. Non-existent global file does not break spawn for an MCP task
+    await rm(globalGeminiPath, { force: true });
+    const missingGlobalAccepted = await service.spawn({
+      requestId: "request_gov_missing_global",
+      topic: "MCP with missing global file",
+      task: "Configure MCP server without global file",
+      cwd: directory,
+      mode: "analyze",
+    });
+    assert.equal(missingGlobalAccepted.accepted, true);
+    assert.equal(client.promptCalls.length, 7);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(globalDir, { recursive: true, force: true });
+  }
+});
+
+test("worktree strategy preserves global GEMINI.md canonical path without escape error", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-worktree-gov-"));
+  const globalDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-worktree-global-"));
+  const globalGeminiPath = path.join(globalDir, "GEMINI.md");
+  await writeFile(globalGeminiPath, "# Global Gemini Rules\n", "utf8");
+
+  await git(directory, "init", "-q");
+  await writeFile(path.join(directory, "tracked.txt"), "tracked content\n", "utf8");
+  await git(directory, "add", "tracked.txt");
+  await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
+
+  const dataDir = path.join(path.dirname(directory), path.basename(directory) + "-data");
+  await mkdir(dataDir, { recursive: true });
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const service = new BridgeService(createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    globalGeminiContextPath: globalGeminiPath,
+  }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+  });
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_worktree_gov_ok",
+      topic: "Worktree MCP task",
+      task: "Configure MCP tools for repository",
+      cwd: directory,
+      mode: "edit",
+      workspaceStrategy: "worktree",
+      contextFiles: ["tracked.txt"],
+    });
+    assert.equal(accepted.accepted, true);
+    assert.equal(client.promptCalls.length, 1);
+    const prompt = client.promptCalls[0]?.task ?? "";
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    // Tracked file mapped inside worktree
+    const worktreeTracked = path.normalize(path.join(agent.workspacePath, "tracked.txt"));
+    assert.ok(prompt.includes("FILE: " + worktreeTracked), "tracked file is mapped inside worktree");
+    // Global file kept as canonical external path
+    assert.ok(prompt.includes("FILE: " + path.normalize(globalGeminiPath)), "global GEMINI.md path preserved in worktree mode");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(globalDir, { recursive: true, force: true });
+  }
+});

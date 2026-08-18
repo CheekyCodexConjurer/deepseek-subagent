@@ -20,6 +20,8 @@ export interface PromptBuildOptions {
   contextFileDelivery?: "inline" | "reference";
   /** Optional provider-specific upper bound for the complete prompt. */
   maxPromptLength?: number;
+  /** Optional explicitly allowlisted external context files (e.g. global GEMINI.md). */
+  allowedExternalFiles?: string[];
 }
 
 export const MAX_VISUAL_CONTEXT_LENGTH = 20_000;
@@ -65,7 +67,7 @@ export async function buildWorkerPrompt(
   const mode = "mode" in input ? input.mode ?? "analyze" : undefined;
   const workspaceStrategy = "workspaceStrategy" in input ? input.workspaceStrategy ?? "shared" : "shared";
   const context = "contextFiles" in input ? input.contextFiles ?? [] : [];
-  const absoluteContext = validateContextFiles(workspacePath, context);
+  const absoluteContext = validateContextFiles(workspacePath, context, options.allowedExternalFiles);
   const contextText = absoluteContext.length === 0
     ? "No additional context files were supplied."
     : await readContextFiles(absoluteContext, options.contextFileDelivery ?? "inline");

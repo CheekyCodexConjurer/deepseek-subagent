@@ -362,6 +362,7 @@ export interface BridgeConfig {
   defaultModelRoute: string;
   retentionMode: RetentionMode;
   maxContextFileBytes: number;
+  globalGeminiContextPath: string;
 }
 
 export interface DoctorCheck {
