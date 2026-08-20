@@ -6,6 +6,7 @@ import { newId, redactSecrets, truncate } from "./security.js";
 import type {
   ActivityType,
   AgentActivity,
+  AgentMode,
   AgentRecord,
   AgentStatus,
   CodexBinding,
@@ -192,6 +193,30 @@ export class BridgeStore {
     if (!routeStateMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?)").run(new Date().toISOString());
     }
+    const agentCols = this.db.prepare("PRAGMA table_info(agents)").all() as Row[];
+    if (!agentCols.some((column) => column.name === "mode")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN mode TEXT NOT NULL DEFAULT 'analyze'");
+    }
+    const modeMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 11").get() as Row | undefined;
+    if (!modeMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(11, ?)").run(new Date().toISOString());
+    }
+    const jobCols = this.db.prepare("PRAGMA table_info(jobs)").all() as Row[];
+    for (const [name, definition] of [
+      ["fallback_from", "TEXT"],
+      ["fallback_to", "TEXT"],
+      ["fallback_reason", "TEXT"],
+      ["fallback_status", "TEXT"],
+      ["fallback_count", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      if (!jobCols.some((column) => column.name === name)) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition);
+      }
+    }
+    const fallbackMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 12").get() as Row | undefined;
+    if (!fallbackMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(12, ?)").run(new Date().toISOString());
+    }
   }
 
   /** True only when no business rows exist at all (fresh database). */
@@ -244,6 +269,7 @@ export class BridgeStore {
     repositoryRoot: string;
     workspacePath: string;
     workspaceStrategy: WorkspaceStrategy;
+    mode?: AgentMode;
     opencodeServerId: string;
     opencodeSessionId: string;
     modelProviderId: string;
@@ -253,13 +279,14 @@ export class BridgeStore {
     parentAgentId?: string | null;
   }): AgentRecord {
     const now = new Date().toISOString();
-    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,model_route,parent_agent_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+    this.db.prepare("INSERT INTO agents (id,title,topic,repository_root,workspace_path,workspace_strategy,mode,opencode_server_id,opencode_session_id,model_provider_id,model_id,model_variant,model_route,parent_agent_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
       input.id,
       input.title,
       input.topic,
       input.repositoryRoot,
       input.workspacePath,
       input.workspaceStrategy,
+      input.mode ?? "analyze",
       input.opencodeServerId,
       input.opencodeSessionId,
       input.modelProviderId,
@@ -275,6 +302,7 @@ export class BridgeStore {
     if (!agent) throw new Error("Agent was not persisted");
     return agent;
   }
+
 
   createJob(input: { id: string; agentId: string; kind: JobKind; requestId: string; promptHash: string }): JobRecord {
     const sequenceRow = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM jobs WHERE agent_id = ?").get(input.agentId) as Row;
@@ -433,7 +461,41 @@ export class BridgeStore {
     return job;
   }
 
+  setJobFallback(id: string, input: { from: string; to: string; reason: string; status: string; count?: number }): JobRecord {
+    this.db.prepare("UPDATE jobs SET fallback_from = ?, fallback_to = ?, fallback_reason = ?, fallback_status = ?, fallback_count = ? WHERE id = ?").run(
+      input.from,
+      input.to,
+      input.reason,
+      input.status,
+      input.count ?? 1,
+      id,
+    );
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  updateJobFallbackStatus(id: string, status: string): JobRecord {
+    this.db.prepare("UPDATE jobs SET fallback_status = ? WHERE id = ?").run(status, id);
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  updateAgentSession(id: string, serverId: string, sessionId: string): AgentRecord {
+    this.db.prepare("UPDATE agents SET opencode_server_id = ?, opencode_session_id = ?, updated_at = ? WHERE id = ?").run(
+      serverId,
+      sessionId,
+      new Date().toISOString(),
+      id,
+    );
+    const agent = this.getAgent(id);
+    if (!agent) throw new Error("Agent disappeared: " + id);
+    return agent;
+  }
+
   countJobsWithCorrelationHints(): number {
+
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE hint_thread_id IS NOT NULL OR hint_turn_id IS NOT NULL").get() as Row;
     return numberValue(row, "count");
   }
@@ -760,6 +822,7 @@ export class BridgeStore {
       repositoryRoot: stringValue(row, "repository_root"),
       workspacePath: stringValue(row, "workspace_path"),
       workspaceStrategy: stringValue(row, "workspace_strategy") as WorkspaceStrategy,
+      mode: (nullableString(row, "mode") as AgentMode) ?? "analyze",
       opencodeServerId: stringValue(row, "opencode_server_id"),
       opencodeSessionId: stringValue(row, "opencode_session_id"),
       modelProviderId: stringValue(row, "model_provider_id"),
@@ -804,8 +867,14 @@ export class BridgeStore {
       hintSource: nullableString(row, "hint_source"),
       dispatchUnknown: numberValue(row, "dispatch_unknown") === 1,
       resultConsumedAt: nullableString(row, "result_consumed_at"),
+      fallbackFrom: nullableString(row, "fallback_from"),
+      fallbackTo: nullableString(row, "fallback_to"),
+      fallbackReason: nullableString(row, "fallback_reason"),
+      fallbackStatus: nullableString(row, "fallback_status"),
+      fallbackCount: typeof row.fallback_count === "number" || typeof row.fallback_count === "bigint" ? Number(row.fallback_count) : 0,
     };
   }
+
 
   private toActivity(row: Row): AgentActivity {
     return {

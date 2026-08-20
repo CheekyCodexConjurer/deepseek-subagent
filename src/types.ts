@@ -129,6 +129,7 @@ export interface AgentRecord {
   repositoryRoot: string;
   workspacePath: string;
   workspaceStrategy: WorkspaceStrategy;
+  mode?: AgentMode;
   opencodeServerId: string;
   opencodeSessionId: string;
   modelProviderId: string;
@@ -172,7 +173,13 @@ export interface JobRecord {
   hintSource: string | null;
   dispatchUnknown: boolean;
   resultConsumedAt: string | null;
+  fallbackFrom?: string | null;
+  fallbackTo?: string | null;
+  fallbackReason?: string | null;
+  fallbackStatus?: string | null;
+  fallbackCount?: number;
 }
+
 
 export type ActivityType =
   | "dispatch"
@@ -325,6 +332,12 @@ export interface ResultEnvelope {
   gracefulFinalize?: boolean;
   partial?: boolean;
   workerAborted?: boolean;
+  fallback?: {
+    from: string;
+    to: string;
+    reason: string;
+    status: string;
+  };
 }
 
 export interface BridgeConfig {
@@ -358,6 +371,7 @@ export interface BridgeConfig {
   antigravityAddDirs: string[];
   antigravityAutoApprovePermissions: boolean;
   antigravityCommand: string | null;
+  antigravityTimeoutFallbackRoute: string | null;
   modelRoutes: ModelRoute[];
   defaultModelRoute: string;
   retentionMode: RetentionMode;
@@ -365,6 +379,7 @@ export interface BridgeConfig {
   globalGeminiContextPath: string;
   backupDir: string;
 }
+
 
 export interface BackupManifest {
   version: 1;

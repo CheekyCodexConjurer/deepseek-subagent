@@ -201,6 +201,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     antigravityAddDirs: asAbsoluteStringArray(overrides.antigravityAddDirs),
     antigravityAutoApprovePermissions: overrides.antigravityAutoApprovePermissions === true,
     antigravityCommand: asNullableCommand(overrides.antigravityCommand),
+    antigravityTimeoutFallbackRoute: asNullableString(overrides.antigravityTimeoutFallbackRoute),
     modelRoutes,
     defaultModelRoute: overrides.defaultModelRoute ?? defaultRouteName(modelRoutes),
     retentionMode: overrides.retentionMode ?? "disabled",
@@ -266,6 +267,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       antigravityAddDirs,
       antigravityAutoApprovePermissions,
       antigravityCommand: asNullableCommand(raw.antigravityCommand),
+      antigravityTimeoutFallbackRoute: asNullableString(raw.antigravityTimeoutFallbackRoute),
       modelRoutes,
       defaultModelRoute: configuredDefaultRoute,
       retentionMode,
@@ -273,6 +275,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       globalGeminiContextPath: asString(raw.globalGeminiContextPath, defaults.globalGeminiContextPath),
       backupDir: asString(raw.backupDir, path.join(dataDir, "backups")),
     };
+
   } catch {
     return defaults;
   }

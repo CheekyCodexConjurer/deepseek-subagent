@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { canRead, defaultWorkspace, assertInside, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
-import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions } from "./prompts.js";
+import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions, type WorkerPromptInput } from "./prompts.js";
 import { BridgeStore } from "./store.js";
 import { InboxDelivery } from "./delivery/inbox.js";
 import {
@@ -15,7 +15,9 @@ import {
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
+import { AntigravityProcessError } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
+
 import type { AntigravityRunResult } from "./antigravity/types.js";
 import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
@@ -439,6 +441,7 @@ export class BridgeService {
         repositoryRoot,
         workspacePath: createdWorkspace,
         workspaceStrategy: strategy,
+        mode,
         opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown"),
         opencodeSessionId: session?.id ?? "antigravity:" + agentId,
         modelProviderId: route.providerId,
@@ -459,7 +462,7 @@ export class BridgeService {
       this.persistCorrelationHint(job, input.threadId, input.turnId);
       // MCP arguments are not proof of origin. A new binding is accepted only
       // after the configured App Server reports this job in item/completed.
-      return this.dispatch(agent, job, prompt);
+      return this.dispatch(agent, job, prompt, { ...input, mode, workspaceStrategy: strategy }, contextFiles);
     });
   }
 
@@ -501,7 +504,7 @@ export class BridgeService {
       });
       this.persistCorrelationHint(job, input.threadId, input.turnId);
       if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
-      return this.dispatch(agent, job, prompt);
+      return this.dispatch(agent, job, prompt, input);
     });
   }
 
@@ -528,13 +531,14 @@ export class BridgeService {
     if (!TERMINAL_JOB_STATUSES.has(lastJob.status) || !lastJob.resultPath) {
       throw new ConflictError("Agent was closed without a persisted result; it cannot be resumed", "not_continuable");
     }
+
+    const childId = newId("agent");
     const workspacePath = agent.workspacePath;
     const title = normalizeTitle(agent.topic);
-    const childId = newId("agent");
     const isAntigravity = agent.modelProviderId === "antigravity";
     const prompt = await buildWorkerPrompt({
       task: input.task,
-      relation: input.relation,
+      relation: input.relation ?? "followup",
       ...(input.visualContext ? { visualContext: input.visualContext } : {}),
     }, workspacePath, workerPromptOptions(this.config, isAntigravity));
     const session = isAntigravity
@@ -547,6 +551,7 @@ export class BridgeService {
       repositoryRoot: agent.repositoryRoot,
       workspacePath,
       workspaceStrategy: agent.workspaceStrategy,
+      mode: agent.mode ?? "analyze",
       opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? agent.opencodeServerId),
       opencodeSessionId: session?.id ?? "antigravity:" + childId,
       modelProviderId: agent.modelProviderId,
@@ -575,7 +580,7 @@ export class BridgeService {
     }
     this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child.id + " after job " + lastJob.id);
     this.recordActivity(child, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new " + (session?.id ? "OpenCode session " + session.id : "Antigravity run (no OpenCode session)"));
-    return this.dispatch(child, job, prompt);
+    return this.dispatch(child, job, prompt, input);
   }
 
   async consult(input: ConsultInput): Promise<ProgressSnapshot> {
@@ -640,6 +645,7 @@ export class BridgeService {
     this.clearApprovalTimer(agentId);
     this.store.setApprovalDeadline(active.id, null);
     let remoteError: string | null = null;
+    const isAntigravityWithoutSession = agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"));
     if (agent.modelProviderId === "antigravity") {
       const controller = this.antigravityAbortControllers.get(active.id);
       if (controller) {
@@ -647,10 +653,11 @@ export class BridgeService {
         this.recordActivity(agent, active, "abort", "Sent abort signal to the active Antigravity process tree");
       } else if (active.status === "created") {
         this.recordActivity(agent, active, "abort", "Abort landed before Antigravity dispatch; the launch will be prevented");
-      } else {
+      } else if (isAntigravityWithoutSession) {
         this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
       }
-    } else {
+    }
+    if (!isAntigravityWithoutSession) {
       try {
         await this.clientOrThrow().abort(agent.opencodeSessionId);
       } catch (error) {
@@ -658,6 +665,7 @@ export class BridgeService {
       }
     }
     const localReason = reason ?? (remoteError ? "Abort requested; remote abort failed: " + remoteError : "Aborted by orchestrator");
+
     if (active.status !== "aborted") this.store.updateJobStatus(active.id, "aborted", localReason);
     // Aborted agents are non-continuable; auto-close them safely.
     if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", reason ?? null);
@@ -866,7 +874,18 @@ export class BridgeService {
     };
   }
 
-  private dispatchOptions(agent: AgentRecord): { providerId: string; modelId: string; variant?: string; agent?: string } {
+  private dispatchOptions(agent: AgentRecord, job?: JobRecord | null): { providerId: string; modelId: string; variant?: string; agent?: string } {
+    if (job?.fallbackTo) {
+      try {
+        const fallbackRoute = this.resolveRouteByName(job.fallbackTo);
+        return {
+          providerId: fallbackRoute.providerId,
+          modelId: fallbackRoute.modelId,
+          ...(fallbackRoute.variant ? { variant: fallbackRoute.variant } : {}),
+          ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
+        };
+      } catch {}
+    }
     const route = this.resolveAgentRoute(agent);
     return {
       providerId: route.providerId,
@@ -875,6 +894,7 @@ export class BridgeService {
       ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
     };
   }
+
 
   /**
    * Resolves candidate context files for a task, automatically including the
@@ -1093,13 +1113,13 @@ export class BridgeService {
   }
 
   private async requestGracefulFinalize(agent: AgentRecord, job: JobRecord): Promise<void> {
-    if (agent.modelProviderId === "antigravity") {
+    if (agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"))) {
       this.recordActivity(agent, job, "finalize", "Antigravity has no OpenCode session to finalize; the follow deadline settles the job");
       return;
     }
     const client = this.clientOrThrow();
     try {
-      await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent));
+      await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent, job));
       this.recordActivity(agent, job, "finalize", "Graceful finalization prompt submitted in the same OpenCode session");
     } catch (error) {
       if (isUnknownDispatchOutcome(error)) {
@@ -1117,7 +1137,7 @@ export class BridgeService {
         this.recordActivity(agent, job, "error", "OpenCode abort failed during graceful finalization");
       }
       try {
-        await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent));
+        await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent, job));
         this.recordActivity(agent, job, "finalize", "Graceful finalization prompt resubmitted in the same OpenCode session");
       } catch {
         this.recordActivity(agent, job, "error", "Graceful finalization could not be submitted after the busy turn was aborted");
@@ -1133,20 +1153,21 @@ export class BridgeService {
     const reason = "Follow deadline and graceful-finalize grace period expired";
     this.store.updateJobStatus(job.id, "timed_out", reason);
     if (agent.status === "working") this.store.updateAgentStatus(agent.id, "timed_out", reason);
-    const isAntigravity = agent.modelProviderId === "antigravity";
-    this.recordActivity(agent, this.store.getJob(job.id), "deadline", isAntigravity
+    const isAntigravityWithoutSession = agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"));
+    this.recordActivity(agent, this.store.getJob(job.id), "deadline", isAntigravityWithoutSession
       ? "Follow grace period expired; the Antigravity process will be aborted"
       : "Grace period expired; the worker will be aborted and partial evidence captured");
     let abortError: string | null = null;
-    if (isAntigravity) {
+    if (agent.modelProviderId === "antigravity") {
       const controller = this.antigravityAbortControllers.get(job.id);
       if (controller) {
         controller.abort();
         this.recordActivity(agent, this.store.getJob(job.id), "abort", "Sent abort signal to the Antigravity process tree after the follow grace period");
-      } else {
+      } else if (isAntigravityWithoutSession) {
         this.recordActivity(agent, this.store.getJob(job.id), "error", "Antigravity process was no longer controllable at the follow grace expiry");
       }
-    } else {
+    }
+    if (!isAntigravityWithoutSession) {
       try {
         await this.clientOrThrow().abort(agent.opencodeSessionId);
       } catch (error) {
@@ -1177,10 +1198,11 @@ export class BridgeService {
   }
 
   private async captureTimedOutEvidence(agent: AgentRecord, job: JobRecord): Promise<Awaited<ReturnType<typeof persistResult>> | null> {
-    if (agent.modelProviderId === "antigravity") {
+    if (agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"))) {
       this.recordActivity(agent, job, "error", "Antigravity has no session messages to capture as timeout evidence");
       return null;
     }
+
     try {
       const messages = await this.clientOrThrow().listMessages(agent.opencodeSessionId);
       const diff = await this.clientOrThrow().getDiff(agent.opencodeSessionId);
@@ -1355,9 +1377,15 @@ export class BridgeService {
     }
   }
 
-  private async dispatch(agent: AgentRecord, job: JobRecord, prompt: string): Promise<AcceptedOperation> {
+  private async dispatch(
+    agent: AgentRecord,
+    job: JobRecord,
+    prompt: string,
+    workerInput?: WorkerPromptInput,
+    contextFiles?: string[],
+  ): Promise<AcceptedOperation> {
     if (agent.modelProviderId === "antigravity") {
-      return this.dispatchAntigravity(agent, job, prompt);
+      return this.dispatchAntigravity(agent, job, prompt, workerInput, contextFiles);
     }
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
@@ -1366,7 +1394,7 @@ export class BridgeService {
       if (baselineAssistantMessageId) this.store.setJobMessages(job.id, null, baselineAssistantMessageId);
     }
     try {
-      await this.clientOrThrow().promptAsync(jobAgentSession(agent), prompt, this.dispatchOptions(agent));
+      await this.clientOrThrow().promptAsync(jobAgentSession(agent), prompt, this.dispatchOptions(agent, job));
       const current = this.store.getJob(job.id);
       if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
       this.recordActivity(agent, job, "dispatch", "Dispatched task to the OpenCode session");
@@ -1414,9 +1442,7 @@ export class BridgeService {
    * creation; the agy executable runs once via the AntigravityAdapter (never
    * OpenCode, never a session) in a background task, and completion/result
    * persistence/delivery happen asynchronously so deepseek_follow observes
-   * them. Exactly one spawn per dispatch; any failure marks the job/agent
-   * failed and settles waiting followers. There is never a fallback to
-   * OpenCode or any other provider.
+   * them.
    *
    * Pre-dispatch abort race: an abort that lands between job creation and
    * this point (job still "created", agent already closed/aborted) must
@@ -1425,7 +1451,13 @@ export class BridgeService {
    * before launching, so a closed/aborted agent is never transitioned back
    * to working and no result is ever delivered for an aborted job.
    */
-  private dispatchAntigravity(agent: AgentRecord, job: JobRecord, prompt: string): AcceptedOperation {
+  private dispatchAntigravity(
+    agent: AgentRecord,
+    job: JobRecord,
+    prompt: string,
+    workerInput?: WorkerPromptInput,
+    contextFiles?: string[],
+  ): AcceptedOperation {
     const controller = new AbortController();
     this.antigravityAbortControllers.set(job.id, controller);
     const currentJob = this.store.getJob(job.id);
@@ -1438,7 +1470,7 @@ export class BridgeService {
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
     this.store.updateJobStatus(job.id, "running");
-    void this.runAntigravityAsync(agent, job, prompt, controller).catch((error: unknown) => {
+    void this.runAntigravityAsync(agent, job, prompt, controller, workerInput, contextFiles).catch((error: unknown) => {
       if (this.running) this.lastStreamError = redactSecrets(String(error));
     });
     return this.accepted(this.store.getJob(job.id) ?? job);
@@ -1449,7 +1481,14 @@ export class BridgeService {
    * envelope, completes the job, delivers it and settles any waiting follow.
    * Runs fire-and-forget after spawn acceptance; never throws to the caller.
    */
-  private async runAntigravityAsync(agent: AgentRecord, job: JobRecord, prompt: string, controller: AbortController): Promise<void> {
+  private async runAntigravityAsync(
+    agent: AgentRecord,
+    job: JobRecord,
+    prompt: string,
+    controller: AbortController,
+    workerInput?: WorkerPromptInput,
+    contextFiles?: string[],
+  ): Promise<void> {
     try {
       const result: AntigravityRunResult = await this.antigravity.runPrompt({
         prompt,
@@ -1504,6 +1543,10 @@ export class BridgeService {
         this.lastStreamError = message;
         return;
       }
+      if (this.isEligibleForTimeoutFallback(agent, current ?? job, error)) {
+        await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
+        return;
+      }
       if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
@@ -1515,6 +1558,126 @@ export class BridgeService {
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
   }
+
+  private isEligibleForTimeoutFallback(agent: AgentRecord, job: JobRecord, error: unknown): boolean {
+    if (!(error instanceof AntigravityProcessError) || error.kind !== "timeout") return false;
+    if (!this.config.antigravityTimeoutFallbackRoute) return false;
+    const mode = agent.mode ?? "analyze";
+    if (mode !== "analyze") return false;
+    if ((job.fallbackCount ?? 0) > 0 || Boolean(job.fallbackStatus)) return false;
+    if (job.status === "aborted" || agent.status === "aborted" || agent.status === "closed") return false;
+    try {
+      const target = this.resolveRouteByName(this.config.antigravityTimeoutFallbackRoute);
+      if (target.providerId !== "opencode-go") return false;
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+
+  private async executeTimeoutFallback(
+    agent: AgentRecord,
+    job: JobRecord,
+    error: AntigravityProcessError,
+    controller: AbortController,
+    workerInput?: WorkerPromptInput,
+    contextFiles?: string[],
+  ): Promise<void> {
+    if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") return;
+    const fallbackRoute = this.resolveRouteByName(this.config.antigravityTimeoutFallbackRoute!);
+    this.store.setJobFallback(job.id, {
+      from: agent.modelRoute ?? agent.modelProviderId,
+      to: fallbackRoute.name,
+      reason: error.message,
+      status: "attempted",
+      count: 1,
+    });
+    this.recordActivity(
+      agent,
+      job,
+      "dispatch",
+      "Antigravity process timed out; executing fallback to OpenCode route " + fallbackRoute.name + " (" + fallbackRoute.display + ")",
+    );
+
+    const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
+    const promptOptions = workerPromptOptions(this.config, false, allowedExternalFiles);
+    const opencodePrompt = await buildWorkerPrompt(
+      {
+        ...(workerInput ?? { task: agent.topic }),
+        contextFiles: contextFiles ?? [],
+        mode: agent.mode ?? "analyze",
+        workspaceStrategy: agent.workspaceStrategy,
+      },
+      agent.workspacePath,
+      promptOptions,
+    );
+
+    const client = this.clientOrThrow();
+    let session: { id: string };
+    try {
+      session = await client.createSession(agent.workspacePath, agent.title);
+    } catch (sessionError) {
+      const message = redactSecrets(String(sessionError));
+      this.store.updateJobFallbackStatus(job.id, "failed");
+      const current = this.store.getJob(job.id);
+      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
+      this.recordActivity(agent, job, "error", "Failed to create OpenCode session for fallback: " + message);
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, { status: "failed", error: message });
+      }
+      return;
+    }
+
+    if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") {
+      await client.abort(session.id).catch(() => {});
+      return;
+    }
+
+    const updatedAgent = this.store.updateAgentSession(agent.id, this.managed?.serverId ?? "unknown", session.id);
+    this.recordActivity(updatedAgent, job, "dispatch", "Created OpenCode session " + session.id + " for timeout fallback");
+
+    const dispatchOpts = {
+      providerId: fallbackRoute.providerId,
+      modelId: fallbackRoute.modelId,
+      ...(fallbackRoute.variant ? { variant: fallbackRoute.variant } : {}),
+      ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
+    };
+
+    try {
+      await client.promptAsync(session.id, opencodePrompt, dispatchOpts);
+      const current = this.store.getJob(job.id);
+      if (current && current.status === "dispatching") this.store.updateJobStatus(job.id, "running");
+      this.recordActivity(updatedAgent, job, "dispatch", "Dispatched task to fallback OpenCode session");
+    } catch (dispatchError) {
+      const message = redactSecrets(String(dispatchError));
+      if (isUnknownDispatchOutcome(dispatchError)) {
+        this.store.markDispatchUnknown(job.id);
+        this.recordActivity(updatedAgent, this.store.getJob(job.id), "error", "Fallback OpenCode dispatch outcome is unknown after a transport failure; the job stays active");
+        const pending = this.store.getJob(job.id) ?? job;
+        this.ensureFollowLifecycle(
+          pending,
+          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+          true,
+        );
+        this.store.setJobError(job.id, "Fallback dispatch outcome unknown after a transport failure: " + message);
+        return;
+      }
+      this.store.updateJobFallbackStatus(job.id, "failed");
+      const current = this.store.getJob(job.id);
+      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
+      this.recordActivity(updatedAgent, job, "error", "Fallback OpenCode rejected task dispatch: " + message);
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, { status: "failed", error: message });
+      }
+    }
+  }
+
 
   private async resumeApproval(agent: AgentRecord, job: JobRecord, prompt: string): Promise<AcceptedOperation> {
     this.clearApprovalTimer(agent.id);
@@ -1702,7 +1865,11 @@ export class BridgeService {
     }
     const partial = currentJob.status === "finalizing" || currentJob.gracefulFinalizeAttempted;
     if (currentJob.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-    const stored = await persistResult(this.config.dataDir, currentAgent, currentJob, messages, diff, this.config.maxResultLength, {
+    if (currentJob.fallbackTo) {
+      this.store.updateJobFallbackStatus(job.id, "succeeded");
+    }
+    const jobToPersist = this.store.getJob(job.id) ?? currentJob;
+    const stored = await persistResult(this.config.dataDir, currentAgent, jobToPersist, messages, diff, this.config.maxResultLength, {
       ...(partial ? {
         statusOverride: "completed_partial",
         deadlineReached: true,
@@ -1710,6 +1877,7 @@ export class BridgeService {
         partial: true,
       } : {}),
     });
+
     this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
     this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
     const completedJob = this.store.getJob(job.id) ?? job;
@@ -1908,6 +2076,12 @@ export class BridgeService {
         continue;
       }
       if (agent?.modelProviderId === "antigravity" && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
+        if (agent.opencodeSessionId && !agent.opencodeSessionId.startsWith("antigravity:")) {
+          await this.reconcileJob(job).catch((error) => {
+            this.lastStreamError = redactSecrets(String(error));
+          });
+          continue;
+        }
         // The Antigravity run lives in the daemon's in-memory provider and
         // process handle. After a daemon loss there is no way to recover,
         // await or abort it, so the stranded job is terminalized with a clear

@@ -290,3 +290,26 @@ test("retention and context file bounds default to safe values and survive a loa
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("antigravityTimeoutFallbackRoute defaults to null and survives a load round trip", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-fallback-"));
+  const configPath = path.join(directory, "config.json");
+  try {
+    const defaults = createDefaultConfig({ dataDir: directory, configPath });
+    assert.equal(defaults.antigravityTimeoutFallbackRoute, null);
+    await writeFile(configPath, JSON.stringify({
+      ...defaults,
+      antigravityTimeoutFallbackRoute: "flash-max",
+    }), "utf8");
+    const loaded = await loadConfig(configPath);
+    assert.equal(loaded.antigravityTimeoutFallbackRoute, "flash-max");
+    await writeFile(configPath, JSON.stringify({
+      ...defaults,
+      antigravityTimeoutFallbackRoute: "",
+    }), "utf8");
+    const emptyLoaded = await loadConfig(configPath);
+    assert.equal(emptyLoaded.antigravityTimeoutFallbackRoute, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

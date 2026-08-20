@@ -4938,3 +4938,453 @@ test("worktree strategy preserves global GEMINI.md canonical path without escape
     await rm(globalDir, { recursive: true, force: true });
   }
 });
+
+test("antigravity timeout triggers exactly one internal fallback to enabled OpenCode route for analyze mode", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-fallback-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-fallback-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  await writeFile(path.join(directory, "context.txt"), "Important analyze context data", "utf8");
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "flash-max",
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 100,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_timeout_fallback_ok",
+      topic: "Analyze timeout failover",
+      task: "Inspect repository and analyze architecture",
+      cwd: directory,
+      mode: "analyze",
+      contextFiles: ["context.txt"],
+      modelRoute: "antigravity-flash-high",
+    });
+
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.7 Flash High");
+
+    // Wait for Antigravity timeout to trigger OpenCode fallback
+    await waitForCondition(() => client.promptCalls.length === 1, 3_000);
+
+    assert.equal(agyCalls.length, 1, "exactly one agy execution was attempted");
+    assert.equal(client.sessionCount, 1, "real OpenCode session created on fallback");
+    assert.equal(client.promptCalls.length, 1, "reconstructed prompt dispatched to OpenCode");
+
+    const prompt = client.promptCalls[0]?.task ?? "";
+    assert.ok(prompt.includes("Important analyze context data"), "OpenCode prompt received reconstructed inline context");
+    assert.ok(prompt.includes("Inspect repository and analyze architecture"), "OpenCode prompt received original task");
+
+    // Verify agent primary route identity is preserved
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    assert.equal(agent.modelRoute, "antigravity-flash-high", "primary route name preserved on agent");
+    assert.equal(agent.modelProviderId, "antigravity", "primary provider preserved on agent");
+    assert.equal(agent.modelId, "gemini-3.7-flash-high", "primary model id preserved on agent");
+    assert.notEqual(agent.opencodeSessionId, "antigravity:" + agent.id, "real OpenCode session ID bound to agent");
+
+    // Verify fallback audit on job
+    const jobBeforeComplete = store.getJob(accepted.jobId);
+    assert.ok(jobBeforeComplete);
+    assert.equal(jobBeforeComplete.fallbackFrom, "antigravity-flash-high");
+    assert.equal(jobBeforeComplete.fallbackTo, "flash-max");
+    assert.equal(jobBeforeComplete.fallbackCount, 1);
+    assert.ok(jobBeforeComplete.fallbackReason?.includes("did not finish within"), "fallback reason captured timeout error");
+
+    // Emit OpenCode completion event
+    client.messages = [{
+      info: { id: "msg_fallback_res", role: "assistant", sessionID: agent.opencodeSessionId },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: Fallback analysis completed successfully.\nFILES:\n- none\nTESTS:\n- none\nRISKS:\n- none" }],
+    }];
+
+    await client.emit({
+      type: "session.idle",
+      properties: { sessionID: agent.opencodeSessionId, status: "idle" },
+    });
+
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "delivered", 2_000);
+
+    const completedJob = store.getJob(accepted.jobId);
+    assert.ok(completedJob);
+    assert.equal(completedJob.status, "delivered");
+    assert.equal(completedJob.fallbackStatus, "succeeded");
+
+    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    assert.equal(followed.status, "completed");
+    assert.equal(followed.result?.envelope.summary, "Fallback analysis completed successfully.");
+
+    const persisted = JSON.parse(await readFile(completedJob.resultPath!, "utf8")) as { envelope: ResultEnvelope };
+    assert.equal(persisted.envelope.status, "completed");
+    assert.equal(persisted.envelope.summary, "Fallback analysis completed successfully.");
+    assert.ok(persisted.envelope.fallback);
+    assert.equal(persisted.envelope.fallback.from, "antigravity-flash-high");
+    assert.equal(persisted.envelope.fallback.to, "flash-max");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity timeout does not fall back when antigravityTimeoutFallbackRoute is null", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-null-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-null-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: null,
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 100,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_no_fallback_null",
+      topic: "No fallback null route",
+      task: "Analyze task",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
+    assert.equal(agyCalls.length, 1);
+    assert.equal(client.sessionCount, 0, "no OpenCode session created when fallback route is null");
+    assert.equal(client.promptCalls.length, 0, "no OpenCode prompt dispatched");
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "failed");
+    assert.match(job?.error ?? "", /did not finish within/);
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity timeout does not fall back for edit mode or test mode", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-mode-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-mode-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "flash-max",
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 100,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_no_fallback_edit_mode",
+      topic: "No fallback edit mode",
+      task: "Edit some files",
+      cwd: directory,
+      mode: "edit",
+      workspaceStrategy: "shared",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
+    assert.equal(client.sessionCount, 0, "no OpenCode fallback for edit mode");
+    assert.equal(client.promptCalls.length, 0);
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "failed");
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity non-timeout errors do not trigger fallback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "flash-max",
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      spawnFn: agyFixtureSpawn("fail", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_no_fallback_exit_fail",
+      topic: "No fallback exit failure",
+      task: "Analyze task",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
+    assert.equal(client.sessionCount, 0, "no OpenCode fallback for exit error");
+    assert.equal(client.promptCalls.length, 0);
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "failed");
+    assert.match(job?.error ?? "", /quota exceeded/);
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity timeout does not fall back if fallback route is disabled or missing", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-disabled-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-disabled-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "pro-max", // pro-max is disabled by default
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 100,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_no_fallback_disabled_route",
+      topic: "No fallback disabled route",
+      task: "Analyze task",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
+    assert.equal(client.sessionCount, 0, "no OpenCode session when fallback route is disabled");
+    assert.equal(client.promptCalls.length, 0);
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "failed");
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("abort racing Antigravity timeout never launches OpenCode fallback", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-racing-fallback-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-racing-fallback-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "flash-max",
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 500,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_abort_racing_fallback",
+      topic: "Abort racing fallback",
+      task: "Analyze task",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    // Abort shortly after spawn while agy is hanging
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await service.abort(accepted.agentId, "Cancelled by user");
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "aborted", 2_000);
+    // Wait a bit to ensure timeout doesn't launch fallback post-abort
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    assert.equal(client.sessionCount, 0, "no OpenCode session created for aborted job");
+    assert.equal(client.promptCalls.length, 0, "no OpenCode prompt dispatched for aborted job");
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "aborted");
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity timeout does not fall back when fallback route provider is not opencode-go", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-non-opencode-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-non-opencode-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    antigravityTimeoutFallbackRoute: "custom-other",
+    modelRoutes: [
+      { name: "custom-other", providerId: "other-provider", modelId: "other-model", variant: null, enabled: true, default: false, display: "Other Provider · Model" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      timeoutMs: 100,
+      spawnFn: agyFixtureSpawn("hang", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_no_fallback_non_opencode",
+      topic: "No fallback non opencode route",
+      task: "Analyze task",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
+    assert.equal(client.sessionCount, 0, "no OpenCode session when fallback route is not opencode-go");
+    assert.equal(client.promptCalls.length, 0);
+
+    const job = store.getJob(accepted.jobId);
+    assert.equal(job?.status, "failed");
+    assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});

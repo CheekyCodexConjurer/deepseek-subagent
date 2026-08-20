@@ -64,11 +64,18 @@ export async function persistResult(
     gracefulFinalize?: boolean;
     partial?: boolean;
     workerAborted?: boolean;
+    fallback?: ResultEnvelope["fallback"];
   } = {},
 ): Promise<{ envelope: ResultEnvelope; resultPath: string; parsed: ParsedSubagentResult }> {
   const parsed = parseMessages(messages, job.lastAssistantMessageId);
   const resultPath = path.join(dataDir, "results", job.id + ".json");
   const diffSummary = redactSecrets(summarizeDiff(diff));
+  const fallback = options.fallback ?? (job.fallbackTo ? {
+    from: job.fallbackFrom ?? "antigravity",
+    to: job.fallbackTo,
+    reason: job.fallbackReason ?? "timeout",
+    status: job.fallbackStatus ?? "succeeded",
+  } : undefined);
   const envelope: ResultEnvelope = {
     version: 1,
     agentId: redactSecrets(agent.id),
@@ -90,7 +97,9 @@ export async function persistResult(
     ...(options.gracefulFinalize === undefined ? {} : { gracefulFinalize: options.gracefulFinalize }),
     ...(options.partial === undefined ? {} : { partial: options.partial }),
     ...(options.workerAborted === undefined ? {} : { workerAborted: options.workerAborted }),
+    ...(fallback ? { fallback } : {}),
   };
+
   await mkdir(path.dirname(resultPath), { recursive: true });
   await writePrivateFile(
     resultPath,
@@ -200,6 +209,15 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
   for (const key of ["deadlineReached", "gracefulFinalize", "partial", "workerAborted"]) {
     if (typeof value[key] === "boolean") output[key] = value[key];
   }
+  if (value.fallback && typeof value.fallback === "object") {
+    const fb = value.fallback as Record<string, unknown>;
+    output.fallback = {
+      from: truncate(redactSecrets(String(fb.from ?? "")), 1_000),
+      to: truncate(redactSecrets(String(fb.to ?? "")), 1_000),
+      reason: truncate(redactSecrets(String(fb.reason ?? "")), 2_000),
+      status: truncate(redactSecrets(String(fb.status ?? "")), 100),
+    };
+  }
   return output;
 }
 
@@ -256,7 +274,7 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 export function formatHumanResult(envelope: ResultEnvelope): string {
-  const isAntigravity = envelope.modelDisplayName.startsWith("Antigravity · ");
+  const isAntigravity = !envelope.fallback && envelope.modelDisplayName.startsWith("Antigravity · ");
   const lines = [
     "DeepSeek Sub-Agent · " + truncate(envelope.topic.replace(/[\r\n]+/g, " "), 240) + " · " + humanState(envelope.status),
     envelope.modelDisplayName,
@@ -279,9 +297,14 @@ export function formatHumanResult(envelope: ResultEnvelope): string {
     "model: " + envelope.model,
     "workspace: " + envelope.workspace,
   );
+  if (envelope.fallback) {
+    lines.push("fallback: from " + envelope.fallback.from + " to " + envelope.fallback.to + " (" + envelope.fallback.reason + ")");
+    lines.push("fallback_status: " + envelope.fallback.status);
+  }
   lines.push("", "ORCHESTRATOR INSTRUCTION", envelope.orchestratorInstruction);
   return lines.join("\n");
 }
+
 
 function parseMessages(messages: OpenCodeMessage[], baselineAssistantId: string | null = null): ParsedSubagentResult {
   const users = messages.filter((message) => message.info?.role === "user");
