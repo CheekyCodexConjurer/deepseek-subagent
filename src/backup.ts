@@ -1,10 +1,23 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readFile, rename, stat, unlink } from "node:fs/promises";
+import { createReadStream, existsSync } from "node:fs";
+import { rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { canRead, ensurePrivateDir, writePrivateFile } from "./security.js";
 import type { BackupManifest, BackupOptions, BackupResult } from "./types.js";
+
+/**
+ * Computes the SHA-256 hash of a file incrementally via streams
+ * to avoid loading large snapshots into memory.
+ */
+export async function computeFileSha256(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  const stream = createReadStream(filePath);
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
 
 export async function createBackup(options: BackupOptions): Promise<BackupResult> {
   const sourceDbPath = path.resolve(options.sourceDbPath);
@@ -46,8 +59,7 @@ export async function createBackup(options: BackupOptions): Promise<BackupResult
       db.close();
     }
 
-    const fileBuffer = await readFile(stagedSnapshotPath);
-    const databaseSha256 = createHash("sha256").update(fileBuffer).digest("hex");
+    const databaseSha256 = await computeFileSha256(stagedSnapshotPath);
     const fileStats = await stat(stagedSnapshotPath);
 
     const manifest: BackupManifest = {

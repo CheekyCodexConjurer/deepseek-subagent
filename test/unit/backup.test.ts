@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { createBackup } from "../../src/backup.js";
+import { computeFileSha256, createBackup } from "../../src/backup.js";
 import { createDefaultConfig, loadConfig } from "../../src/config.js";
 import { BridgeStore } from "../../src/store.js";
 import { main } from "../../src/cli.js";
@@ -349,5 +349,78 @@ test("BridgeStore.createSnapshot directly executes VACUUM INTO", async () => {
     }
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("computeFileSha256 streams and computes SHA-256 hash without loading whole file into memory", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-backup-stream-"));
+  try {
+    const filePath = path.join(directory, "test-stream.dat");
+    // Generate multi-chunk test data
+    const chunk1 = Buffer.from("first chunk of data for streaming hash calculation\n");
+    const chunk2 = Buffer.from("second chunk with random bytes: " + randomBytes(1024).toString("hex") + "\n");
+    const chunk3 = Buffer.from("third chunk to complete the multi-chunk payload\n");
+    const fullBuffer = Buffer.concat([chunk1, chunk2, chunk3]);
+    await writeFile(filePath, fullBuffer);
+
+    const expectedHash = createHash("sha256").update(fullBuffer).digest("hex");
+    const computedHash = await computeFileSha256(filePath);
+
+    assert.equal(computedHash, expectedHash);
+
+    // Verify non-existent file rejects cleanly
+    await assert.rejects(
+      () => computeFileSha256(path.join(directory, "nonexistent.dat")),
+      (error: unknown) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        assert.match(msg, /no such file|ENOENT/i);
+        return true;
+      },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("createBackup calculates manifest checksum via streaming without whole-file readFile", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-backup-no-readfile-src-"));
+  const backupDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-backup-no-readfile-dest-"));
+  try {
+    const dbPath = path.join(dataDir, "bridge.sqlite");
+    const store = new BridgeStore(dbPath);
+    store.createAgent({
+      id: "agent_stream_check",
+      title: "Stream Check Agent",
+      topic: "Online Backup Stream Test",
+      repositoryRoot: "C:\\test\\repo",
+      workspacePath: "C:\\test\\repo",
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_1",
+      opencodeSessionId: "session_1",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+      modelRoute: "flash-max",
+    });
+    store.close();
+
+    const fixedTime = "2026-08-20T21:00:00.000Z";
+    const result = await createBackup({
+      sourceDbPath: dbPath,
+      destinationDir: backupDir,
+      now: fixedTime,
+    });
+
+    const manifestRaw = await readFile(result.manifestPath, "utf8");
+    const manifest = JSON.parse(manifestRaw);
+    const expectedSha256 = await computeFileSha256(result.snapshotPath);
+
+    assert.equal(manifest.databaseSha256, expectedSha256);
+    assert.equal(typeof manifest.databaseSha256, "string");
+    assert.equal(manifest.databaseSha256.length, 64);
+    assert.ok(manifest.databaseSizeBytes > 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(backupDir, { recursive: true, force: true });
   }
 });
