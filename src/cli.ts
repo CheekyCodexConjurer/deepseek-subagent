@@ -12,7 +12,8 @@ import { createLegacyPruneIndexes, evaluateRetentionPolicy, runRetentionPrune } 
 import { BridgeService } from "./service.js";
 import { BridgeStore } from "./store.js";
 import { OpenCodeClient } from "./opencode/client.js";
-import type { BridgeConfig, DoctorCheck, DoctorReport, RetentionMode, RouteStatusInfo } from "./types.js";
+import { createBackup } from "./backup.js";
+import type { BackupResult, BridgeConfig, DoctorCheck, DoctorReport, RetentionMode, RouteStatusInfo } from "./types.js";
 
 export const DOCTOR_PROBE_TIMEOUT_MS = 10_000;
 
@@ -27,6 +28,7 @@ interface CliArgs {
   purgeData: boolean;
   confirmPurge: boolean;
   confirmRetention: boolean;
+  destination?: string | undefined;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -43,6 +45,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   switch (parsed.command) {
     case "help":
       printHelp();
+      return;
+    case "backup":
+      await runBackupCommand(config, parsed.destination ?? parsed.rest[0], parsed.json);
       return;
     case "install":
       await saveConfig(config);
@@ -866,6 +871,29 @@ function renderRouteStatus(status: RouteStatusInfo): string {
     "\nRegistered routes: " + status.routes.map((route) => route.name + (route.enabled ? "" : " (disabled)")).join(", ");
 }
 
+export async function runBackupCommand(
+  config: BridgeConfig,
+  destinationOverride: string | undefined,
+  json: boolean,
+): Promise<BackupResult> {
+  const dbPath = path.join(config.dataDir, "bridge.sqlite");
+  if (!(await canRead(dbPath))) {
+    throw new Error("Bridge database does not exist: " + dbPath);
+  }
+  const targetDir = destinationOverride ? path.resolve(destinationOverride) : config.backupDir;
+  const result = await createBackup({
+    sourceDbPath: dbPath,
+    destinationDir: targetDir,
+  });
+  const human = [
+    "Backup created successfully.",
+    "Snapshot: " + result.snapshotPath + " (" + result.manifest.databaseSizeBytes + " bytes, sha256: " + result.manifest.databaseSha256 + ")",
+    "Manifest: " + result.manifestPath,
+  ].join("\n");
+  output(json, { success: true, ...result }, human);
+  return result;
+}
+
 async function ensureConfig(configPath: string): Promise<BridgeConfig> {
   const config = await loadConfig(configPath);
   await ensurePrivateDir(config.dataDir);
@@ -895,6 +923,7 @@ function parseArgs(argv: string[]): CliArgs {
   let purgeData = false;
   let confirmPurge = false;
   let confirmRetention = false;
+  let destination: string | undefined;
   const rest: string[] = [];
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
@@ -905,13 +934,17 @@ function parseArgs(argv: string[]): CliArgs {
     else if (value === "--purge-data") purgeData = true;
     else if (value === "--confirm-purge") confirmPurge = true;
     else if (value === "--confirm") confirmRetention = true;
-    else if (value === "--config") {
+    else if (value === "--destination" || value === "--to") {
+      const next = argv[++index];
+      if (!next) throw new Error(value + " requires a path");
+      destination = path.resolve(next);
+    } else if (value === "--config") {
       const next = argv[++index];
       if (!next) throw new Error("--config requires a path");
       configPath = path.resolve(next);
     } else rest.push(value as string);
   }
-  return { command, rest, json, verbose, full, configPath, removeCodex, purgeData, confirmPurge, confirmRetention };
+  return { command, rest, json, verbose, full, configPath, removeCodex, purgeData, confirmPurge, confirmRetention, destination };
 }
 
 function output(json: boolean, value: unknown, human: string): void {
@@ -1073,10 +1106,11 @@ function printHelp(): void {
   console.log([
     "DeepSeek Sub-Agent local bridge",
     "",
-    "Commands: daemon, mcp, install, start, stop, restart, doctor [--full], logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>",
+    "Commands: daemon, mcp, install, start, stop, restart, doctor [--full], logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>, backup [--destination <dir>]",
     "doctor performs a fast schema/access check by default; use --full to run SQLite PRAGMA quick_check.",
     "retention enabled on an existing database requires --confirm after reviewing `retention dry-run`. Run retention commands while the daemon is stopped.",
     "route commands require the running daemon: route list shows registered routes, route status shows the effective active route, route set <route> switches it for new spawns without a daemon restart (existing agents keep their pinned route).",
+    "backup creates a safe online SQLite snapshot and manifest in the configured backup destination or an explicit override.",
     "Use --json for machine-readable output or --verbose for technical IDs in human listings. Secrets are always redacted.",
   ].join("\n"));
 }

@@ -206,6 +206,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     retentionMode: overrides.retentionMode ?? "disabled",
     maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
     globalGeminiContextPath: overrides.globalGeminiContextPath ?? defaultGlobalGeminiContextPath(),
+    backupDir: overrides.backupDir ?? path.join(dataDir, "backups"),
   };
 }
 
@@ -215,6 +216,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
     const parsed: unknown = JSON.parse(await readFile(configPath, "utf8"));
     if (!parsed || typeof parsed !== "object") return defaults;
     const raw = parsed as Record<string, unknown>;
+    const dataDir = asString(raw.dataDir, defaults.dataDir);
     const flatProviderId = asString(raw.opencodeProviderId, defaults.opencodeProviderId);
     const flatModelId = asString(raw.opencodeModelId, defaults.opencodeModelId);
     const flatVariant = asNullableString(raw.opencodeVariant);
@@ -230,7 +232,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
     const antigravityAutoApprovePermissions = raw.antigravityAutoApprovePermissions === true;
     return {
       ...defaults,
-      dataDir: asString(raw.dataDir, defaults.dataDir),
+      dataDir,
       configPath,
       daemonHost: isLoopbackHost(asString(raw.daemonHost, defaults.daemonHost))
         ? asString(raw.daemonHost, defaults.daemonHost)
@@ -269,6 +271,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       retentionMode,
       maxContextFileBytes: boundedInteger(raw.maxContextFileBytes, defaults.maxContextFileBytes, 1_024, 64_000_000),
       globalGeminiContextPath: asString(raw.globalGeminiContextPath, defaults.globalGeminiContextPath),
+      backupDir: asString(raw.backupDir, path.join(dataDir, "backups")),
     };
   } catch {
     return defaults;

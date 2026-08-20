@@ -363,6 +363,28 @@ export interface BridgeConfig {
   retentionMode: RetentionMode;
   maxContextFileBytes: number;
   globalGeminiContextPath: string;
+  backupDir: string;
+}
+
+export interface BackupManifest {
+  version: 1;
+  timestamp: string;
+  databaseFile: string;
+  databaseSizeBytes: number;
+  databaseSha256: string;
+  sourceDatabasePath: string;
+}
+
+export interface BackupResult {
+  snapshotPath: string;
+  manifestPath: string;
+  manifest: BackupManifest;
+}
+
+export interface BackupOptions {
+  sourceDbPath: string;
+  destinationDir: string;
+  now?: string | undefined;
 }
 
 export interface DoctorCheck {

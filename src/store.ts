@@ -69,6 +69,10 @@ export class BridgeStore {
     return row?.ok === 1 ? "ok" : "unknown";
   }
 
+  createSnapshot(destinationPath: string): void {
+    this.db.exec(`VACUUM INTO '${destinationPath.replace(/'/g, "''")}';`);
+  }
+
   migrate(): void {
     const schema = [
       "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
