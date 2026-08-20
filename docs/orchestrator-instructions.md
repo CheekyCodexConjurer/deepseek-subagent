@@ -23,6 +23,8 @@ When delegating work to DeepSeek:
 5. Review the follow result, including partial or timed-out evidence, before deciding the next action.
 6. Use `deepseek_continue` for a direct clarification, correction, review or continuation of the same topic. Use `deepseek_spawn` for materially different work.
 
+External orchestration lifecycle remains strictly `fallback=forbidden`, and route pinning and manual route overrides remain fail-closed; orchestrators must never implement client-side fallback. This is distinct from controlled internal timeout failover V1: an opt-in, bridge-internal, persisted, one-hop failover from Antigravity to configured OpenCode DeepSeek (`flash-max`) for `analyze`-mode tasks only upon confirmed Antigravity timeout. Hard exclusions apply: `edit` and `test` modes (which fail closed on timeout without failover to prevent unsafe duplicate filesystem modifications), user cancellation/abort, unconfirmed process termination, partial or invalid output, and disabled target routes. When internal failover executes, the transition is recorded in `agent_activity` and visible in result metadata; no daemon restart or automatic process cleanup is performed.
+
 `deepseek_follow` does not replace the worker or create a new session. Cancelling it removes only the waiter; use `deepseek_abort` when the worker itself must stop.
 
 A terminal `deepseek_follow` result consumes the job obligation (persisted); a `needs_approval` follow keeps the obligation pending and requires `deepseek_continue` with `permission_id` and `permission_reply`. Closing the agent with `deepseek_close` is separate from consuming the obligation: consume first, then close after review.

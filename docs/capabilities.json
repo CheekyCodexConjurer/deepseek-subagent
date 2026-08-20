@@ -53,7 +53,7 @@
       "noRestart": "route set applies to new spawns immediately, without a daemon restart",
       "offlineBehavior": "route commands fail closed when the daemon is not running; the CLI never writes the route pointer outside the daemon process (no concurrent DB write)",
       "noOverride": "the MCP deepseek_spawn tool never exposes or forwards model_route; it always uses the active route, while legacy/direct HTTP callers still fail closed on a conflicting override",
-      "noFallback": "no automatic fallback route ever applies"
+      "noFallback": "external MCP orchestration lifecycle remains fallback=forbidden and manual route overrides fail closed; distinct from bridge-internal opt-in timeout failover V1"
     },
     "modelRouteOnSpawn": "not available on the MCP spawn tool; it always uses the active route. The legacy/direct HTTP contract still validates an explicitly named route with typed unknown_route, route_disabled or route_override_denied failures and never falls back",
     "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults, and never the mutable active-route pointer",
@@ -91,7 +91,8 @@
     "semantics": "textual only; optional string on spawn and continue, no default. The orchestrator inspects visuals itself and sends three labeled parts ('Direct observations:', 'Interpretation:', 'Uncertainty:'). DeepSeek never receives pixels; direct observations are evidence, interpretation is a hypothesis, and details absent from the context must not be invented"
   },
   "antigravity": {
-    "asyncContract": "deepseek_spawn returns an accepted pending obligation immediately after job creation; agy runs asynchronously and deepseek_follow observes completion/failure/abort; abort between job creation and dispatch prevents the launch and never re-activates a closed/aborted agent; no provider fallback",
+    "asyncContract": "deepseek_spawn returns an accepted pending obligation immediately after job creation; agy runs asynchronously and deepseek_follow observes completion/failure/abort; abort between job creation and dispatch prevents the launch and never re-activates a closed/aborted agent; external orchestration lifecycle remains fallback=forbidden",
+    "timeoutFailoverV1": "opt-in, bridge-internal, persisted, one-hop timeout failover from Antigravity to configured OpenCode DeepSeek for analyze-mode tasks only upon confirmed timeout. Hard exclusions: edit/test modes, cancellation/abort, unconfirmed process termination, partial/invalid output, disabled target route. Visible in activity audit and result metadata; no daemon restart or automatic process cleanup",
     "sandbox": "antigravitySandbox (boolean, default false) enables agy --sandbox; never implied by other flags",
     "command": "antigravityCommand (string, default null): per-bridge override for the agy executable, a bare command name (PATH lookup) or an absolute path to a trusted local executable; null keeps the default agy.exe/agy PATH lookup; a single executable, never a shell command line; whitespace-containing non-absolute values are rejected at config load, while absolute executable paths with spaces remain allowed; avoids global PATH changes",
     "addDirs": "antigravityAddDirs (absolute string paths, default []) mounts explicit writable directories into the sandbox; relative entries are dropped at load",
