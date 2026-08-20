@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { acquireDaemonLock, collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, isProcessAlive, readCodexMcpToolTimeout, runCapture, runRouteCommand, terminateProcessTree, withStore } from "../../src/cli.js";
+import { acquireDaemonLock, collectObligationDiagnostics, doctorDatabaseCheck, doctorObligationChecks, isProcessAlive, main, readCodexMcpToolTimeout, runCapture, runRouteCommand, terminateProcessTree, withStore } from "../../src/cli.js";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpError, BridgeTransportError } from "../../src/http-server.js";
 import { BridgeStore } from "../../src/store.js";
@@ -483,5 +483,22 @@ test("acquireDaemonLock fails closed when lock file content is empty or unreadab
     assert.equal(content, "");
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("main displays help on help, --help, and -h without requiring config or database", async () => {
+  for (const args of [[], ["help"], ["--help"], ["-h"]]) {
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => logs.push(a.map(String).join(" "));
+    try {
+      await main(args);
+    } finally {
+      console.log = origLog;
+    }
+    const output = logs.join("\n");
+    assert.match(output, /DeepSeek Sub-Agent local bridge/i);
+    assert.match(output, /Commands:/i);
+    assert.match(output, /backup/i);
   }
 });

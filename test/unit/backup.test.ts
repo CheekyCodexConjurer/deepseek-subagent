@@ -283,6 +283,38 @@ test("CLI backup fails cleanly when bridge database does not exist", async () =>
   }
 });
 
+test("CLI backup --help and -h display command help and exit without creating backup or reading database", async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-backup-cli-help-"));
+  const configPath = path.join(dataDir, "config.json");
+  try {
+    const config = createDefaultConfig({ dataDir, configPath });
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+
+    for (const helpArg of ["--help", "-h", "help"]) {
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+      try {
+        await main(["backup", helpArg, "--config", configPath]);
+      } finally {
+        console.log = origLog;
+      }
+      const output = logs.join("\n");
+      assert.match(output, /backup/i);
+      assert.match(output, /DeepSeek Sub-Agent local bridge/i);
+      assert.match(output, /Commands:/i);
+    }
+
+    // Verify no backup directory or snapshot files were created
+    const helpDir = path.resolve("--help");
+    assert.equal(existsSync(helpDir), false, "--help directory must not be created");
+    const hDir = path.resolve("-h");
+    assert.equal(existsSync(hDir), false, "-h directory must not be created");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("BridgeStore.createSnapshot directly executes VACUUM INTO", async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-backup-store-"));
   try {

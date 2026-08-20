@@ -29,10 +29,15 @@ interface CliArgs {
   confirmPurge: boolean;
   confirmRetention: boolean;
   destination?: string | undefined;
+  help: boolean;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const parsed = parseArgs(argv);
+  if (parsed.help || parsed.command === "help") {
+    printHelp();
+    return;
+  }
   if (parsed.command === "mcp") {
     await runMcp(parsed.configPath);
     return;
@@ -43,9 +48,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   const config = await ensureConfig(parsed.configPath);
   switch (parsed.command) {
-    case "help":
-      printHelp();
-      return;
     case "backup":
       await runBackupCommand(config, parsed.destination ?? parsed.rest[0], parsed.json);
       return;
@@ -914,7 +916,8 @@ async function installInstructions(config: BridgeConfig): Promise<void> {
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const command = argv[0] ?? "help";
+  const first = argv[0] ?? "help";
+  const command = (first === "--help" || first === "-h") ? "help" : first;
   let configPath = defaultConfigPath();
   let json = false;
   let verbose = false;
@@ -924,6 +927,7 @@ function parseArgs(argv: string[]): CliArgs {
   let confirmPurge = false;
   let confirmRetention = false;
   let destination: string | undefined;
+  let help = command === "help";
   const rest: string[] = [];
   for (let index = 1; index < argv.length; index += 1) {
     const value = argv[index];
@@ -934,6 +938,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (value === "--purge-data") purgeData = true;
     else if (value === "--confirm-purge") confirmPurge = true;
     else if (value === "--confirm") confirmRetention = true;
+    else if (value === "--help" || value === "-h" || value === "help") help = true;
     else if (value === "--destination" || value === "--to") {
       const next = argv[++index];
       if (!next) throw new Error(value + " requires a path");
@@ -944,7 +949,7 @@ function parseArgs(argv: string[]): CliArgs {
       configPath = path.resolve(next);
     } else rest.push(value as string);
   }
-  return { command, rest, json, verbose, full, configPath, removeCodex, purgeData, confirmPurge, confirmRetention, destination };
+  return { command, rest, json, verbose, full, configPath, removeCodex, purgeData, confirmPurge, confirmRetention, destination, help };
 }
 
 function output(json: boolean, value: unknown, human: string): void {
@@ -1102,7 +1107,7 @@ async function runCodex(args: string[]): Promise<{ ok: boolean; output: string; 
   return runCapture("codex", args);
 }
 
-function printHelp(): void {
+export function printHelp(): void {
   console.log([
     "DeepSeek Sub-Agent local bridge",
     "",
