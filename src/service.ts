@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -15,10 +16,12 @@ import {
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
-import { AntigravityProcessError } from "./antigravity/runner.js";
+import { AntigravityProcessError, AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
+import { AntigravitySpool, isHeartbeatLive } from "./antigravity/spool.js";
 
-import type { AntigravityRunResult } from "./antigravity/types.js";
+import type { AntigravityAttemptManifest, AntigravityRunResult } from "./antigravity/types.js";
+
 import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
@@ -98,7 +101,11 @@ export class BridgeBusyError extends ConflictError {
   }
 }
 
+export type DaemonLifecycleState = "starting" | "recovering" | "ready" | "degraded";
+
 export interface ServiceStatus {
+  state: DaemonLifecycleState;
+  ready: boolean;
   running: boolean;
   opencodeUrl: string | null;
   provider: string;
@@ -113,6 +120,7 @@ export interface ServiceStatus {
   lastStreamError: string | null;
   activeRoute: ResolvedRoute | null;
   activeRouteSource: ActiveRouteSource;
+  error?: string | null;
 }
 
 const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "following", "finalizing", "needs_approval"]);
@@ -237,6 +245,8 @@ export class BridgeService {
   private readonly antigravityAbortControllers = new Map<string, AbortController>();
   private retentionTimer: NodeJS.Timeout | null = null;
   private retentionState: RetentionPolicyState | null = null;
+  private lifecycleState: DaemonLifecycleState = "starting";
+  private startupError: string | null = null;
 
   constructor(private readonly config: BridgeConfig, dependencies: ServiceDependencies = {}) {
     this.store = dependencies.store ?? new BridgeStore(path.join(config.dataDir, "bridge.sqlite"));
@@ -255,46 +265,67 @@ export class BridgeService {
       sandbox: config.antigravitySandbox,
       addDirs: config.antigravityAddDirs,
       dangerouslySkipPermissions: config.antigravityAutoApprovePermissions,
+      dataDir: config.dataDir,
     });
   }
 
+  isReady(): boolean {
+    return this.lifecycleState === "ready";
+  }
+
+  getLifecycleState(): DaemonLifecycleState {
+    return this.lifecycleState;
+  }
+
   async start(): Promise<void> {
-    if (this.running) return;
-    const managed = await this.manager.start(defaultWorkspace());
-    this.managed = managed;
-    this.client = managed.client;
-    this.store.registerServer({
-      id: managed.serverId,
-      workspaceRoot: defaultWorkspace(),
-      baseUrl: managed.baseUrl,
-      processId: managed.processId,
-    });
-    if (this.config.experimentalSameChatDelivery) {
-      try {
-        await this.codex.start();
-      } catch (error) {
-        this.codex = new UnavailableCodexDeliveryAdapter(redactSecrets(String(error)));
-      }
-      this.correlationUnsubscribe = this.codex.onCorrelation((correlation) => {
-        void this.handleCorrelation(correlation).catch((error) => {
-          this.lastStreamError = redactSecrets(String(error));
-        });
+    if (this.running || this.lifecycleState === "ready") return;
+    this.lifecycleState = "starting";
+    this.startupError = null;
+    try {
+      const managed = await this.manager.start(defaultWorkspace());
+      this.managed = managed;
+      this.client = managed.client;
+      this.store.registerServer({
+        id: managed.serverId,
+        workspaceRoot: defaultWorkspace(),
+        baseUrl: managed.baseUrl,
+        processId: managed.processId,
       });
+      if (this.config.experimentalSameChatDelivery) {
+        try {
+          await this.codex.start();
+        } catch (error) {
+          this.codex = new UnavailableCodexDeliveryAdapter(redactSecrets(String(error)));
+        }
+        this.correlationUnsubscribe = this.codex.onCorrelation((correlation) => {
+          void this.handleCorrelation(correlation).catch((error) => {
+            this.lastStreamError = redactSecrets(String(error));
+          });
+        });
+      }
+      this.streamAbort = new AbortController();
+      this.streamTask = managed.client.subscribe(
+        (event) => this.handleEvent(event),
+        this.streamAbort.signal,
+      ).catch((error: unknown) => {
+        if (!this.streamAbort?.signal.aborted) this.lastStreamError = redactSecrets(String(error));
+      });
+      this.lifecycleState = "recovering";
+      await this.recoverPendingJobs();
+      this.lifecycleState = "ready";
+      this.running = true;
+      this.scheduleRetentionPolicy();
+    } catch (error) {
+      this.lifecycleState = "degraded";
+      this.running = false;
+      this.startupError = redactSecrets(String(error));
     }
-    this.running = true;
-    this.streamAbort = new AbortController();
-    this.streamTask = managed.client.subscribe(
-      (event) => this.handleEvent(event),
-      this.streamAbort.signal,
-    ).catch((error: unknown) => {
-      if (!this.streamAbort?.signal.aborted) this.lastStreamError = redactSecrets(String(error));
-    });
-    await this.recoverPendingJobs();
-    this.applyRetentionPolicy();
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    this.lifecycleState = "starting";
+    this.startupError = null;
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
@@ -339,7 +370,9 @@ export class BridgeService {
     const defaultRoute = this.config.modelRoutes.find((route) => route.name === this.config.defaultModelRoute);
     const active = this.safeActiveRoute();
     return {
-      running: this.running,
+      state: this.lifecycleState,
+      ready: this.lifecycleState === "ready",
+      running: this.lifecycleState === "ready",
       opencodeUrl: this.managed?.baseUrl ?? null,
       provider: defaultRoute?.providerId ?? this.config.opencodeProviderId,
       model: defaultRoute?.modelId ?? this.config.opencodeModelId,
@@ -356,10 +389,11 @@ export class BridgeService {
       lastStreamError: this.lastStreamError,
       activeRoute: active,
       activeRouteSource: this.effectiveRouteSource(),
+      ...(this.startupError ? { error: this.startupError } : {}),
     };
   }
 
-  private applyRetentionPolicy(): void {
+  private scheduleRetentionPolicy(): void {
     const policy = evaluateRetentionPolicy(this.store, this.config.retentionMode);
     this.retentionState = policy;
     if (!policy.pruningEnabled) return;
@@ -370,7 +404,7 @@ export class BridgeService {
         this.lastStreamError = redactSecrets(String(error));
       }
     };
-    runPass();
+    queueMicrotask(runPass);
     this.retentionTimer = setInterval(runPass, RETENTION_INTERVAL_MS);
     this.retentionTimer.unref?.();
   }
@@ -656,6 +690,8 @@ export class BridgeService {
       } else if (isAntigravityWithoutSession) {
         this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
       }
+      const spool = new AntigravitySpool(this.config.dataDir);
+      void spool.writeCancelSignal(active.id, reason ?? "Aborted by orchestrator").catch(() => undefined);
     }
     if (!isAntigravityWithoutSession) {
       try {
@@ -1476,6 +1512,86 @@ export class BridgeService {
     return this.accepted(this.store.getJob(job.id) ?? job);
   }
 
+  private async runAntigravityAttemptAsync(
+    agent: AgentRecord,
+    job: JobRecord,
+    manifest: AntigravityAttemptManifest,
+    controller: AbortController,
+    workerInput?: WorkerPromptInput,
+    contextFiles?: string[],
+  ): Promise<void> {
+    const spool = new AntigravitySpool(this.config.dataDir);
+    try {
+      let result: AntigravityRunResult;
+      if (typeof (this.antigravity as any).runAttempt === "function") {
+        result = await (this.antigravity as any).runAttempt(manifest, controller.signal);
+      } else {
+        result = await this.antigravity.runPrompt({
+          prompt: manifest.promptPath && existsSync(manifest.promptPath) ? await readFile(manifest.promptPath, "utf8").catch(() => "") : "",
+          cwd: manifest.cwd,
+          model: manifest.modelId,
+          signal: controller.signal,
+          attemptManifest: manifest,
+        });
+      }
+      const current = this.store.getJob(job.id);
+      if (controller.signal.aborted || current?.status === "aborted") {
+        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        return;
+      }
+      if (current?.status === "timed_out") {
+        this.recordActivity(agent, current, "abort", "Antigravity process ended after the follow timeout; the timed-out job stays terminal");
+        return;
+      }
+      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
+      const completed = this.store.getJob(job.id) ?? job;
+      if (["running", "following", "finalizing"].includes(completed.status)) {
+        this.store.updateJobStatus(job.id, "completed");
+      }
+      const completedAgent = this.store.getAgent(agent.id) ?? agent;
+      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
+      this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, {
+          status: "completed",
+          resultAvailable: true,
+          envelope: stored.envelope,
+        });
+      }
+      const pending = this.store.getJob(job.id) ?? job;
+      if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
+      const deliveryJob = this.store.getJob(job.id) ?? job;
+      await this.deliverEnvelope(stored.envelope, deliveryJob);
+      await spool.cleanupPrompt(manifest.attemptId, job.id);
+    } catch (error) {
+      const message = redactSecrets(String(error));
+      const current = this.store.getJob(job.id);
+      if (current?.status === "aborted" || controller.signal.aborted) {
+        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        return;
+      }
+      if (current?.resultPath || ["completed", "completed_partial", "delivery_pending", "delivered"].includes(current?.status ?? "")) {
+        this.recordActivity(agent, current ?? job, "error", "Delivery failed for persisted Antigravity result: " + message);
+        this.lastStreamError = message;
+        return;
+      }
+      if (this.isEligibleForTimeoutFallback(agent, current ?? job, error)) {
+        await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
+        return;
+      }
+      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
+      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, { status: "failed", error: message });
+      }
+    } finally {
+      if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
+    }
+  }
+
   /**
    * Background Antigravity execution: awaits agy, persists the literal result
    * envelope, completes the job, delivers it and settles any waiting follow.
@@ -2082,18 +2198,9 @@ export class BridgeService {
           });
           continue;
         }
-        // The Antigravity run lives in the daemon's in-memory provider and
-        // process handle. After a daemon loss there is no way to recover,
-        // await or abort it, so the stranded job is terminalized with a clear
-        // failure reason instead of remaining dispatching/working forever.
-        // (The orphaned child, if any, is not controllable; it is not the
-        // job's state.) In-process follow/abort semantics are untouched: this
-        // branch only runs at startup recovery.
-        const reason = "Antigravity run stranded: the daemon process that owned the in-memory run was lost; the job cannot be recovered";
-        this.recordActivity(agent, job, "error", reason);
-        this.store.updateJobStatus(job.id, "failed", reason);
-        const currentAgent = this.store.getAgent(agent.id);
-        if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+        await this.recoverAntigravityJob(agent, job).catch((error) => {
+          this.lastStreamError = redactSecrets(String(error));
+        });
         continue;
       }
       if (["dispatching", "running"].includes(job.status)) {
@@ -2336,6 +2443,240 @@ export class BridgeService {
       return this.accepted(job, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
     }
     return this.accepted(job);
+  }
+
+  private async recoverAntigravityJob(agent: AgentRecord, job: JobRecord): Promise<void> {
+    const spool = new AntigravitySpool(this.config.dataDir);
+    const attempts = await spool.listAttempts(job.id);
+    if (attempts.length === 0) {
+      const reason = "Antigravity run stranded: no durable spool found for job " + job.id + "; the job cannot be recovered";
+      this.recordActivity(agent, job, "error", reason);
+      this.store.updateJobStatus(job.id, "failed", reason);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+      return;
+    }
+
+    const latestAttempt = attempts[attempts.length - 1];
+    if (!latestAttempt) return;
+
+    // 1. Check if terminal status was already written by supervisor
+    const terminalStatus = await spool.readStatus(latestAttempt.statusPath);
+    if (terminalStatus) {
+      if (terminalStatus.status === "completed" || terminalStatus.status === "completed_partial") {
+        const result: AntigravityRunResult = {
+          status: terminalStatus.status,
+          runId: terminalStatus.runId,
+          summary: terminalStatus.summary,
+          files: terminalStatus.files,
+          tests: terminalStatus.tests,
+          risks: terminalStatus.risks,
+          diffSummary: terminalStatus.diffSummary,
+          model: latestAttempt.modelId,
+          modelDisplayName: "Antigravity · " + latestAttempt.modelId,
+          workspace: latestAttempt.cwd,
+          rawOutput: terminalStatus.stdout,
+        };
+        const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+        this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
+        this.store.updateJobStatus(job.id, terminalStatus.status);
+        const currentAgent = this.store.getAgent(agent.id) ?? agent;
+        if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, terminalStatus.status);
+        this.recordActivity(agent, this.store.getJob(job.id), "result", "Recovered completed Antigravity result from durable spool");
+        this.store.updateJobStatus(job.id, "delivery_pending");
+        const deliveryJob = this.store.getJob(job.id) ?? job;
+        await this.deliverEnvelope(stored.envelope, deliveryJob).catch((error) => {
+          this.lastStreamError = redactSecrets(String(error));
+        });
+        await spool.cleanupPrompt(latestAttempt.attemptId, job.id);
+        return;
+      } else {
+        const reason = terminalStatus.error || ("Antigravity run ended with status " + terminalStatus.status);
+        const finalStatus = terminalStatus.status === "aborted" ? "aborted" : terminalStatus.status === "timed_out" ? "timed_out" : "failed";
+        this.store.updateJobStatus(job.id, finalStatus, reason);
+        const currentAgent = this.store.getAgent(agent.id);
+        if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, finalStatus, reason);
+        this.recordActivity(agent, job, "error", "Recovered terminal " + finalStatus + " Antigravity status from durable spool");
+        await spool.cleanupPrompt(latestAttempt.attemptId, job.id);
+        return;
+      }
+    }
+
+    // 2. Check if supervisor heartbeat is live
+    const heartbeat = await spool.readHeartbeat(latestAttempt.heartbeatPath);
+    if (spool.isHeartbeatLive(heartbeat)) {
+      this.recordActivity(agent, job, "dispatch", "Reattached to live Antigravity attempt " + latestAttempt.attemptId + " (supervisor PID " + heartbeat!.supervisorPid + ")");
+      if (["following", "finalizing"].includes(job.status)) {
+        this.ensureFollowLifecycle(
+          job,
+          normalizeFollowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          normalizeFollowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+        );
+      }
+      void this.monitorReattachedAntigravityAttempt(agent, job, latestAttempt, spool).catch((error) => {
+        if (this.running) this.lastStreamError = redactSecrets(String(error));
+      });
+      return;
+    }
+
+    // 3. Provably dead non-terminal attempt: take exclusive recovery claim
+    const claimantId = "daemon_" + process.pid + "_" + Date.now();
+    const claimed = await spool.claimRecovery(job.id, claimantId);
+    if (!claimed) {
+      return;
+    }
+
+    // Check replay budget (at most 1 replacement attempt; total 2 attempts)
+    if (attempts.length >= 2 || latestAttempt.parentAttemptId !== null) {
+      const reason = "Antigravity replay budget exhausted: replacement attempt already attempted; job cannot be recovered";
+      this.recordActivity(agent, job, "error", reason);
+      this.store.updateJobStatus(job.id, "failed", reason);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+      return;
+    }
+
+    // Check prompt availability
+    let prompt: string | null = null;
+    try {
+      if (existsSync(latestAttempt.promptPath)) {
+        prompt = await readFile(latestAttempt.promptPath, "utf8");
+      }
+    } catch {}
+
+    if (!prompt || !prompt.trim()) {
+      const reason = "Antigravity replacement recovery failed: original transient prompt is unavailable in spool";
+      this.recordActivity(agent, job, "error", reason);
+      this.store.updateJobStatus(job.id, "failed", reason);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+      return;
+    }
+
+    // Create replacement attempt
+    const replacement = await spool.createAttempt({
+      agentId: agent.id,
+      jobId: job.id,
+      requestId: job.requestId,
+      prompt,
+      cwd: agent.workspacePath,
+      modelProviderId: agent.modelProviderId,
+      modelId: agent.modelId,
+      modelVariant: agent.modelVariant,
+      modelRoute: agent.modelRoute,
+      command: latestAttempt.command,
+      timeoutMs: latestAttempt.timeoutMs,
+      sandbox: latestAttempt.sandbox,
+      addDirs: latestAttempt.addDirs,
+      dangerouslySkipPermissions: latestAttempt.dangerouslySkipPermissions,
+      parentAttemptId: latestAttempt.attemptId,
+      maxOutputBytes: latestAttempt.maxOutputBytes,
+    });
+
+    this.recordActivity(
+      agent,
+      job,
+      "dispatch",
+      "Started recovery replacement attempt " + replacement.attemptId + " for dead attempt " + latestAttempt.attemptId,
+    );
+
+    if (["following", "finalizing"].includes(job.status)) {
+      this.ensureFollowLifecycle(
+        job,
+        normalizeFollowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+        normalizeFollowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+      );
+    }
+
+    const controller = new AbortController();
+    this.antigravityAbortControllers.set(job.id, controller);
+    void this.runAntigravityAttemptAsync(agent, job, replacement, controller).catch((error) => {
+      if (this.running) this.lastStreamError = redactSecrets(String(error));
+    });
+  }
+
+  private async monitorReattachedAntigravityAttempt(
+    agent: AgentRecord,
+    job: JobRecord,
+    manifest: AntigravityAttemptManifest,
+    spool: AntigravitySpool,
+  ): Promise<void> {
+    const controller = new AbortController();
+    this.antigravityAbortControllers.set(job.id, controller);
+    try {
+      const pollIntervalMs = 250;
+      while (true) {
+        if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") {
+          await spool.writeCancelSignal(manifest.attemptId, "Aborted by orchestrator");
+          return;
+        }
+
+        const status = await spool.readStatus(manifest.statusPath);
+        if (status) {
+          if (status.status === "completed" || status.status === "completed_partial") {
+            const result: AntigravityRunResult = {
+              status: status.status,
+              runId: status.runId,
+              summary: status.summary,
+              files: status.files,
+              tests: status.tests,
+              risks: status.risks,
+              diffSummary: status.diffSummary,
+              model: manifest.modelId,
+              modelDisplayName: "Antigravity · " + manifest.modelId,
+              workspace: manifest.cwd,
+              rawOutput: status.stdout,
+            };
+            const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+            this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
+            const current = this.store.getJob(job.id) ?? job;
+            if (["running", "following", "finalizing"].includes(current.status)) {
+              this.store.updateJobStatus(job.id, status.status);
+            }
+            const currentAgent = this.store.getAgent(agent.id) ?? agent;
+            if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, status.status);
+            this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and result was persisted");
+            if (this.followLifecycles.has(job.id)) {
+              await this.resolveFollow(job.id, {
+                status: status.status,
+                resultAvailable: true,
+                envelope: stored.envelope,
+              });
+            }
+            const pending = this.store.getJob(job.id) ?? job;
+            if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
+            const deliveryJob = this.store.getJob(job.id) ?? job;
+            await this.deliverEnvelope(stored.envelope, deliveryJob);
+            await spool.cleanupPrompt(manifest.attemptId, job.id);
+            return;
+          } else {
+            const reason = status.error || ("Antigravity run ended with status " + status.status);
+            const finalStatus = status.status === "aborted" ? "aborted" : status.status === "timed_out" ? "timed_out" : "failed";
+            this.store.updateJobStatus(job.id, finalStatus, reason);
+            const currentAgent = this.store.getAgent(agent.id);
+            if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, finalStatus, reason);
+            this.recordActivity(agent, job, "error", reason);
+            if (this.followLifecycles.has(job.id)) {
+              await this.resolveFollow(job.id, { status: "failed", error: reason });
+            }
+            await spool.cleanupPrompt(manifest.attemptId, job.id);
+            return;
+          }
+        }
+
+        const heartbeat = await spool.readHeartbeat(manifest.heartbeatPath);
+        if (!spool.isHeartbeatLive(heartbeat)) {
+          await this.recoverAntigravityJob(agent, job);
+          return;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
+    } finally {
+      if (this.antigravityAbortControllers.get(job.id) === controller) {
+        this.antigravityAbortControllers.delete(job.id);
+      }
+    }
   }
 
   private clientOrThrow(): OpenCodeClientLike {

@@ -122,6 +122,57 @@ export interface DaemonBootstrapOptions {
   retryMs?: number;
 }
 
+export function isDaemonHealthReady(health: unknown): boolean {
+  if (!health || typeof health !== "object") return false;
+  const h = health as Record<string, unknown>;
+  if (h.ready === true) return true;
+  if (h.state === "ready") return true;
+  const status = h.status;
+  if (status && typeof status === "object") {
+    const s = status as Record<string, unknown>;
+    if (s.ready === true) return true;
+    if (s.state === "ready") return true;
+    if (s.running === true && s.ready === undefined && s.state === undefined) return true;
+  }
+  return false;
+}
+
+export function isDaemonHealthDegraded(health: unknown): boolean {
+  if (!health || typeof health !== "object") return false;
+  const h = health as Record<string, unknown>;
+  if (h.state === "degraded") return true;
+  const status = h.status;
+  if (status && typeof status === "object") {
+    const s = status as Record<string, unknown>;
+    if (s.state === "degraded") return true;
+  }
+  return false;
+}
+
+export function getDaemonHealthState(health: unknown): string | null {
+  if (!health || typeof health !== "object") return null;
+  const h = health as Record<string, unknown>;
+  if (typeof h.state === "string") return h.state;
+  const status = h.status;
+  if (status && typeof status === "object") {
+    const s = status as Record<string, unknown>;
+    if (typeof s.state === "string") return s.state;
+  }
+  return null;
+}
+
+export function getDaemonHealthError(health: unknown): string {
+  if (!health || typeof health !== "object") return "unknown error";
+  const h = health as Record<string, unknown>;
+  if (typeof h.error === "string") return h.error;
+  const status = h.status;
+  if (status && typeof status === "object") {
+    const s = status as Record<string, unknown>;
+    if (typeof s.error === "string") return s.error;
+  }
+  return "degraded state";
+}
+
 /**
  * MCP startup is allowed to recover the local daemon once. This is readiness
  * handling, not a job-status polling loop: the MCP process only waits for the
@@ -132,23 +183,45 @@ export async function ensureDaemonRunning(
   client: DaemonHealthClient,
   options: DaemonBootstrapOptions = {},
 ): Promise<void> {
-  try {
-    await client.health();
-    return;
-  } catch (error) {
-    // Start below and retain the first failure for a useful timeout message.
-    var lastError: unknown = error;
-  }
-
-  await (options.start ?? startDetachedDaemon)(config);
   const timeoutMs = options.timeoutMs ?? Math.max(10_000, Math.min(45_000, config.opencodeStartupTimeoutMs + 5_000));
   const retryMs = options.retryMs ?? 100;
   const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = null;
+
+  let initialReachable = false;
+  try {
+    const health = await client.health();
+    if (isDaemonHealthReady(health)) {
+      return;
+    }
+    initialReachable = true;
+    if (isDaemonHealthDegraded(health)) {
+      throw new Error("DeepSeek Sub-Agent daemon is degraded: " + getDaemonHealthError(health));
+    }
+    lastError = new Error("Daemon is " + (getDaemonHealthState(health) || "not ready"));
+  } catch (error) {
+    lastError = error;
+    if (initialReachable) throw error;
+  }
+
+  if (!initialReachable) {
+    await (options.start ?? startDetachedDaemon)(config);
+  }
+
   while (Date.now() < deadline) {
     try {
-      await client.health();
-      return;
+      const health = await client.health();
+      if (isDaemonHealthReady(health)) {
+        return;
+      }
+      if (isDaemonHealthDegraded(health)) {
+        throw new Error("DeepSeek Sub-Agent daemon is degraded: " + getDaemonHealthError(health));
+      }
+      lastError = new Error("Daemon is " + (getDaemonHealthState(health) || "not ready"));
     } catch (error) {
+      if (error instanceof Error && error.message.includes("daemon is degraded")) {
+        throw error;
+      }
       lastError = error;
     }
     await delay(Math.min(retryMs, Math.max(1, deadline - Date.now())));

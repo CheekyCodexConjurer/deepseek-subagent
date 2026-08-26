@@ -1,4 +1,4 @@
-export type BridgeErrorStatus = 400 | 401 | 403 | 404 | 409 | 500;
+export type BridgeErrorStatus = 400 | 401 | 403 | 404 | 409 | 500 | 503;
 
 export type BridgeErrorCode =
   | "invalid_request"
@@ -17,7 +17,8 @@ export type BridgeErrorCode =
   | "not_followable"
   | "state_conflict"
   | "unauthorized"
-  | "internal";
+  | "internal"
+  | "service_unavailable";
 
 /**
  * Stable typed bridge error. Every error that crosses the HTTP or MCP
@@ -90,5 +91,12 @@ export class InternalBridgeError extends BridgeError {
   constructor(message: string) {
     super(500, "internal", message);
     this.name = "InternalBridgeError";
+  }
+}
+
+export class ServiceUnavailableError extends BridgeError {
+  constructor(message = "DeepSeek Sub-Agent daemon is not ready yet", details?: unknown) {
+    super(503, "service_unavailable", message, details);
+    this.name = "ServiceUnavailableError";
   }
 }

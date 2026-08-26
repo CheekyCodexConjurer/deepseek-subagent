@@ -376,3 +376,132 @@ test("recoverPendingJobs includes jobs with persisted results in terminal or del
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("BridgeStore.recoverPendingJobs uses a direct status-bounded query and index idx_jobs_status exists", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-store-pending-sql-"));
+  const store = await BridgeStore.open(directory);
+  try {
+    const indexRow = store.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_status'").get() as { name: string } | undefined;
+    assert.equal(indexRow?.name, "idx_jobs_status", "idx_jobs_status index must exist in schema");
+
+    store.createAgent({
+      id: "agent_sql_test",
+      title: "SQL Test",
+      topic: "SQL Test Topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "server_sql",
+      opencodeSessionId: "session_sql",
+      modelProviderId: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      modelVariant: "max",
+    });
+
+    const pendingStatuses = [
+      "dispatching",
+      "running",
+      "following",
+      "finalizing",
+      "needs_approval",
+      "completed",
+      "completed_partial",
+      "timed_out",
+      "delivery_pending",
+    ] as const;
+
+    const nonPendingStatuses = ["delivered", "aborted", "failed"] as const;
+
+    const transitionJobTo = (jobId: string, target: typeof pendingStatuses[number] | typeof nonPendingStatuses[number]) => {
+      if (target === "created") return;
+      store.updateJobStatus(jobId, "dispatching");
+      if (target === "dispatching") return;
+      if (target === "aborted" || target === "failed") {
+        store.updateJobStatus(jobId, target);
+        return;
+      }
+      store.updateJobStatus(jobId, "running");
+      if (target === "running") return;
+      if (target === "needs_approval") {
+        store.updateJobStatus(jobId, "needs_approval");
+        return;
+      }
+      if (target === "following") {
+        store.updateJobStatus(jobId, "following");
+        return;
+      }
+      if (target === "finalizing") {
+        store.updateJobStatus(jobId, "following");
+        store.updateJobStatus(jobId, "finalizing");
+        return;
+      }
+      if (target === "completed" || target === "timed_out") {
+        store.setJobResult(jobId, path.join(directory, `result_${jobId}.json`), "summary");
+        store.updateJobStatus(jobId, target);
+        return;
+      }
+      if (target === "completed_partial") {
+        store.updateJobStatus(jobId, "following");
+        store.setJobResult(jobId, path.join(directory, `result_${jobId}.json`), "summary");
+        store.updateJobStatus(jobId, "completed_partial");
+        return;
+      }
+      if (target === "delivery_pending") {
+        store.setJobResult(jobId, path.join(directory, `result_${jobId}.json`), "summary");
+        store.updateJobStatus(jobId, "completed");
+        store.updateJobStatus(jobId, "delivery_pending");
+        return;
+      }
+      if (target === "delivered") {
+        store.setJobResult(jobId, path.join(directory, `result_${jobId}.json`), "summary");
+        store.updateJobStatus(jobId, "completed");
+        store.updateJobStatus(jobId, "delivery_pending");
+        store.updateJobStatus(jobId, "delivered");
+        return;
+      }
+    };
+
+    for (let i = 0; i < pendingStatuses.length; i++) {
+      const status = pendingStatuses[i]!;
+      const job = store.createJob({
+        id: `job_pending_${i}`,
+        agentId: "agent_sql_test",
+        kind: "spawn",
+        requestId: `req_pending_${i}`,
+        promptHash: `hash_${i}`,
+      });
+      transitionJobTo(job.id, status);
+    }
+
+    for (let i = 0; i < nonPendingStatuses.length; i++) {
+      const status = nonPendingStatuses[i]!;
+      const job = store.createJob({
+        id: `job_nonpending_${i}`,
+        agentId: "agent_sql_test",
+        kind: "spawn",
+        requestId: `req_nonpending_${i}`,
+        promptHash: `hash_np_${i}`,
+      });
+      transitionJobTo(job.id, status);
+    }
+
+    const executedSql: string[] = [];
+    const origPrepare = store.db.prepare;
+    store.db.prepare = ((sql: string) => {
+      executedSql.push(sql);
+      return origPrepare.call(store.db, sql);
+    }) as typeof origPrepare;
+
+    const recovered = store.recoverPendingJobs();
+    assert.equal(recovered.length, pendingStatuses.length, "must recover exactly all pending status jobs");
+    for (const job of recovered) {
+      assert.ok((pendingStatuses as readonly string[]).includes(job.status));
+      assert.ok(!(nonPendingStatuses as readonly string[]).includes(job.status));
+    }
+    const selectQuery = executedSql.find((sql) => sql.toLowerCase().includes("from jobs") && sql.toLowerCase().includes("status in"));
+    assert.ok(selectQuery, "recoverPendingJobs must execute a status-bounded SQL query with WHERE status IN (...)");
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

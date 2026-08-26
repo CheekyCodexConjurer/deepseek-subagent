@@ -796,7 +796,22 @@ export class BridgeStore {
   }
 
   recoverPendingJobs(): JobRecord[] {
-    return this.listJobs().filter((job) => ["dispatching", "running", "following", "finalizing", "needs_approval", "completed", "completed_partial", "timed_out", "delivery_pending"].includes(job.status));
+    const statuses = [
+      "dispatching",
+      "running",
+      "following",
+      "finalizing",
+      "needs_approval",
+      "completed",
+      "completed_partial",
+      "timed_out",
+      "delivery_pending",
+    ];
+    const placeholders = statuses.map(() => "?").join(",");
+    const rows = this.db.prepare(
+      `SELECT * FROM jobs WHERE status IN (${placeholders}) ORDER BY created_at DESC`,
+    ).all(...statuses) as Row[];
+    return rows.map((row) => this.toJob(row));
   }
 
   registerServer(input: { id: string; workspaceRoot: string; baseUrl: string; processId: number | null }): void {

@@ -75,9 +75,29 @@ export class BridgeHttpServer {
     const method = request.method ?? "GET";
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (url.pathname === "/health" && method === "GET") {
+      const status = typeof this.service.status === "function" ? this.service.status() : null;
+      const state = status?.state ?? "ready";
+      const ready = status?.ready ?? (typeof this.service.isReady === "function" ? this.service.isReady() : true);
       writeJson(response, 200, {
         displayName: "DeepSeek Sub-Agent",
-        status: this.service.status(),
+        state,
+        ready,
+        status: status ?? { running: true, state, ready },
+        ...(status?.error ? { error: status.error } : {}),
+      });
+      return;
+    }
+    if (typeof this.service.isReady === "function" && !this.service.isReady()) {
+      const status = typeof this.service.status === "function" ? this.service.status() : null;
+      const state = status?.state ?? "starting";
+      const error = status?.error ?? null;
+      writeJson(response, 503, {
+        error: redactSecrets(error ? `DeepSeek Sub-Agent daemon is degraded: ${error}` : `DeepSeek Sub-Agent daemon is ${state} and not ready yet`),
+        code: "service_unavailable",
+        status: 503,
+        retry: state !== "degraded",
+        state,
+        ready: false,
       });
       return;
     }
@@ -271,6 +291,9 @@ function writeError(response: ServerResponse, error: unknown): void {
       body.retry = false;
       body.jobId = error.jobId;
     }
+    if (error.status === 503) {
+      body.retry = true;
+    }
     writeJson(response, error.status, body);
     return;
   }
@@ -327,6 +350,7 @@ function defaultCodeForStatus(status: number): string {
   if (status === 401) return "unauthorized";
   if (status === 404) return "not_found";
   if (status === 409) return "conflict";
+  if (status === 503) return "service_unavailable";
   return "internal";
 }
 

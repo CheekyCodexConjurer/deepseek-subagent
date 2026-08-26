@@ -224,8 +224,8 @@ async function runDaemon(config: BridgeConfig): Promise<void> {
   const http = new BridgeHttpServer(config, service);
   try {
     await saveConfig(config);
-    await service.start();
     await http.start();
+    await service.start();
   } catch (error) {
     await http.stop().catch(() => undefined);
     await service.stop().catch(() => undefined);

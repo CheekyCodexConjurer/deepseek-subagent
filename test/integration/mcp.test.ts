@@ -1070,3 +1070,63 @@ test("MCP plain ensureReady callback without recovery propagates transport error
     await server.close();
   }
 });
+
+test("MCP bootstrap distinguishes reachable-but-recovering from absent daemon and prevents duplicate start", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let pollCount = 0;
+  let starts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      pollCount += 1;
+      if (pollCount <= 2) {
+        return { displayName: "DeepSeek Sub-Agent", state: "recovering", ready: false, status: { running: false, state: "recovering", ready: false } };
+      }
+      return { displayName: "DeepSeek Sub-Agent", state: "ready", ready: true, status: { running: true, state: "ready", ready: true } };
+    },
+  };
+
+  await ensureDaemonRunning(config, healthClient, {
+    start: async () => {
+      starts += 1;
+    },
+    timeoutMs: 500,
+    retryMs: 10,
+  });
+
+  assert.equal(starts, 0, "must not start a duplicate daemon when health endpoint is reachable in recovering state");
+  assert.ok(pollCount >= 3, "must wait boundedly for readiness");
+});
+
+test("MCP bootstrap fails immediately when daemon is degraded", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let starts = 0;
+  const healthClient = {
+    async health(): Promise<unknown> {
+      return {
+        displayName: "DeepSeek Sub-Agent",
+        state: "degraded",
+        ready: false,
+        error: "Fatal OpenCode startup error",
+        status: { running: false, state: "degraded", ready: false, error: "Fatal OpenCode startup error" },
+      };
+    },
+  };
+
+  await assert.rejects(
+    () => ensureDaemonRunning(config, healthClient, {
+      start: async () => {
+        starts += 1;
+      },
+      timeoutMs: 500,
+      retryMs: 10,
+    }),
+    /degraded.*Fatal OpenCode startup error/,
+  );
+  assert.equal(starts, 0, "must not attempt to restart a degraded daemon");
+});

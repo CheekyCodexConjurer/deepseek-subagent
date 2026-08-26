@@ -573,3 +573,145 @@ test("BridgeHttpClient propagates the daemon's structured code as a typed Bridge
     await closeHttp(http);
   }
 });
+
+test("HTTP server binds socket and exposes lifecycle state before readiness (delayed recovery fixture)", async () => {
+  let isReady = false;
+  let state = "recovering";
+  let spawnCalled = false;
+  const service = {
+    isReady: () => isReady,
+    spawn: async () => {
+      spawnCalled = true;
+      return { accepted: true };
+    },
+    status: () => ({
+      state,
+      ready: isReady,
+      running: isReady,
+      opencodeUrl: null,
+      provider: "opencode-go",
+      model: "deepseek-v4-flash",
+      variant: "max",
+      experimentalSameChatDelivery: false,
+      followDefaultWaitMinutes: 60,
+      followDefaultGraceMinutes: 10,
+      codexDelivery: { available: false, reason: null },
+      correlation: { hints: 0, bindings: 0 },
+      retention: { mode: "auto", dbState: "fresh", pruningEnabled: false },
+      lastStreamError: null,
+      activeRoute: null,
+      activeRouteSource: "configured-default",
+    }),
+  } as unknown as BridgeService;
+
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-readiness-token",
+    dataDir: "C:\\deepseek-http-readiness-data",
+    configPath: "C:\\deepseek-http-readiness-data\\config.json",
+  });
+
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    // 1. While recovering (not ready yet), socket is connected and /health returns 200 with state="recovering", ready=false
+    const healthResponse = await fetch(`http://${config.daemonHost}:${config.daemonPort}/health`);
+    assert.equal(healthResponse.status, 200);
+    const healthBody = await healthResponse.json() as Record<string, unknown>;
+    assert.equal(healthBody.displayName, "DeepSeek Sub-Agent");
+    assert.equal(healthBody.state, "recovering");
+    assert.equal(healthBody.ready, false);
+    assert.equal((healthBody.status as Record<string, unknown>)?.running, false);
+
+    // 2. Non-health tool endpoints fail with typed retryable 503 service_unavailable
+    const spawnResponse = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ topic: "test", task: "test" }),
+    });
+    assert.equal(spawnResponse.status, 503);
+    const spawnBody = await spawnResponse.json() as Record<string, unknown>;
+    assert.equal(spawnBody.code, "service_unavailable");
+    assert.equal(spawnBody.status, 503);
+    assert.equal(spawnBody.retry, true);
+    assert.equal(spawnBody.ready, false);
+    assert.equal(spawnBody.state, "recovering");
+    assert.equal(spawnCalled, false, "service spawn must not be executed early while recovering");
+
+    // 3. Complete recovery -> state becomes "ready", ready=true
+    isReady = true;
+    state = "ready";
+
+    const readyHealth = await fetch(`http://${config.daemonHost}:${config.daemonPort}/health`);
+    assert.equal(readyHealth.status, 200);
+    const readyBody = await readyHealth.json() as Record<string, unknown>;
+    assert.equal(readyBody.state, "ready");
+    assert.equal(readyBody.ready, true);
+    assert.equal((readyBody.status as Record<string, unknown>)?.running, true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP server handles degraded state after startup failure", async () => {
+  const service = {
+    isReady: () => false,
+    status: () => ({
+      state: "degraded",
+      ready: false,
+      running: false,
+      error: "OpenCode binary not found in PATH",
+      opencodeUrl: null,
+      provider: "opencode-go",
+      model: "deepseek-v4-flash",
+      variant: "max",
+      experimentalSameChatDelivery: false,
+      followDefaultWaitMinutes: 60,
+      followDefaultGraceMinutes: 10,
+      codexDelivery: { available: false, reason: null },
+      correlation: { hints: 0, bindings: 0 },
+      retention: { mode: "auto", dbState: "fresh", pruningEnabled: false },
+      lastStreamError: null,
+      activeRoute: null,
+      activeRouteSource: "configured-default",
+    }),
+  } as unknown as BridgeService;
+
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-degraded-token",
+    dataDir: "C:\\deepseek-http-degraded-data",
+    configPath: "C:\\deepseek-http-degraded-data\\config.json",
+  });
+
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const healthResponse = await fetch(`http://${config.daemonHost}:${config.daemonPort}/health`);
+    assert.equal(healthResponse.status, 200);
+    const healthBody = await healthResponse.json() as Record<string, unknown>;
+    assert.equal(healthBody.state, "degraded");
+    assert.equal(healthBody.ready, false);
+    assert.equal(healthBody.error, "OpenCode binary not found in PATH");
+
+    const spawnResponse = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ topic: "test", task: "test" }),
+    });
+    assert.equal(spawnResponse.status, 503);
+    const spawnBody = await spawnResponse.json() as Record<string, unknown>;
+    assert.equal(spawnBody.code, "service_unavailable");
+    assert.equal(spawnBody.retry, false);
+  } finally {
+    await server.stop();
+  }
+});
