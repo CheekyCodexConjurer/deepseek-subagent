@@ -224,3 +224,110 @@ test("Phase 1: service startup failure leaves HTTP server in degraded state with
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("Phase 1: retention policy scheduling does not execute synchronous pruning during startup microtask or block /health", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-phase1-retention-readiness-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const port = await freePort();
+
+  // Populate store with an agent, consumed job, and old events eligible for pruning
+  const old = new Date(Date.now() - 60 * 24 * 60 * 60_000).toISOString();
+  store.createAgent({
+    id: "agent_retention_readiness",
+    title: "Retention Readiness",
+    topic: "Readiness topic",
+    repositoryRoot: directory,
+    workspacePath: directory,
+    workspaceStrategy: "shared",
+    opencodeServerId: "server_readiness",
+    opencodeSessionId: "session_readiness",
+    modelProviderId: "opencode-go",
+    modelId: "deepseek-v4-flash",
+    modelVariant: "max",
+    modelRoute: "flash-max",
+  });
+  const job = store.createJob({
+    id: "job_retention_readiness",
+    agentId: "agent_retention_readiness",
+    kind: "spawn",
+    requestId: "request_retention_readiness",
+    promptHash: "h",
+  });
+  store.updateJobStatus(job.id, "dispatching");
+  store.updateJobStatus(job.id, "running");
+  store.updateJobStatus(job.id, "completed");
+  store.updateJobStatus(job.id, "delivery_pending");
+  store.updateJobStatus(job.id, "delivered");
+  store.setJobResult(job.id, path.join(directory, "results", "job_retention_readiness.json"), "readiness");
+  store.consumeResult(job.id);
+  for (let index = 0; index < 3; index += 1) {
+    store.insertEvent({
+      source: "opencode",
+      sourceEventId: "readiness_" + index,
+      eventType: "session.idle",
+      sessionId: "session_readiness",
+      jobId: job.id,
+    });
+  }
+  store.db.prepare("UPDATE events SET received_at = ? WHERE job_id = ?").run(old, job.id);
+  store.markRetentionPrepared();
+
+  // Track if pruning queries execute during startup
+  let pruneQueryExecutedDuringStartup = false;
+  const originalPrepare = store.db.prepare.bind(store.db);
+  store.db.prepare = ((sql: string, ...rest: unknown[]) => {
+    if (typeof sql === "string" && (sql.includes("FROM events WHERE received_at < ?") || sql.includes("DELETE FROM events"))) {
+      pruneQueryExecutedDuringStartup = true;
+    }
+    return (originalPrepare as (...args: unknown[]) => unknown)(sql, ...rest);
+  }) as typeof store.db.prepare;
+
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: port,
+    daemonToken: "retention-readiness-token",
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    retentionMode: "enabled",
+  });
+
+  const manager = new FakeManager(client);
+  const service = new BridgeService(config, {
+    store,
+    manager,
+  });
+  const http = new BridgeHttpServer(config, service);
+
+  await http.start();
+  try {
+    // Start service
+    await service.start();
+
+    // Invariant: startup reaches ready without running synchronous retention prune queries in startup microtask turn
+    assert.equal(
+      pruneQueryExecutedDuringStartup,
+      false,
+      "retention pruning queries must not execute synchronously during service startup microtask",
+    );
+
+    // /health is immediately reachable and reports ready=true with pruning enabled in policy
+    const healthRes = await fetch(`http://${config.daemonHost}:${config.daemonPort}/health`);
+    assert.equal(healthRes.status, 200);
+    const healthBody = await healthRes.json() as Record<string, unknown>;
+    assert.equal(healthBody.state, "ready");
+    assert.equal(healthBody.ready, true);
+    const status = healthBody.status as Record<string, unknown>;
+    assert.equal(status?.running, true);
+    assert.equal((status?.retention as Record<string, unknown>)?.pruningEnabled, true);
+
+    // Events were not pruned during startup: maintenance is deferred to scheduled interval
+    const remaining = store.db.prepare("SELECT COUNT(*) AS count FROM events WHERE job_id = ?").get(job.id) as { count: number | bigint };
+    assert.equal(Number(remaining.count), 3, "events must remain intact right after startup without immediate pruning pass");
+  } finally {
+    await http.stop();
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

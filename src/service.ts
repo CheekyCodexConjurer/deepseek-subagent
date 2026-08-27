@@ -404,7 +404,6 @@ export class BridgeService {
         this.lastStreamError = redactSecrets(String(error));
       }
     };
-    queueMicrotask(runPass);
     this.retentionTimer = setInterval(runPass, RETENTION_INTERVAL_MS);
     this.retentionTimer.unref?.();
   }

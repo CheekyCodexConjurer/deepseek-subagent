@@ -16,6 +16,7 @@ import { BridgeStore } from "../../src/store.js";
 import { BridgeBusyError, BridgeService, FollowCancelledError, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH } from "../../src/antigravity/args.js";
+import { runRetentionPrune } from "../../src/retention.js";
 import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -4579,6 +4580,7 @@ test("enabled retention never auto-prunes a legacy database without the offline 
   try {
     await second.start();
     assert.equal(second.status().retention.pruningEnabled, true, "the offline preparation marker arms pruning on the legacy DB");
+    runRetentionPrune(store, {});
     const remaining = store.db.prepare("SELECT COUNT(*) AS count FROM events WHERE job_id = ?").get(job.id) as { count: number | bigint };
     assert.equal(Number(remaining.count), 0, "the daemon pruned the eligible old events after preparation");
   } finally {
