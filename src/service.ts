@@ -243,6 +243,7 @@ export class BridgeService {
   private readonly eventRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly followLifecycles = new Map<string, FollowLifecycle>();
   private readonly antigravityAbortControllers = new Map<string, AbortController>();
+  private readonly antigravityTasks = new Set<Promise<void>>();
   private retentionTimer: NodeJS.Timeout | null = null;
   private retentionState: RetentionPolicyState | null = null;
   private lifecycleState: DaemonLifecycleState = "starting";
@@ -347,6 +348,13 @@ export class BridgeService {
     this.followLifecycles.clear();
     for (const controller of this.antigravityAbortControllers.values()) controller.abort();
     this.antigravityAbortControllers.clear();
+    if (this.antigravityTasks.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.antigravityTasks]),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+      this.antigravityTasks.clear();
+    }
     this.streamAbort?.abort();
     this.streamAbort = null;
     if (this.streamTask) {
@@ -1505,9 +1513,14 @@ export class BridgeService {
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
     this.store.updateJobStatus(job.id, "running");
-    void this.runAntigravityAsync(agent, job, prompt, controller, workerInput, contextFiles).catch((error: unknown) => {
-      if (this.running) this.lastStreamError = redactSecrets(String(error));
-    });
+    const task = this.runAntigravityAsync(agent, job, prompt, controller, workerInput, contextFiles)
+      .catch((error: unknown) => {
+        if (this.running) this.lastStreamError = redactSecrets(String(error));
+      })
+      .finally(() => {
+        this.antigravityTasks.delete(task);
+      });
+    this.antigravityTasks.add(task);
     return this.accepted(this.store.getJob(job.id) ?? job);
   }
 
@@ -1610,6 +1623,10 @@ export class BridgeService {
         cwd: agent.workspacePath,
         model: agent.modelId,
         signal: controller.signal,
+        dataDir: this.config.dataDir,
+        agentId: agent.id,
+        jobId: job.id,
+        requestId: job.requestId,
       });
       const current = this.store.getJob(job.id);
       if (controller.signal.aborted || current?.status === "aborted") {
@@ -1640,6 +1657,11 @@ export class BridgeService {
       if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
       const deliveryJob = this.store.getJob(job.id) ?? job;
       await this.deliverEnvelope(stored.envelope, deliveryJob);
+      const spool = new AntigravitySpool(this.config.dataDir);
+      const attempts = await spool.listAttempts(job.id);
+      if (attempts.length > 0) {
+        await spool.cleanupPrompt(attempts[attempts.length - 1]!.attemptId, job.id);
+      }
     } catch (error) {
       const message = redactSecrets(String(error));
       const current = this.store.getJob(job.id);
@@ -1665,7 +1687,7 @@ export class BridgeService {
       if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch");
+      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
       if (this.followLifecycles.has(job.id)) {
         await this.resolveFollow(job.id, { status: "failed", error: message });
       }
@@ -2512,9 +2534,14 @@ export class BridgeService {
           normalizeFollowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
         );
       }
-      void this.monitorReattachedAntigravityAttempt(agent, job, latestAttempt, spool).catch((error) => {
-        if (this.running) this.lastStreamError = redactSecrets(String(error));
-      });
+      const task = this.monitorReattachedAntigravityAttempt(agent, job, latestAttempt, spool)
+        .catch((error) => {
+          if (this.running) this.lastStreamError = redactSecrets(String(error));
+        })
+        .finally(() => {
+          this.antigravityTasks.delete(task);
+        });
+      this.antigravityTasks.add(task);
       return;
     }
 
@@ -2589,9 +2616,14 @@ export class BridgeService {
 
     const controller = new AbortController();
     this.antigravityAbortControllers.set(job.id, controller);
-    void this.runAntigravityAttemptAsync(agent, job, replacement, controller).catch((error) => {
-      if (this.running) this.lastStreamError = redactSecrets(String(error));
-    });
+    const task = this.runAntigravityAttemptAsync(agent, job, replacement, controller)
+      .catch((error) => {
+        if (this.running) this.lastStreamError = redactSecrets(String(error));
+      })
+      .finally(() => {
+        this.antigravityTasks.delete(task);
+      });
+    this.antigravityTasks.add(task);
   }
 
   private async monitorReattachedAntigravityAttempt(

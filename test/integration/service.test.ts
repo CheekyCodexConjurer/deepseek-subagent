@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { execFile, spawn } from "node:child_process";
@@ -16,6 +17,7 @@ import { BridgeStore } from "../../src/store.js";
 import { BridgeBusyError, BridgeService, FollowCancelledError, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH } from "../../src/antigravity/args.js";
+import { AntigravitySpool } from "../../src/antigravity/spool.js";
 import { runRetentionPrune } from "../../src/retention.js";
 import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
 
@@ -359,7 +361,6 @@ test("spawn returns after dispatch, completes on idle, deduplicates, and continu
     await rm(directory, { recursive: true, force: true });
   }
 });
-
 test("Antigravity references large context files from the workspace instead of overflowing the CLI prompt", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-context-budget-"));
   const store = await BridgeStore.open(directory);
@@ -3519,6 +3520,7 @@ test("the enabled antigravity route is selectable as the active route and new sp
       cwd: directory,
       mode: "analyze",
     });
+    await waitForCondition(() => agyCalls.length === 1);
     assert.equal(agyCalls.length, 1, "exactly one agy spawn");
     assert.equal(client.sessionCount, 0, "no OpenCode session was created");
     assert.equal(client.promptCalls.length, 0, "no OpenCode prompt was dispatched");
@@ -3566,6 +3568,7 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
       mode: "analyze",
       modelRoute: "antigravity-flash-high",
     });
+    await waitForCondition(() => agyCalls.length === 1);
     assert.equal(agyCalls.length, 1, "exactly one agy spawn");
     assert.equal(client.sessionCount, 0, "no OpenCode session was created");
     assert.equal(client.promptCalls.length, 0, "no OpenCode prompt was dispatched");
@@ -3638,6 +3641,7 @@ test("antigravity route failure marks the job failed after exactly one agy spawn
       modelRoute: "antigravity-flash-high",
     });
     assert.equal(accepted.accepted, true, "spawn stays async: acceptance happens before the agy failure");
+    await waitForCondition(() => agyCalls.length === 1);
     assert.equal(agyCalls.length, 1, "exactly one agy spawn, no retry");
     assert.equal(client.sessionCount, 0, "no OpenCode session was created");
     assert.equal(client.promptCalls.length, 0, "no OpenCode prompt was dispatched");
@@ -3682,6 +3686,7 @@ test("antigravity spawn returns accepted while agy is still executing; deepseek_
       mode: "analyze",
     });
     assert.equal(accepted.accepted, true);
+    await waitForCondition(() => agyCalls.length === 1);
     assert.equal(agyCalls.length, 1, "exactly one agy spawn started");
     assert.ok(
       ["dispatching", "running"].includes(store.getJob(accepted.jobId)?.status ?? ""),
@@ -3734,6 +3739,7 @@ test("antigravity follow grace timeout aborts the live process controller, never
       cwd: directory,
       mode: "analyze",
     });
+    await waitForCondition(() => agyCalls.length === 1);
     assert.equal(agyCalls.length, 1, "exactly one agy spawn is running");
     await waitForCondition(() => internal.antigravityAbortControllers.has(accepted.jobId));
     const controller = internal.antigravityAbortControllers.get(accepted.jobId);
@@ -3854,7 +3860,7 @@ test("abort signals an active antigravity process tree and leaves the job termin
       mode: "analyze",
       modelRoute: "antigravity-flash-high",
     });
-    await waitForCondition(() => store.listAgents()[0]?.status === "working");
+    await waitForCondition(() => agyCalls.length === 1);
     const agent = store.listAgents()[0];
     assert.ok(agent);
     const aborted = await service.abort(agent.id, "test abort");
@@ -3878,7 +3884,7 @@ test("abort signals an active antigravity process tree and leaves the job termin
   }
 });
 
-test("an aborted Antigravity run is never recorded as a rejected dispatch and recovery settles the stranded job", async () => {
+test("an aborted Antigravity run is never recorded as a rejected dispatch and recovery settles the aborted job", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-abort-classify-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
@@ -3914,10 +3920,10 @@ test("an aborted Antigravity run is never recorded as a rejected dispatch and re
       "an abort signal must never be recorded as a rejected dispatch",
     );
     assert.equal(store.getJob(accepted.jobId)?.status, "running", "stop() leaves the in-flight job as-is for startup recovery");
-    // The next daemon start terminalizes the stranded job.
+    // The next daemon start settles the aborted job.
     await service.start();
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
-    assert.match(store.getJob(accepted.jobId)?.error ?? "", /stranded|cannot be recovered/i);
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "aborted", 2_000);
+    assert.match(store.getJob(accepted.jobId)?.error ?? "", /cancelled|aborted/i);
   } finally {
     await service.stop();
     store.close();
@@ -4427,7 +4433,6 @@ test("valid tracked context files work with worktree strategy and resolve inside
     await rm(dataDir, { recursive: true, force: true });
   }
 });
-
 test("escaping context paths with worktree strategy fail typed 400 before any worktree", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-escape-"));
   await git(directory, "init", "-q");
@@ -5383,6 +5388,87 @@ test("antigravity timeout does not fall back when fallback route provider is not
     const job = store.getJob(accepted.jobId);
     assert.equal(job?.status, "failed");
     assert.equal(job?.fallbackCount ?? 0, 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("normal Antigravity first spawn persists one linked attempt, reaches terminal status, and removes transient prompt", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-first-spawn-cwd-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-first-spawn-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
+
+  const config = createDefaultConfig({
+    dataDir,
+    configPath: path.join(dataDir, "config.json"),
+    modelRoutes: [
+      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Flash · Max" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.7 Flash High" },
+    ],
+  });
+
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      spawnFn: agyFixtureSpawn("ok", agyCalls, prompts),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+
+    const accepted = await service.spawn({
+      requestId: "request_agy_normal_first_spawn",
+      topic: "Normal Antigravity spawn",
+      task: "Analyze repository architecture",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.status, "accepted");
+    assert.ok(accepted.agentId);
+    assert.ok(accepted.jobId);
+
+    await waitForCondition(() => {
+      const job = store.getJob(accepted.jobId);
+      return job !== null && ["completed", "delivery_pending", "delivered"].includes(job.status);
+    }, 2_000);
+
+    const job = store.getJob(accepted.jobId);
+    assert.ok(job);
+    assert.equal(job.status, "delivered");
+    assert.equal(agyCalls.length, 1, "exactly one agy execution was spawned");
+
+    const spool = new AntigravitySpool(dataDir);
+    const attempts = await spool.listAttempts(accepted.jobId);
+    assert.equal(attempts.length, 1, "exactly one spool attempt must be persisted");
+
+    const attempt = attempts[0]!;
+    assert.equal(attempt.agentId, accepted.agentId);
+    assert.equal(attempt.jobId, accepted.jobId);
+    assert.equal(attempt.requestId, "request_agy_normal_first_spawn");
+    assert.equal(attempt.modelRoute, "antigravity-flash-high");
+    assert.equal(attempt.modelId, "gemini-3.7-flash-high");
+    assert.equal(attempt.cwd, directory);
+
+    const attemptStatus = await spool.readStatus(attempt.attemptId, accepted.jobId);
+    assert.ok(attemptStatus);
+    assert.equal(attemptStatus.status, "completed");
+    assert.equal(attemptStatus.exitCode, 0);
+
+    assert.equal(existsSync(attempt.promptPath), false, "transient prompt.txt must be removed after terminal status");
   } finally {
     await service.stop();
     store.close();
