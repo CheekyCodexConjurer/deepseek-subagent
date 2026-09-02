@@ -613,7 +613,7 @@ test("MCP drops a legacy model_route argument and dispatches on the active route
         accepted: true,
         status: "accepted",
         topic: "t",
-        modelDisplayName: "Antigravity · Gemini 3.7 Flash High",
+        modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
         agentId: "agent_active_route",
         jobId: "job_active_route",
         state: "Starting",

@@ -2734,9 +2734,11 @@ function staticModelDisplayName(modelId: string, variant: string | null): string
     ? "DeepSeek V4 Flash"
     : modelId === "deepseek-v4-pro"
       ? "DeepSeek V4 Pro"
-      : modelId === "gemini-3.7-flash-high"
-        ? "Gemini 3.7 Flash High"
-        : modelId;
+      : modelId === "gemini-3.8-flash-high"
+        ? "Gemini 3.8 Flash High"
+        : modelId === "gemini-3.7-flash-high"
+          ? "Gemini 3.7 Flash High"
+          : modelId;
   return variant === "max" ? base + " · Max" : base;
 }
 

@@ -27,7 +27,7 @@ function fixtureSpawn(behavior: string, calls: string[] = []) {
 test("buildAgyArgs matches the smoke-observed contract with the prompt last", () => {
   assert.deepEqual(buildAgyArgs("do the thing", {}), [
     "--model",
-    "gemini-3.7-flash-high",
+    "gemini-3.8-flash-high",
     "-p",
     "do the thing",
     "--print-timeout",
@@ -53,7 +53,7 @@ test("buildAgyArgs adds the lab-only sandbox permission flags before the prompt"
     dangerouslySkipPermissions: true,
   }), [
     "--model",
-    "gemini-3.7-flash-high",
+    "gemini-3.8-flash-high",
     "--sandbox",
     "--add-dir",
     "C:\\lab\\external-a",
@@ -289,8 +289,8 @@ test("AntigravityAdapter maps a fixture run into the bridge result contract", as
   assert.deepEqual(result.files, ["src/example.ts"]);
   assert.deepEqual(result.tests, ["npm test"]);
   assert.equal(result.diffSummary, "1 file changed");
-  assert.equal(result.model, "gemini-3.7-flash-high");
-  assert.equal(result.modelDisplayName, "Antigravity · gemini-3.7-flash-high");
+  assert.equal(result.model, "gemini-3.8-flash-high");
+  assert.equal(result.modelDisplayName, "Antigravity · gemini-3.8-flash-high");
   assert.equal(result.workspace, process.cwd());
   assert.match(result.rawOutput, /run_fixture_1/);
 });
@@ -388,7 +388,7 @@ test("buildAgyArgs derives --print-timeout from timeoutMs when printTimeout is n
   const args = buildAgyArgs("test task", { timeoutMs: 300_000 });
   assert.deepEqual(args, [
     "--model",
-    "gemini-3.7-flash-high",
+    "gemini-3.8-flash-high",
     "-p",
     "test task",
     "--print-timeout",

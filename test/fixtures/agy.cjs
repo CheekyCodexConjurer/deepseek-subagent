@@ -3,7 +3,7 @@
 
 // Fake `agy` executable for tests without quota. Behavior selected by the
 // AGY_FIXTURE environment variable. Always validates the argument contract
-// observed in the smoke: `--model gemini-3.7-flash-high -p <prompt>
+// observed in the smoke: `--model gemini-3.8-flash-high -p <prompt>
 // --print-timeout <timeout>`.
 
 const args = process.argv.slice(2);
@@ -12,7 +12,7 @@ const prompt = promptIndex >= 0 ? (args[promptIndex + 1] ?? "") : "";
 
 const valid =
   args[0] === "--model" &&
-  args[1] === "gemini-3.7-flash-high" &&
+  (args[1] === "gemini-3.8-flash-high" || args[1] === "gemini-3.7-flash-high") &&
   promptIndex >= 2 &&
   prompt.trim().length > 0 &&
   args[args.length - 2] === "--print-timeout" &&

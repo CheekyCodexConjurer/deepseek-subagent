@@ -1,4 +1,4 @@
-import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, buildAgyArgs } from "./args.js";
+import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, AGY_MODEL, buildAgyArgs } from "./args.js";
 import { parseAgyOutput } from "./parser.js";
 import { AntigravityProcessError, runAgy, type SpawnLike } from "./runner.js";
 import { InvalidRequestError } from "../errors.js";
@@ -68,7 +68,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
 
   constructor(options: AntigravityAdapterOptions = {}) {
     this.command = options.command ?? AGY_COMMAND;
-    this.model = options.model ?? "gemini-3.7-flash-high";
+    this.model = options.model ?? AGY_MODEL;
     this.timeoutMs = options.timeoutMs ?? 900_000;
     this.sandbox = options.sandbox === true;
     this.addDirs = [...new Set(options.addDirs ?? [])];

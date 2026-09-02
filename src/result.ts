@@ -404,9 +404,11 @@ function summarizeDiff(diff: unknown): string {
 function displayModel(modelId: string, variant: string | null): string {
   const base = modelId === "deepseek-v4-flash"
     ? "DeepSeek V4 Flash"
-    : modelId === "gemini-3.7-flash-high"
-      ? "Gemini 3.7 Flash High"
-      : modelId;
+    : modelId === "gemini-3.8-flash-high"
+      ? "Gemini 3.8 Flash High"
+      : modelId === "gemini-3.7-flash-high"
+        ? "Gemini 3.7 Flash High"
+        : modelId;
   return variant === "max" ? base + " · Max" : base;
 }
 

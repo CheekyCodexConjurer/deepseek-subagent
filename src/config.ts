@@ -44,11 +44,11 @@ export const MODEL_ROUTE_REGISTRY: readonly ModelRoute[] = [
   {
     name: "antigravity-flash-high",
     providerId: "antigravity",
-    modelId: "gemini-3.7-flash-high",
+    modelId: "gemini-3.8-flash-high",
     variant: null,
     enabled: true,
     default: false,
-    display: "Antigravity · Gemini 3.7 Flash High",
+    display: "Antigravity · Gemini 3.8 Flash High",
   },
 ];
 
@@ -114,10 +114,16 @@ function parseRouteRegistry(value: unknown): ModelRoute[] | null {
     const variant = asNullableString(raw.variant);
     const enabled = raw.enabled !== false;
     const defaultRoute = raw.default === true;
-    const display = typeof raw.display === "string" && raw.display.length > 0
-      ? raw.display
-      : raw.providerId + "/" + raw.modelId + (variant ? " · " + variant : "");
-    routes.push({ name: raw.name, providerId: raw.providerId, modelId: raw.modelId, variant, enabled, default: defaultRoute, display });
+    let modelId = raw.modelId;
+    let display = typeof raw.display === "string" && raw.display.length > 0 ? raw.display : null;
+    if (raw.name === "antigravity-flash-high" && raw.providerId === "antigravity" && modelId === "gemini-3.7-flash-high") {
+      modelId = "gemini-3.8-flash-high";
+      if (!display || display === "Antigravity · Gemini 3.7 Flash High" || display === "antigravity/gemini-3.7-flash-high") {
+        display = "Antigravity · Gemini 3.8 Flash High";
+      }
+    }
+    const effectiveDisplay = display ?? (raw.providerId + "/" + modelId + (variant ? " · " + variant : ""));
+    routes.push({ name: raw.name, providerId: raw.providerId, modelId, variant, enabled, default: defaultRoute, display: effectiveDisplay });
   }
   if (routes.some((route) => route.default)) return routes;
   const first = routes[0];

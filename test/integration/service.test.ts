@@ -3528,8 +3528,8 @@ test("the enabled antigravity route is selectable as the active route and new sp
     assert.ok(agent);
     assert.equal(agent.modelRoute, "antigravity-flash-high");
     assert.equal(agent.modelProviderId, "antigravity");
-    assert.equal(agent.modelId, "gemini-3.7-flash-high");
-    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.7 Flash High");
+    assert.equal(agent.modelId, "gemini-3.8-flash-high");
+    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
     await waitForCondition(() => store.getJob(accepted.jobId)?.status === "delivered", 2_000);
   } finally {
     await service.stop();
@@ -3548,7 +3548,7 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
     configPath: path.join(directory, "config.json"),
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
   const service = new BridgeService(config, {
@@ -3572,12 +3572,12 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
     assert.equal(agyCalls.length, 1, "exactly one agy spawn");
     assert.equal(client.sessionCount, 0, "no OpenCode session was created");
     assert.equal(client.promptCalls.length, 0, "no OpenCode prompt was dispatched");
-    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.7 Flash High");
+    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
     const agent = store.getAgent(accepted.agentId);
     assert.ok(agent);
     assert.equal(agent.modelRoute, "antigravity-flash-high");
     assert.equal(agent.modelProviderId, "antigravity");
-    assert.equal(agent.modelId, "gemini-3.7-flash-high");
+    assert.equal(agent.modelId, "gemini-3.8-flash-high");
     assert.equal(agent.opencodeSessionId, "antigravity:" + agent.id);
     assert.ok(
       ["dispatching", "running"].includes(store.getJob(accepted.jobId)?.status ?? ""),
@@ -3597,8 +3597,8 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
     assert.equal(persisted.envelope.summary, "Fixture summary: task completed without quota.");
     assert.deepEqual(persisted.envelope.files, ["src/example.ts"]);
     assert.deepEqual(persisted.envelope.tests, ["npm test"]);
-    assert.equal(persisted.envelope.model, "gemini-3.7-flash-high");
-    assert.equal(persisted.envelope.modelDisplayName, "Antigravity · gemini-3.7-flash-high");
+    assert.equal(persisted.envelope.model, "gemini-3.8-flash-high");
+    assert.equal(persisted.envelope.modelDisplayName, "Antigravity · gemini-3.8-flash-high");
     const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
     assert.equal(followed.status, "completed");
     assert.equal(followed.result?.envelope.summary, "Fixture summary: task completed without quota.");
@@ -3620,7 +3620,7 @@ test("antigravity route failure marks the job failed after exactly one agy spawn
     configPath: path.join(directory, "config.json"),
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
   const service = new BridgeService(config, {
@@ -3840,7 +3840,7 @@ test("abort signals an active antigravity process tree and leaves the job termin
     configPath: path.join(directory, "config.json"),
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
   const service = new BridgeService(config, {
@@ -4960,7 +4960,7 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
     antigravityTimeoutFallbackRoute: "flash-max",
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -4989,7 +4989,7 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
     });
 
     assert.equal(accepted.accepted, true);
-    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.7 Flash High");
+    assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
 
     // Wait for Antigravity timeout to trigger OpenCode fallback
     await waitForCondition(() => client.promptCalls.length === 1, 3_000);
@@ -5007,7 +5007,7 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
     assert.ok(agent);
     assert.equal(agent.modelRoute, "antigravity-flash-high", "primary route name preserved on agent");
     assert.equal(agent.modelProviderId, "antigravity", "primary provider preserved on agent");
-    assert.equal(agent.modelId, "gemini-3.7-flash-high", "primary model id preserved on agent");
+    assert.equal(agent.modelId, "gemini-3.8-flash-high", "primary model id preserved on agent");
     assert.notEqual(agent.opencodeSessionId, "antigravity:" + agent.id, "real OpenCode session ID bound to agent");
 
     // Verify fallback audit on job
@@ -5068,7 +5068,7 @@ test("antigravity timeout does not fall back when antigravityTimeoutFallbackRout
     antigravityTimeoutFallbackRoute: null,
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5125,7 +5125,7 @@ test("antigravity timeout does not fall back for edit mode or test mode", async 
     antigravityTimeoutFallbackRoute: "flash-max",
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5181,7 +5181,7 @@ test("antigravity non-timeout errors do not trigger fallback", async () => {
     antigravityTimeoutFallbackRoute: "flash-max",
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5237,7 +5237,7 @@ test("antigravity timeout does not fall back if fallback route is disabled or mi
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
       { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5292,7 +5292,7 @@ test("abort racing Antigravity timeout never launches OpenCode fallback", async 
     antigravityTimeoutFallbackRoute: "flash-max",
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5354,7 +5354,7 @@ test("antigravity timeout does not fall back when fallback route provider is not
     antigravityTimeoutFallbackRoute: "custom-other",
     modelRoutes: [
       { name: "custom-other", providerId: "other-provider", modelId: "other-model", variant: null, enabled: true, default: false, display: "Other Provider · Model" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5409,7 +5409,7 @@ test("normal Antigravity first spawn persists one linked attempt, reaches termin
     configPath: path.join(dataDir, "config.json"),
     modelRoutes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   });
 
@@ -5460,7 +5460,7 @@ test("normal Antigravity first spawn persists one linked attempt, reaches termin
     assert.equal(attempt.jobId, accepted.jobId);
     assert.equal(attempt.requestId, "request_agy_normal_first_spawn");
     assert.equal(attempt.modelRoute, "antigravity-flash-high");
-    assert.equal(attempt.modelId, "gemini-3.7-flash-high");
+    assert.equal(attempt.modelId, "gemini-3.8-flash-high");
     assert.equal(attempt.cwd, directory);
 
     const attemptStatus = await spool.readStatus(attempt.attemptId, accepted.jobId);
@@ -5469,6 +5469,78 @@ test("normal Antigravity first spawn persists one linked attempt, reaches termin
     assert.equal(attemptStatus.exitCode, 0);
 
     assert.equal(existsSync(attempt.promptPath), false, "transient prompt.txt must be removed after terminal status");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("existing persisted agent with historical gemini-3.7-flash-high retains pinned identity while new spawns receive 3.8", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-historical-pinning-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-historical-pinning-data-"));
+  const store = await BridgeStore.open(dataDir);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+
+  // Create an existing historical agent directly in store with 3.7
+  const historicalAgent = store.createAgent({
+    id: "agent_historical_37",
+    title: "Historical Agent",
+    topic: "Historical Gemini 3.7 task",
+    repositoryRoot: directory,
+    workspacePath: directory,
+    workspaceStrategy: "shared",
+    opencodeServerId: "antigravity",
+    opencodeSessionId: "antigravity:agent_historical_37",
+    modelProviderId: "antigravity",
+    modelId: "gemini-3.7-flash-high",
+    modelVariant: null,
+    modelRoute: "antigravity-flash-high",
+  });
+  store.updateAgentStatus(historicalAgent.id, "working");
+  store.updateAgentStatus(historicalAgent.id, "completed");
+
+  const service = new BridgeService(createDefaultConfig({ dataDir, configPath: path.join(dataDir, "config.json") }), {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({
+      command: "node",
+      spawnFn: agyFixtureSpawn("ok", agyCalls),
+    }),
+  });
+
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+
+    // 1. Verify persisted agent retains historical 3.7 model identity
+    const reloadedAgent = store.getAgent(historicalAgent.id);
+    assert.ok(reloadedAgent);
+    assert.equal(reloadedAgent.modelId, "gemini-3.7-flash-high");
+    assert.equal(reloadedAgent.modelRoute, "antigravity-flash-high");
+
+    // 2. New spawn receives promoted 3.8 model identity
+    const newSpawn = await service.spawn({
+      requestId: "req_new_spawn_38",
+      topic: "New spawn on 3.8",
+      task: "Task on promoted model",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+
+    assert.equal(newSpawn.accepted, true);
+    assert.equal(newSpawn.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
+
+    const newAgent = store.getAgent(newSpawn.agentId);
+    assert.ok(newAgent);
+    assert.equal(newAgent.modelId, "gemini-3.8-flash-high");
+    assert.equal(newAgent.modelRoute, "antigravity-flash-high");
+
+    await waitForCondition(() => store.getJob(newSpawn.jobId)?.status === "delivered", 2_000);
   } finally {
     await service.stop();
     store.close();

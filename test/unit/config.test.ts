@@ -86,7 +86,8 @@ test("antigravity route is registered, enabled for selection, and never becomes 
   const route = config.modelRoutes.find((candidate) => candidate.name === "antigravity-flash-high");
   assert.ok(route);
   assert.equal(route.providerId, "antigravity");
-  assert.equal(route.modelId, "gemini-3.7-flash-high");
+  assert.equal(route.modelId, "gemini-3.8-flash-high");
+  assert.equal(route.display, "Antigravity · Gemini 3.8 Flash High");
   assert.equal(route.variant, null);
   assert.equal(route.enabled, true, "selectable by the operator control plane");
   assert.equal(route.default, false, "never the default");
@@ -309,6 +310,69 @@ test("antigravityTimeoutFallbackRoute defaults to null and survives a load round
     }), "utf8");
     const emptyLoaded = await loadConfig(configPath);
     assert.equal(emptyLoaded.antigravityTimeoutFallbackRoute, null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("existing config containing exactly built-in antigravity-flash-high 3.7 route performs fail-closed narrow in-memory migration to 3.8 without modifying disk", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-migration-"));
+  const configPath = path.join(directory, "config.json");
+  try {
+    const rawConfig = {
+      dataDir: directory,
+      configPath,
+      modelRoutes: [
+        {
+          name: "flash-max",
+          providerId: "opencode-go",
+          modelId: "deepseek-v4-flash",
+          variant: "max",
+          enabled: true,
+          default: true,
+          display: "DeepSeek V4 Flash · Max",
+        },
+        {
+          name: "antigravity-flash-high",
+          providerId: "antigravity",
+          modelId: "gemini-3.7-flash-high",
+          variant: null,
+          enabled: true,
+          default: false,
+          display: "Antigravity · Gemini 3.7 Flash High",
+        },
+        {
+          name: "custom-legacy-37",
+          providerId: "custom-provider",
+          modelId: "gemini-3.7-flash-high",
+          variant: null,
+          enabled: true,
+          default: false,
+          display: "Custom 3.7 Route",
+        },
+      ],
+    };
+    const jsonBefore = JSON.stringify(rawConfig, null, 2);
+    await writeFile(configPath, jsonBefore, "utf8");
+
+    const loaded = await loadConfig(configPath);
+
+    // Built-in antigravity-flash-high route must be migrated in-memory
+    const agyRoute = loaded.modelRoutes.find((r) => r.name === "antigravity-flash-high");
+    assert.ok(agyRoute);
+    assert.equal(agyRoute.modelId, "gemini-3.8-flash-high");
+    assert.equal(agyRoute.display, "Antigravity · Gemini 3.8 Flash High");
+    assert.equal(agyRoute.enabled, true);
+
+    // Unrelated custom route must remain completely untouched
+    const customRoute = loaded.modelRoutes.find((r) => r.name === "custom-legacy-37");
+    assert.ok(customRoute);
+    assert.equal(customRoute.modelId, "gemini-3.7-flash-high");
+    assert.equal(customRoute.display, "Custom 3.7 Route");
+
+    // Config file on disk must NOT be rewritten automatically on load
+    const jsonAfter = await readFile(configPath, "utf8");
+    assert.equal(jsonAfter, jsonBefore, "loadConfig must never mutate the configuration file on disk");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

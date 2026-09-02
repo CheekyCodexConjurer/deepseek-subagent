@@ -39,11 +39,11 @@
       {
         "name": "antigravity-flash-high",
         "provider": "antigravity",
-        "model": "gemini-3.7-flash-high",
+        "model": "gemini-3.8-flash-high",
         "variant": null,
         "enabled": true,
         "default": false,
-        "display": "Antigravity · Gemini 3.7 Flash High"
+        "display": "Antigravity · Gemini 3.8 Flash High"
       }
     ],
     "activeRoute": {

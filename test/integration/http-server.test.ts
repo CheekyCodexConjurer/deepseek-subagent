@@ -430,13 +430,13 @@ test("route endpoints are operator-only: the bearer token gate protects status a
 
 test("HTTP route status and list expose the effective active route", async () => {
   const status = {
-    activeRoute: { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, display: "Antigravity · Gemini 3.7 Flash High" },
+    activeRoute: { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, display: "Antigravity · Gemini 3.8 Flash High" },
     activeRouteError: null,
     defaultModelRoute: "flash-max",
     source: "operator-set",
     routes: [
       { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.7-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.7 Flash High" },
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
     ],
   };
   const service = {

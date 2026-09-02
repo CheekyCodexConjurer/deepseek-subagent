@@ -41,7 +41,7 @@ The bridge refuses to create a worktree from `HEAD` when the repository has unco
 
 ## Model routes
 
-Dispatch runs through a config-based route registry (`modelRoutes`). Each route pins provider, model and variant. The built-in registry ships `flash-max` (`opencode-go` / `deepseek-v4-flash` / `max`) enabled and default, `pro-max` (`opencode-go` / `deepseek-v4-pro` / `max`) registered but disabled, and `antigravity-flash-high` (`antigravity` / `gemini-3.7-flash-high`) registered and enabled for operator selection (never the default).
+Dispatch runs through a config-based route registry (`modelRoutes`). Each route pins provider, model and variant. The built-in registry ships `flash-max` (`opencode-go` / `deepseek-v4-flash` / `max`) enabled and default, `pro-max` (`opencode-go` / `deepseek-v4-pro` / `max`) registered but disabled, and `antigravity-flash-high` (`antigravity` / `gemini-3.8-flash-high`) registered and enabled for operator selection (never the default).
 
 New spawns resolve the **active model route**: an operator-set pointer persisted in the bridge SQLite store (`route_state`), which effectively initializes to the configured `defaultModelRoute` (`flash-max`) when no pointer exists. The pointer is additive state — config.json is never rewritten while a daemon is live.
 

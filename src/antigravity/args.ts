@@ -1,11 +1,11 @@
 /**
  * Single source of truth for the `agy` CLI argument contract, matching the
  * smoke observed against the installed authenticated CLI:
- * `agy.exe --model gemini-3.7-flash-high -p <prompt> --print-timeout 15m`.
+ * `agy.exe --model gemini-3.8-flash-high -p <prompt> --print-timeout 15m`.
  * The smoke ran with this exact shape; no invented flags are added here.
  */
 export const AGY_COMMAND = process.platform === "win32" ? "agy.exe" : "agy";
-export const AGY_MODEL = "gemini-3.7-flash-high";
+export const AGY_MODEL = "gemini-3.8-flash-high";
 export const AGY_PRINT_TIMEOUT = "15m";
 export const AGY_MAX_PROMPT_LENGTH = 30_000;
 
