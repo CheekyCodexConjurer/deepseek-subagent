@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { assertAgentTransition, assertJobTransition } from "./state.js";
 import { newId, redactSecrets, truncate } from "./security.js";
+import { ConflictError } from "./errors.js";
 import type {
   ActivityType,
   AgentActivity,
@@ -216,6 +217,22 @@ export class BridgeStore {
     const fallbackMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 12").get() as Row | undefined;
     if (!fallbackMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(12, ?)").run(new Date().toISOString());
+    }
+    const livenessCols = this.db.prepare("PRAGMA table_info(jobs)").all() as Row[];
+    for (const [name, definition] of [
+      ["lease_expires_at", "TEXT"],
+      ["attempt", "TEXT"],
+      ["fence", "INTEGER NOT NULL DEFAULT 1"],
+      ["worker_pid", "INTEGER"],
+      ["heartbeat_at", "TEXT"],
+    ] as const) {
+      if (!livenessCols.some((column) => column.name === name)) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition);
+      }
+    }
+    const livenessMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 13").get() as Row | undefined;
+    if (!livenessMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(13, ?)").run(new Date().toISOString());
     }
   }
 
@@ -516,6 +533,72 @@ export class BridgeStore {
 
   setJobResult(id: string, resultPath: string, summary: string): JobRecord {
     this.db.prepare("UPDATE jobs SET result_path = ?, result_summary = ? WHERE id = ?").run(resultPath, summary, id);
+    const updated = this.getJob(id);
+    if (!updated) throw new Error("Job disappeared: " + id);
+    return updated;
+  }
+
+  updateJobLiveness(id: string, update: {
+    leaseExpiresAt?: string | null;
+    attempt?: string | null;
+    fence?: number;
+    workerPid?: number | null;
+    heartbeatAt?: string | null;
+  }): JobRecord {
+    const setClauses: string[] = [];
+    const params: (string | number | null)[] = [];
+
+    if (update.leaseExpiresAt !== undefined) {
+      setClauses.push("lease_expires_at = ?");
+      params.push(update.leaseExpiresAt);
+    }
+    if (update.attempt !== undefined) {
+      setClauses.push("attempt = ?");
+      params.push(update.attempt);
+    }
+    if (update.fence !== undefined) {
+      setClauses.push("fence = ?");
+      params.push(update.fence);
+    }
+    if (update.workerPid !== undefined) {
+      setClauses.push("worker_pid = ?");
+      params.push(update.workerPid);
+    }
+    if (update.heartbeatAt !== undefined) {
+      if (update.heartbeatAt === null) {
+        setClauses.push("heartbeat_at = NULL");
+      } else {
+        setClauses.push("heartbeat_at = CASE WHEN heartbeat_at IS NULL OR heartbeat_at <= ? THEN ? ELSE heartbeat_at END");
+        params.push(update.heartbeatAt, update.heartbeatAt);
+      }
+    }
+
+    if (setClauses.length === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Unknown job: " + id);
+      return existing;
+    }
+
+    let sql = `UPDATE jobs SET ${setClauses.join(", ")} WHERE id = ?`;
+    params.push(id);
+
+    if (update.fence !== undefined) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(update.fence);
+    }
+
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) {
+        throw new Error("Job disappeared: " + id);
+      }
+      if (update.fence !== undefined && existing.fence !== null && existing.fence !== undefined && update.fence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + update.fence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
@@ -887,6 +970,11 @@ export class BridgeStore {
       fallbackReason: nullableString(row, "fallback_reason"),
       fallbackStatus: nullableString(row, "fallback_status"),
       fallbackCount: typeof row.fallback_count === "number" || typeof row.fallback_count === "bigint" ? Number(row.fallback_count) : 0,
+      leaseExpiresAt: nullableString(row, "lease_expires_at"),
+      attempt: nullableString(row, "attempt"),
+      fence: typeof row.fence === "number" || typeof row.fence === "bigint" ? Number(row.fence) : 1,
+      workerPid: typeof row.worker_pid === "number" || typeof row.worker_pid === "bigint" ? Number(row.worker_pid) : null,
+      heartbeatAt: nullableString(row, "heartbeat_at"),
     };
   }
 

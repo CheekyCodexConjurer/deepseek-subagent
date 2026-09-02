@@ -50,14 +50,17 @@ export interface AntigravityAttemptManifest {
   cancelPath: string;
   createdAt: string;
   maxOutputBytes: number;
+  fence?: number | null;
 }
 
 export interface AntigravityHeartbeat {
+  attemptId?: string;
   nonce: string;
   supervisorPid: number;
   agyPid: number | null;
   updatedAt: number;
   timestamp: string;
+  fence?: number | null;
 }
 
 export interface AntigravityAttemptStatus {

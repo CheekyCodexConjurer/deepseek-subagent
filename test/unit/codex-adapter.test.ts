@@ -92,6 +92,90 @@ test("Codex adapter deterministically extracts job correlation from MCP item com
   await adapter.close();
 });
 
+test("Codex adapter correlates canonical SubAgents MCP server and tools as well as transition aliases", async () => {
+  const rpc = new FakeRpc();
+  const adapter = new CodexAppServerDeliveryAdapter(createDefaultConfig({ codexAppServerCommand: "codex" }), rpc);
+  await adapter.start();
+  const correlations: unknown[] = [];
+  adapter.onCorrelation((value) => correlations.push(value));
+
+  // Canonical server and subagents_spawn
+  rpc.emit({
+    method: "item/completed",
+    params: {
+      threadId: "thread_canon_1",
+      turnId: "turn_canon_1",
+      item: {
+        id: "item_canon_1",
+        type: "mcpToolCall",
+        status: "completed",
+        server: "subagents",
+        tool: "subagents_spawn",
+        result: { structuredContent: { accepted: true, status: "accepted", jobId: "job_canon_1" } },
+      },
+    },
+  });
+
+  // Canonical server and subagents_continue
+  rpc.emit({
+    method: "item/completed",
+    params: {
+      threadId: "thread_canon_2",
+      turnId: "turn_canon_2",
+      item: {
+        id: "item_canon_2",
+        type: "mcpToolCall",
+        status: "completed",
+        server: "subagents-mcp",
+        tool: "subagents_continue",
+        result: { structuredContent: { accepted: true, status: "accepted", jobId: "job_canon_2" } },
+      },
+    },
+  });
+
+  // Transition alias server deepseek-subagent and subagents_spawn
+  rpc.emit({
+    method: "item/completed",
+    params: {
+      threadId: "thread_alias_1",
+      turnId: "turn_alias_1",
+      item: {
+        id: "item_alias_1",
+        type: "mcpToolCall",
+        status: "completed",
+        server: "deepseek-subagent",
+        tool: "subagents_spawn",
+        result: { structuredContent: { accepted: true, status: "accepted", jobId: "job_alias_1" } },
+      },
+    },
+  });
+
+  // Transition alias server deepseek_subagent and deepseek_continue
+  rpc.emit({
+    method: "item/completed",
+    params: {
+      threadId: "thread_alias_2",
+      turnId: "turn_alias_2",
+      item: {
+        id: "item_alias_2",
+        type: "mcpToolCall",
+        status: "completed",
+        server: "deepseek_subagent",
+        tool: "deepseek_continue",
+        result: { structuredContent: { accepted: true, status: "accepted", jobId: "job_alias_2" } },
+      },
+    },
+  });
+
+  assert.deepEqual(correlations, [
+    { jobId: "job_canon_1", threadId: "thread_canon_1", turnId: "turn_canon_1", itemId: "item_canon_1" },
+    { jobId: "job_canon_2", threadId: "thread_canon_2", turnId: "turn_canon_2", itemId: "item_canon_2" },
+    { jobId: "job_alias_1", threadId: "thread_alias_1", turnId: "turn_alias_1", itemId: "item_alias_1" },
+    { jobId: "job_alias_2", threadId: "thread_alias_2", turnId: "turn_alias_2", itemId: "item_alias_2" },
+  ]);
+  await adapter.close();
+});
+
 test("Codex adapter ignores untrusted or incomplete MCP completion items", async () => {
   const rpc = new FakeRpc();
   const adapter = new CodexAppServerDeliveryAdapter(createDefaultConfig({ codexAppServerCommand: "codex" }), rpc);

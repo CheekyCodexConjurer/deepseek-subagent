@@ -2,6 +2,7 @@ import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { AGY_COMMAND, buildAgyArgs } from "./args.js";
+import { AGY_DEFAULT_TIMEOUT_MS } from "./runner.js";
 import {
   ensurePrivateDir,
   isProcessAlive,
@@ -38,6 +39,7 @@ export interface CreateAttemptInput {
   dangerouslySkipPermissions?: boolean | undefined;
   parentAttemptId?: string | null | undefined;
   maxOutputBytes?: number | undefined;
+  fence?: number | null | undefined;
 }
 
 export class AntigravitySpool {
@@ -57,7 +59,7 @@ export class AntigravitySpool {
     await ensurePrivateDir(dir);
 
     const command = input.command ?? AGY_COMMAND;
-    const timeoutMs = input.timeoutMs ?? 900_000;
+    const timeoutMs = input.timeoutMs ?? AGY_DEFAULT_TIMEOUT_MS;
     const sandbox = input.sandbox === true;
     const addDirs = [...new Set(input.addDirs ?? [])];
     const dangerouslySkipPermissions = input.dangerouslySkipPermissions === true;
@@ -110,6 +112,7 @@ export class AntigravitySpool {
       cancelPath,
       createdAt: new Date().toISOString(),
       maxOutputBytes,
+      fence: input.fence ?? 1,
     };
 
     await writePrivateFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
@@ -222,18 +225,49 @@ export class AntigravitySpool {
     return (now - heartbeat.updatedAt) <= ttlMs;
   }
 
-  async writeCancelSignal(attemptIdOrDir: string, reason = "Cancelled", jobId?: string): Promise<void> {
-    const dir = await this.resolveAttemptDir(attemptIdOrDir, jobId);
+  async writeCancelSignal(attemptIdOrJobIdOrDir: string, reason = "Cancelled", jobId?: string): Promise<void> {
+    const jobDir = this.jobSpoolDir(attemptIdOrJobIdOrDir);
+    const payload = JSON.stringify({ requestedAt: new Date().toISOString(), reason: redactSecrets(reason) }, null, 2) + "\n";
+    if (existsSync(jobDir)) {
+      const cancelPath = path.join(jobDir, "cancel.signal");
+      await writePrivateFile(cancelPath, payload);
+      const attempts = await this.listAttempts(attemptIdOrJobIdOrDir).catch(() => []);
+      for (const attempt of attempts) {
+        await writePrivateFile(attempt.cancelPath, payload).catch(() => undefined);
+      }
+      return;
+    }
+    const dir = await this.resolveAttemptDir(attemptIdOrJobIdOrDir, jobId);
     if (!dir) return;
     const cancelPath = path.join(dir, "cancel.signal");
-    await writePrivateFile(cancelPath, JSON.stringify({ requestedAt: new Date().toISOString(), reason: redactSecrets(reason) }, null, 2) + "\n");
+    await writePrivateFile(cancelPath, payload);
+  }
+
+  async writeDeadlineExtension(attemptIdOrJobIdOrDir: string, timeoutMs: number, jobId?: string): Promise<void> {
+    const jobDir = this.jobSpoolDir(attemptIdOrJobIdOrDir);
+    const payload = JSON.stringify({ timeoutMs, requestedAt: new Date().toISOString() }, null, 2) + "\n";
+    if (existsSync(jobDir)) {
+      const deadlinePath = path.join(jobDir, "deadline.json");
+      await writePrivateFile(deadlinePath, payload);
+      const attempts = await this.listAttempts(attemptIdOrJobIdOrDir).catch(() => []);
+      for (const attempt of attempts) {
+        await writePrivateFile(path.join(attempt.attemptDir, "deadline.json"), payload).catch(() => undefined);
+      }
+      return;
+    }
+    const dir = await this.resolveAttemptDir(attemptIdOrJobIdOrDir, jobId);
+    if (!dir) return;
+    const deadlinePath = path.join(dir, "deadline.json");
+    await writePrivateFile(deadlinePath, payload);
   }
 
   async hasCancelSignal(attemptIdOrDir: string, jobId?: string): Promise<boolean> {
     const dir = await this.resolveAttemptDir(attemptIdOrDir, jobId);
     if (!dir) return false;
     const cancelPath = path.join(dir, "cancel.signal");
-    return existsSync(cancelPath);
+    if (existsSync(cancelPath)) return true;
+    const parentCancel = path.join(path.dirname(dir), "cancel.signal");
+    return existsSync(parentCancel);
   }
 
   async claimRecovery(jobId: string, claimant: string): Promise<boolean> {

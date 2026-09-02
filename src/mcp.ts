@@ -10,8 +10,10 @@ import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-
 import { canRead, ensurePrivateDir, newId, redactSecrets } from "./security.js";
 import type { BridgeConfig } from "./types.js";
 
-const DISPLAY_NAME = "DeepSeek Sub-Agent";
+const DISPLAY_NAME = "SubAgents MCP";
+const LEGACY_DISPLAY_NAME = "DeepSeek Sub-Agent";
 const MODEL_DISPLAY = "DeepSeek V4 Flash · Max";
+const CANONICAL_SERVER_NAME = "subagents";
 
 export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   const config = await loadConfig(configPath);
@@ -25,7 +27,7 @@ export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   });
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(DISPLAY_NAME + " MCP server connected; daemon readiness is bootstrapped on the first tool call.");
+  console.error(DISPLAY_NAME + " server connected; daemon readiness is bootstrapped on the first tool call.");
 }
 
 export interface LazyDaemonBootstrap {
@@ -255,6 +257,7 @@ async function startDetachedDaemon(config: BridgeConfig): Promise<void> {
 
 export interface McpServerOptions {
   ensureReady?: LazyDaemonBootstrap | (() => Promise<void>);
+  name?: string;
 }
 
 export function createMcpServer(
@@ -262,28 +265,232 @@ export function createMcpServer(
   options: McpServerOptions = {},
 ): McpServer {
   const server = new McpServer({
-    name: "deepseek-subagent",
+    name: options.name ?? CANONICAL_SERVER_NAME,
     title: DISPLAY_NAME,
     version: "0.1.0",
   });
   const readyClient = options.ensureReady ? new LazyReadyClient(client, options.ensureReady) : client;
 
-  server.registerTool("deepseek_spawn", {
+  const spawnInputSchema = {
+    request_id: z.string().min(1).optional(),
+    topic: z.string().min(1).max(240),
+    task: z.string().min(1),
+    cwd: z.string().optional(),
+    mode: z.enum(["analyze", "edit", "test"]).optional(),
+    workspace_strategy: z.enum(["shared", "worktree"]).optional(),
+    context_files: z.array(z.string()).optional(),
+    visual_context: z.string().optional(),
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+  };
+
+  const continueInputSchema = {
+    request_id: z.string().min(1).optional(),
+    agent_id: z.string().min(1),
+    relation: z.enum(["clarification", "correction", "review", "continuation"]).default("continuation"),
+    task: z.string().min(1),
+    visual_context: z.string().optional(),
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+    permission_id: z.string().optional(),
+    permission_reply: z.enum(["once", "always", "reject"]).optional(),
+    permission_message: z.string().max(2_000).optional(),
+    allow_respawn: z.boolean().optional(),
+  };
+
+  const consultInputSchema = {
+    agent_id: z.string().min(1),
+    job_id: z.string().min(1).optional(),
+    activity_limit: z.number().int().min(1).max(20).default(10),
+  };
+
+  const followInputSchema = {
+    agent_id: z.string().min(1),
+    job_id: z.string().min(1).optional(),
+    wait_minutes: z.number().int().min(1).max(60).optional(),
+    grace_minutes: z.number().int().min(1).max(10).optional(),
+  };
+
+  const abortInputSchema = {
+    agent_id: z.string().min(1),
+    reason: z.string().max(500).optional(),
+  };
+
+  const closeInputSchema = {
+    agent_id: z.string().min(1),
+  };
+
+  const recoverInputSchema = {
+    agent_id: z.string().min(1),
+    job_id: z.string().min(1),
+  };
+
+  // --- Canonical SubAgents MCP Surface ---
+
+  server.registerTool("subagents_spawn", {
     title: DISPLAY_NAME + " · Spawn",
+    description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The bridge, not the caller, selects and pins the active model route at spawn. Changing routes is an operator-only control-plane action; ordinary MCP callers must never send a remembered/default route name. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: spawnInputSchema,
+    outputSchema: {
+      accepted: z.boolean(),
+      status: z.string(),
+      topic: z.string(),
+      modelDisplayName: z.string(),
+      agentId: z.string(),
+      jobId: z.string(),
+      state: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("subagents_follow"),
+    },
+  }, async (args) => {
+    try {
+      const payload = {
+        ...args,
+        request_id: args.request_id ?? newId("request"),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload);
+      return acceptedResult(result, false);
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_continue", {
+    title: DISPLAY_NAME + " · Continue",
+    description: "Continue an existing agent after reviewing its delivered result. Asynchronous; returns immediately; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. An open agent continues in its same OpenCode session. Reject or wait if the agent is busy; use subagents_abort to stop it. A closed agent is not continuable: set allow_respawn=true only as an explicit recovery when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted — the bridge then accepts automatically by spawning a NEW agent and a NEW OpenCode session in the same persisted workspace, topic, workspace strategy and pinned model route, records the lineage (parent_agent_id and auditable activity on both agents), preserves or derives the correlation thread/turn hints, and returns the NEW agentId/jobId to follow; it never claims the closed session is the same session and never reopens the closed agent. allow_respawn is rejected (typed 409/400) for aborted agents, closed agents without a persisted result, busy agents, permission-field answers and any scope change: the child inherits only the parent's persisted identity and workspace, with no provider fallback and no live-config route. For an explicit OpenCode permission response on an open agent, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: continueInputSchema,
+    outputSchema: {
+      accepted: z.boolean(),
+      status: z.string(),
+      topic: z.string(),
+      modelDisplayName: z.string(),
+      agentId: z.string(),
+      jobId: z.string(),
+      state: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("subagents_follow"),
+    },
+  }, async (args) => {
+    try {
+      const payload = {
+        ...args,
+        request_id: args.request_id ?? newId("request"),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload);
+      return acceptedResult(result, false);
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_status", {
+    title: DISPLAY_NAME + " · Status",
+    description: "Get one immediate observable progress snapshot for an existing agent. Use only when the user asks for progress, a task is taking unusually long, or the snapshot materially changes the orchestrator's next decision. Do not use repeatedly to wait for completion. Never exposes private reasoning.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: consultInputSchema,
+  }, async (args) => {
+    try {
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args);
+      return {
+        content: [{ type: "text", text: "Observable SubAgents MCP status snapshot returned." }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_follow", {
+    title: DISPLAY_NAME + " · Follow",
+    description: "Wait for a job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. Returning a usable terminal result consumes the job obligation explicitly and persistently; a needs_approval follow keeps the obligation pending and requires subagents_continue with permission_id and permission_reply. A terminal follow result closes the job obligation only: the agent stays open and continuable until you close it with subagents_close after reviewing — closing the agent is separate from consuming the obligation. Completed, failed and timed-out agents remain continuable with subagents_continue. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: followInputSchema,
+    outputSchema: {
+      agentId: z.string(),
+      jobId: z.string(),
+      status: z.string(),
+      resultAvailable: z.boolean(),
+      permissionId: z.string().nullable().optional(),
+      message: z.string().optional(),
+      obligationState: z.union([z.literal("pending"), z.literal("closed")]),
+      nextRequiredAction: z.literal("subagents_continue").optional(),
+    },
+  }, async (args) => {
+    try {
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args);
+      return followResult(result, false);
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_abort", {
+    title: DISPLAY_NAME + " · Abort",
+    description: "Stop the active task for an agent and end its pending obligation. This is a control action, not a polling operation.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    inputSchema: abortInputSchema,
+    outputSchema: {
+      agentId: z.string(),
+      jobId: z.string().nullable().optional(),
+      status: z.string(),
+      state: z.string(),
+      obligationState: z.literal("closed"),
+    },
+  }, async (args) => {
+    try {
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args);
+      return technicalResult(result, "SubAgents MCP task stopped.");
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_close", {
+    title: DISPLAY_NAME + " · Close",
+    description: "Close an agent after its work is complete or stopped, ending any pending obligation. It does not delete result history.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: closeInputSchema,
+    outputSchema: {
+      agentId: z.string(),
+      status: z.string(),
+      state: z.string(),
+      obligationState: z.literal("closed"),
+    },
+  }, async (args) => {
+    try {
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args);
+      return technicalResult(result, "SubAgents MCP agent closed.");
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_recover_result", {
+    title: DISPLAY_NAME + " · Recover result",
+    description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: recoverInputSchema,
+  }, async (args) => {
+    try {
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", args);
+      return {
+        content: [{ type: "text", text: "Persisted SubAgents MCP result recovered." }],
+        structuredContent: { result },
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  // --- Migration Aliases (deepseek_*) ---
+
+  server.registerTool("deepseek_spawn", {
+    title: LEGACY_DISPLAY_NAME + " · Spawn",
     description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The bridge, not the caller, selects and pins the active model route at spawn. Changing routes is an operator-only control-plane action; ordinary MCP callers must never send a remembered/default route name. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    inputSchema: {
-      request_id: z.string().min(1).optional(),
-      topic: z.string().min(1).max(240),
-      task: z.string().min(1),
-      cwd: z.string().optional(),
-      mode: z.enum(["analyze", "edit", "test"]).optional(),
-      workspace_strategy: z.enum(["shared", "worktree"]).optional(),
-      context_files: z.array(z.string()).optional(),
-      visual_context: z.string().optional(),
-      thread_id: z.string().optional(),
-      turn_id: z.string().optional(),
-    },
+    inputSchema: spawnInputSchema,
     outputSchema: {
       accepted: z.boolean(),
       status: z.string(),
@@ -302,29 +509,17 @@ export function createMcpServer(
         request_id: args.request_id ?? newId("request"),
       };
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload);
-      return acceptedResult(result);
+      return acceptedResult(result, true);
     } catch (error) {
       return errorResult(error);
     }
   });
 
   server.registerTool("deepseek_continue", {
-    title: DISPLAY_NAME + " · Continue",
+    title: LEGACY_DISPLAY_NAME + " · Continue",
     description: "Continue an existing DeepSeek agent after reviewing its delivered result. Asynchronous; returns immediately; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with deepseek_follow before a dependent gate or a final response, or explicitly end it with deepseek_abort or deepseek_close. An open agent continues in its same OpenCode session. Reject or wait if the agent is busy; use deepseek_abort to stop it. A closed agent is not continuable: set allow_respawn=true only as an explicit recovery when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted — the bridge then accepts automatically by spawning a NEW agent and a NEW OpenCode session in the same persisted workspace, topic, workspace strategy and pinned model route, records the lineage (parent_agent_id and auditable activity on both agents), preserves or derives the correlation thread/turn hints, and returns the NEW agentId/jobId to follow; it never claims the closed session is the same session and never reopens the closed agent. allow_respawn is rejected (typed 409/400) for aborted agents, closed agents without a persisted result, busy agents, permission-field answers and any scope change: the child inherits only the parent's persisted identity and workspace, with no provider fallback and no live-config route. For an explicit OpenCode permission response on an open agent, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-    inputSchema: {
-      request_id: z.string().min(1).optional(),
-      agent_id: z.string().min(1),
-      relation: z.enum(["clarification", "correction", "review", "continuation"]).default("continuation"),
-      task: z.string().min(1),
-      visual_context: z.string().optional(),
-      thread_id: z.string().optional(),
-      turn_id: z.string().optional(),
-      permission_id: z.string().optional(),
-      permission_reply: z.enum(["once", "always", "reject"]).optional(),
-      permission_message: z.string().max(2_000).optional(),
-      allow_respawn: z.boolean().optional(),
-    },
+    inputSchema: continueInputSchema,
     outputSchema: {
       accepted: z.boolean(),
       status: z.string(),
@@ -343,21 +538,17 @@ export function createMcpServer(
         request_id: args.request_id ?? newId("request"),
       };
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload);
-      return acceptedResult(result);
+      return acceptedResult(result, true);
     } catch (error) {
       return errorResult(error);
     }
   });
 
   server.registerTool("deepseek_consult", {
-    title: DISPLAY_NAME + " · Consult",
+    title: LEGACY_DISPLAY_NAME + " · Consult",
     description: "Get one immediate observable progress snapshot for an existing DeepSeek agent. Use only when the user asks for progress, a task is taking unusually long, or the snapshot materially changes the orchestrator's next decision. Do not use repeatedly to wait for completion. Never exposes private reasoning.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    inputSchema: {
-      agent_id: z.string().min(1),
-      job_id: z.string().min(1).optional(),
-      activity_limit: z.number().int().min(1).max(20).default(10),
-    },
+    inputSchema: consultInputSchema,
   }, async (args) => {
     try {
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args);
@@ -371,15 +562,10 @@ export function createMcpServer(
   });
 
   server.registerTool("deepseek_follow", {
-    title: DISPLAY_NAME + " · Follow",
+    title: LEGACY_DISPLAY_NAME + " · Follow",
     description: "Wait for a DeepSeek job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. Returning a usable terminal result consumes the job obligation explicitly and persistently; a needs_approval follow keeps the obligation pending and requires deepseek_continue with permission_id and permission_reply. A terminal follow result closes the job obligation only: the DeepSeek agent stays open and continuable until you close it with deepseek_close after reviewing — closing the agent is separate from consuming the obligation. Completed, failed and timed-out agents remain continuable with deepseek_continue. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    inputSchema: {
-      agent_id: z.string().min(1),
-      job_id: z.string().min(1).optional(),
-      wait_minutes: z.number().int().min(1).max(60).optional(),
-      grace_minutes: z.number().int().min(1).max(10).optional(),
-    },
+    inputSchema: followInputSchema,
     outputSchema: {
       agentId: z.string(),
       jobId: z.string(),
@@ -393,20 +579,17 @@ export function createMcpServer(
   }, async (args) => {
     try {
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args);
-      return followResult(result);
+      return followResult(result, true);
     } catch (error) {
       return errorResult(error);
     }
   });
 
   server.registerTool("deepseek_abort", {
-    title: DISPLAY_NAME + " · Abort",
+    title: LEGACY_DISPLAY_NAME + " · Abort",
     description: "Stop the active DeepSeek task for an agent and end its pending obligation. This is a control action, not a polling operation.",
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    inputSchema: {
-      agent_id: z.string().min(1),
-      reason: z.string().max(500).optional(),
-    },
+    inputSchema: abortInputSchema,
     outputSchema: {
       agentId: z.string(),
       jobId: z.string().nullable().optional(),
@@ -424,12 +607,10 @@ export function createMcpServer(
   });
 
   server.registerTool("deepseek_close", {
-    title: DISPLAY_NAME + " · Close",
+    title: LEGACY_DISPLAY_NAME + " · Close",
     description: "Close a DeepSeek agent after its work is complete or stopped, ending any pending obligation. It does not delete result history.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    inputSchema: {
-      agent_id: z.string().min(1),
-    },
+    inputSchema: closeInputSchema,
     outputSchema: {
       agentId: z.string(),
       status: z.string(),
@@ -446,13 +627,10 @@ export function createMcpServer(
   });
 
   server.registerTool("deepseek_recover_result", {
-    title: DISPLAY_NAME + " · Recover result",
+    title: LEGACY_DISPLAY_NAME + " · Recover result",
     description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    inputSchema: {
-      agent_id: z.string().min(1),
-      job_id: z.string().min(1),
-    },
+    inputSchema: recoverInputSchema,
   }, async (args) => {
     try {
       const result = await readyClient.call<unknown>("/v1/jobs/recover", args);
@@ -464,10 +642,11 @@ export function createMcpServer(
       return errorResult(error);
     }
   });
+
   return server;
 }
 
-function acceptedResult(result: Record<string, unknown>): {
+function acceptedResult(result: Record<string, unknown>, isAlias = false): {
   content: [{ type: "text"; text: string }];
   structuredContent: {
     accepted: true;
@@ -478,59 +657,82 @@ function acceptedResult(result: Record<string, unknown>): {
     jobId: unknown;
     state: "Starting";
     obligationState: "pending";
-    nextRequiredAction: "deepseek_follow";
+    nextRequiredAction: "deepseek_follow" | "subagents_follow";
   };
   _meta: Record<string, unknown>;
 } {
   const jobId = String(result.jobId ?? "");
   const uncertain = result.outcome === "dispatch_unknown";
-  const text = uncertain
-    ? "DeepSeek Sub-Agent accepted the task; OpenCode dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: " + jobId
-      + ". Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with deepseek_follow, or explicitly abort/close it, before a dependent gate or a final response."
-    : "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
-      + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.";
+  const modelDisplayName = result.modelDisplayName ?? MODEL_DISPLAY;
+  const nextRequiredAction = isAlias ? "deepseek_follow" : "subagents_follow";
+  const followTool = nextRequiredAction;
+  const abortTool = isAlias ? "deepseek_abort" : "subagents_abort";
+  const closeTool = isAlias ? "deepseek_close" : "subagents_close";
+
+  const text = isAlias
+    ? (uncertain
+      ? "DeepSeek Sub-Agent accepted the task; OpenCode dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: " + jobId
+        + ". Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with deepseek_follow, or explicitly abort/close it, before a dependent gate or a final response."
+      : "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
+        + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.")
+    : (uncertain
+      ? `${DISPLAY_NAME} accepted the task (${modelDisplayName}); provider dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: ` + jobId
+        + `. Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with ${followTool}, or explicitly abort/close it with ${abortTool} or ${closeTool}, before a dependent gate or a final response.`
+      : `${DISPLAY_NAME} accepted the task (${modelDisplayName}). Pending DeepSeek job created: ` + jobId
+        + `. Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with ${followTool}, or explicitly abort/close it with ${abortTool} or ${closeTool}.`);
+
   return {
     content: [{ type: "text", text }],
     structuredContent: {
       accepted: true,
       status: "accepted",
       topic: result.topic,
-      modelDisplayName: result.modelDisplayName ?? MODEL_DISPLAY,
+      modelDisplayName,
       agentId: result.agentId,
       jobId: result.jobId,
       state: "Starting",
       obligationState: "pending",
-      nextRequiredAction: "deepseek_follow",
+      nextRequiredAction,
     },
     _meta: {
       technical: {
         agentId: result.agentId,
         jobId: result.jobId,
         state: "Starting",
+        provider: result.modelProviderId ?? "deepseek",
+        model: modelDisplayName,
       },
     },
   };
 }
 
-function followResult(result: Record<string, unknown>): {
+function followResult(result: Record<string, unknown>, isAlias = false): {
   content: [{ type: "text"; text: string }];
   structuredContent: Record<string, unknown>;
 } {
+  const nextRequiredAction = isAlias ? "deepseek_continue" : "subagents_continue";
+  const abortTool = isAlias ? "deepseek_abort" : "subagents_abort";
+  const closeTool = isAlias ? "deepseek_close" : "subagents_close";
+  const displayName = isAlias ? LEGACY_DISPLAY_NAME : DISPLAY_NAME;
+
   if (result.status === "needs_approval") {
     return {
       content: [{
         type: "text",
-        text: "DeepSeek Sub-Agent follow requires explicit approval before continuing. Answer with deepseek_continue, providing permission_id and permission_reply, or end the obligation with deepseek_abort or deepseek_close.",
+        text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.`,
       }],
       structuredContent: {
         ...result,
         obligationState: "pending",
-        nextRequiredAction: "deepseek_continue",
+        nextRequiredAction,
       },
     };
   }
   return {
-    content: [{ type: "text", text: "DeepSeek Sub-Agent follow returned a terminal result. The job obligation is closed; the DeepSeek agent itself remains open and continuable. Close it with deepseek_close after reviewing the result." }],
+    content: [{
+      type: "text",
+      text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.`,
+    }],
     structuredContent: { ...result, obligationState: "closed" },
   };
 }

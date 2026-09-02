@@ -214,6 +214,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
     globalGeminiContextPath: overrides.globalGeminiContextPath ?? defaultGlobalGeminiContextPath(),
     backupDir: overrides.backupDir ?? path.join(dataDir, "backups"),
+    workerMaxExecutionMinutes: boundedInteger(overrides.workerMaxExecutionMinutes, FOLLOW_MAX_TOTAL_MINUTES, 1, 240),
   };
 }
 
@@ -280,6 +281,7 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       maxContextFileBytes: boundedInteger(raw.maxContextFileBytes, defaults.maxContextFileBytes, 1_024, 64_000_000),
       globalGeminiContextPath: asString(raw.globalGeminiContextPath, defaults.globalGeminiContextPath),
       backupDir: asString(raw.backupDir, path.join(dataDir, "backups")),
+      workerMaxExecutionMinutes: boundedInteger(raw.workerMaxExecutionMinutes, defaults.workerMaxExecutionMinutes ?? FOLLOW_MAX_TOTAL_MINUTES, 1, 240),
     };
 
   } catch {

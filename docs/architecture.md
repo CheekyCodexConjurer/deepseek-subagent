@@ -1,6 +1,6 @@
 # Architecture
 
-DeepSeek Sub-Agent is a local bridge with one daemon, one stdio MCP process, an OpenCode manager/client and a durable SQLite store.
+SubAgents MCP (formerly DeepSeek Sub-Agent) is a local bridge with one daemon, one stdio MCP process, an OpenCode manager/client and a durable SQLite store.
 
 ## Runtime flow
 
@@ -27,7 +27,7 @@ Startup recovery performs a bounded one-time reconciliation for unfinished jobs,
 - src/codex/websocket.ts owns the opt-in WebSocket JSON-RPC transport. It rejects non-loopback endpoints and does not accept Unix socket paths on Windows.
 - When the Codex adapter is initialized but an MCP correlation has not arrived yet, a completed result waits up to the configured correlation window (10 seconds by default) before using the inbox. The WebSocket endpoint is a same-user local trust boundary, not an authenticated remote service; it must not be exposed or forwarded off-host.
 - src/delivery/inbox.ts is the durable fallback.
-- src/mcp.ts exposes seven stable tools: spawn, continue, consult, follow, abort, close and recover_result.
+- src/mcp.ts exposes seven canonical tools (`subagents_spawn`, `subagents_continue`, `subagents_status`, `subagents_follow`, `subagents_abort`, `subagents_close`, `subagents_recover_result`) alongside seven backward-compatible `deepseek_*` migration aliases. `subagents_status` maps directly to the daemon's `/v1/jobs/consult` endpoint without mutating internal runtime contracts.
 
 ## State
 
@@ -47,13 +47,13 @@ New spawns resolve the **active model route**: an operator-set pointer persisted
 
 The active route is operator-controlled through the authenticated loopback daemon and CLI (`route list`, `route status`, `route set <route>`, with `--json`). `route set` validates that the target is registered and enabled (typed `unknown_route` / `route_disabled` 400 otherwise), persists the pointer, and applies immediately — a live-daemon set needs no daemon restart, and the effective route is exposed in `/health`, `route status` and `route list`. All route commands require the running daemon; when it is not running they fail closed with guidance and the CLI never writes the route pointer itself, so a stopped daemon cannot race a live one on the store.
 
-The MCP `deepseek_spawn` tool never exposes or forwards `model_route`: it always uses the live active route, preventing a remembered route such as `flash-max` from conflicting after an operator switch. The lower-level HTTP spawn contract retains typed validation for legacy/direct callers: an unknown or disabled route fails closed with a stable typed 400 before any workspace, worktree, session or job side effect; another registered route is denied with a typed 403 `route_override_denied`. There is no fallback route, and a `model_route` never changes the active pointer.
+The MCP `subagents_spawn` tool (alias `deepseek_spawn`) never exposes or forwards `model_route`: it always uses the live active route, preventing a remembered route such as `flash-max` from conflicting after an operator switch. The lower-level HTTP spawn contract retains typed validation for legacy/direct callers: an unknown or disabled route fails closed with a stable typed 400 before any workspace, worktree, session or job side effect; another registered route is denied with a typed 403 `route_override_denied`. There is no fallback route, and a `model_route` never changes the active pointer.
 
 The resolved route is persisted on the agent (`model_route`). Continue, approval resume/reply, graceful finalization, recovery and startup reconciliation always resolve the agent's persisted route — never the mutable live config defaults and never the mutable active-route pointer — so changing the active route or disabling a route never redirects an in-flight agent. Agents created before route pinning (or whose route was removed from the registry) keep dispatching on their persisted flat `model_provider_id`/`model_id`/`model_variant` columns, so old agents remain fully compatible.
 
 ## Antigravity provider
 
-The `antigravity-flash-high` route runs the authenticated `agy` executable directly in the prepared workspace (never OpenCode, never a session). Dispatch preserves the MCP asynchronous contract: `deepseek_spawn` returns an accepted pending obligation as soon as the job is created, the agy process runs asynchronously in a background task, and `deepseek_follow` observes completion, failure or abort. An abort that lands between job creation and dispatch prevents the agy launch entirely and never transitions an aborted/closed agent back to working. There is never a fallback to another provider or model, and the explicit abort signal kills the actual process tree.
+The `antigravity-flash-high` route runs the authenticated `agy` executable directly in the prepared workspace (never OpenCode, never a session). Dispatch preserves the MCP asynchronous contract: `subagents_spawn` (alias `deepseek_spawn`) returns an accepted pending obligation as soon as the job is created, the agy process runs asynchronously in a background task, and `subagents_follow` (alias `deepseek_follow`) observes completion, failure or abort. An abort that lands between job creation and dispatch prevents the agy launch entirely and never transitions an aborted/closed agent back to working. There is never a fallback to another provider or model, and the explicit abort signal kills the actual process tree.
 
 For Antigravity, validated `context_files` are supplied as paths inside the prepared workspace instead of copying their contents into the `agy` command line; the worker reads them directly when relevant. The bridge checks the complete command prompt against the 30,000-character safe limit before it creates a worktree, session, agent or job. A genuinely oversized task, visual context or path list returns a typed 400 early instead of accepting a job that would fail before execution.
 
@@ -71,7 +71,7 @@ All errors crossing the HTTP or MCP boundary are typed: a stable machine-readabl
 
 ## Obligation and result consumption
 
-A terminal result becomes explicitly consumed when `deepseek_follow` or `deepseek_recover_result` returns a usable final result; the consumption timestamp is persisted on the job (`result_consumed_at`). `needs_approval` follows keep the obligation pending. Closing an agent is a separate operation from consuming an obligation. Doctor and the `obligations` CLI command warn about unconsumed terminal results, terminal agents still open, open obligations, and genuinely stale follow windows — a stale window is one whose grace deadline has passed while the job is still following/finalizing and was not auto-armed, so fresh and auto-armed windows never produce false positives. Doctor never auto-closes and never auto-consumes.
+A terminal result becomes explicitly consumed when `subagents_follow` (alias `deepseek_follow`) or `subagents_recover_result` (alias `deepseek_recover_result`) returns a usable final result; the consumption timestamp is persisted on the job (`result_consumed_at`). `needs_approval` follows keep the obligation pending. Closing an agent is a separate operation from consuming an obligation. Doctor and the `obligations` CLI command warn about unconsumed terminal results, terminal agents still open, open obligations, and genuinely stale follow windows — a stale window is one whose grace deadline has passed while the job is still following/finalizing and was not auto-armed, so fresh and auto-armed windows never produce false positives. Doctor never auto-closes and never auto-consumes.
 
 ## Retention
 

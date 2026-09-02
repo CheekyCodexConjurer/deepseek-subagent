@@ -40,7 +40,7 @@ function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<str
   };
 }
 
-test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async () => {
+test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and deepseek_* migration aliases", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
     configPath: "C:\\\\deepseek-test-data\\\\config.json",
@@ -55,6 +55,13 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async
     const result = await client.listTools();
     const tools = result.tools;
     assert.deepEqual(tools.map((tool) => tool.name), [
+      "subagents_spawn",
+      "subagents_continue",
+      "subagents_status",
+      "subagents_follow",
+      "subagents_abort",
+      "subagents_close",
+      "subagents_recover_result",
       "deepseek_spawn",
       "deepseek_continue",
       "deepseek_consult",
@@ -63,22 +70,45 @@ test("MCP exposes the stable DeepSeek Sub-Agent identity and seven tools", async
       "deepseek_close",
       "deepseek_recover_result",
     ]);
-    assert.equal(tools[0]?.title, "DeepSeek Sub-Agent · Spawn");
+    assert.equal(tools[0]?.title, "SubAgents MCP · Spawn");
     assert.match(tools[0]?.description ?? "", /asynchronous/i);
     assert.match(tools[0]?.description ?? "", /do not poll/i);
     assert.doesNotMatch(tools[0]?.description ?? "", /DeepSeek V4 Flash/, "spawn description must be provider-neutral; the route decides the provider");
     assert.match(tools[0]?.description ?? "", /active model route/i);
     assert.match(tools[0]?.description ?? "", /operator-only/i);
-    const consult = tools.find((tool) => tool.name === "deepseek_consult");
-    const follow = tools.find((tool) => tool.name === "deepseek_follow");
-    assert.equal(consult?.title, "DeepSeek Sub-Agent · Consult");
-    assert.match(consult?.description ?? "", /observable/i);
-    assert.match(consult?.description ?? "", /never exposes private reasoning/i);
-    assert.equal(follow?.title, "DeepSeek Sub-Agent · Follow");
+
+    const spawn = tools.find((tool) => tool.name === "subagents_spawn");
+    const continueTool = tools.find((tool) => tool.name === "subagents_continue");
+    const statusTool = tools.find((tool) => tool.name === "subagents_status");
+    const follow = tools.find((tool) => tool.name === "subagents_follow");
+    const abort = tools.find((tool) => tool.name === "subagents_abort");
+    const close = tools.find((tool) => tool.name === "subagents_close");
+    const recover = tools.find((tool) => tool.name === "subagents_recover_result");
+
+    assert.equal(spawn?.title, "SubAgents MCP · Spawn");
+    assert.equal(continueTool?.title, "SubAgents MCP · Continue");
+    assert.equal(statusTool?.title, "SubAgents MCP · Status");
+    assert.equal(follow?.title, "SubAgents MCP · Follow");
+    assert.equal(abort?.title, "SubAgents MCP · Abort");
+    assert.equal(close?.title, "SubAgents MCP · Close");
+    assert.equal(recover?.title, "SubAgents MCP · Recover result");
+
+    assert.match(spawn?.description ?? "", /subagents_follow/i);
+    assert.match(continueTool?.description ?? "", /subagents_follow/i);
+    assert.match(statusTool?.description ?? "", /observable/i);
+    assert.match(statusTool?.description ?? "", /never exposes private reasoning/i);
     assert.match(follow?.description ?? "", /without polling/i);
     const followProperties = (follow?.inputSchema as { properties?: Record<string, { default?: number }> } | undefined)?.properties ?? {};
     assert.equal(followProperties.wait_minutes?.default, undefined);
     assert.equal(followProperties.grace_minutes?.default, undefined);
+
+    // Verify migration aliases are preserved
+    const legacySpawn = tools.find((tool) => tool.name === "deepseek_spawn");
+    const legacyConsult = tools.find((tool) => tool.name === "deepseek_consult");
+    const legacyFollow = tools.find((tool) => tool.name === "deepseek_follow");
+    assert.equal(legacySpawn?.title, "DeepSeek Sub-Agent · Spawn");
+    assert.equal(legacyConsult?.title, "DeepSeek Sub-Agent · Consult");
+    assert.equal(legacyFollow?.title, "DeepSeek Sub-Agent · Follow");
   } finally {
     await client.close();
     await server.close();
@@ -141,7 +171,7 @@ test("MCP handshake and tool listing complete without waiting for daemon startup
   await client.connect(clientTransport);
   try {
     const result = await client.listTools();
-    assert.equal(result.tools.length, 7);
+    assert.equal(result.tools.length, 14);
     assert.equal(starts, 0, "tool listing must not bootstrap the daemon");
     const first = client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
     const second = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
@@ -358,6 +388,88 @@ test("MCP spawn and continue report a pending obligation in content and structur
   }
 });
 
+test("MCP canonical subagents_spawn, subagents_continue, and subagents_status report obligations and provenance", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const consultedArgs: unknown[] = [];
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      if (pathname === "/v1/jobs/spawn" || pathname === "/v1/jobs/continue") {
+        return {
+          accepted: true,
+          status: "accepted",
+          topic: "canonical topic",
+          modelDisplayName: "DeepSeek V4 Flash · Max",
+          agentId: "agent_sub_1",
+          jobId: "job_sub_1",
+          state: "Starting",
+        };
+      }
+      if (pathname === "/v1/jobs/consult") {
+        consultedArgs.push(body);
+        return {
+          agentId: "agent_sub_1",
+          jobId: "job_sub_1",
+          topic: "canonical topic",
+          status: "running",
+          elapsedSeconds: 5,
+          lastActivityAgoSeconds: 2,
+          currentActivity: "Running task",
+          recentActivity: [],
+          filesTouched: [],
+          testSummary: "All tests pass",
+          resultAvailable: false,
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    for (const toolName of ["subagents_spawn", "subagents_continue"] as const) {
+      const result = await client.callTool({
+        name: toolName,
+        arguments: toolName === "subagents_spawn"
+          ? { topic: "canonical topic", task: "spawn task" }
+          : { agent_id: "agent_sub_1", task: "continue task" },
+      });
+      assert.equal(result.isError, undefined);
+      const text = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+      assert.match(text, /SubAgents MCP accepted the task/);
+      assert.match(text, /DeepSeek V4 Flash · Max/);
+      assert.match(text, /consume.*subagents_follow/);
+      const structured = result.structuredContent as Record<string, unknown>;
+      assert.equal(structured.obligationState, "pending");
+      assert.equal(structured.nextRequiredAction, "subagents_follow");
+      assert.equal(structured.accepted, true);
+      assert.equal(structured.status, "accepted");
+      assert.equal(structured.topic, "canonical topic");
+      assert.equal(structured.modelDisplayName, "DeepSeek V4 Flash · Max");
+      assert.equal(structured.agentId, "agent_sub_1");
+      assert.equal(structured.jobId, "job_sub_1");
+    }
+
+    const statusResult = await client.callTool({
+      name: "subagents_status",
+      arguments: { agent_id: "agent_sub_1", job_id: "job_sub_1" },
+    });
+    assert.equal(statusResult.isError, undefined);
+    assert.deepEqual(consultedArgs, [{ agent_id: "agent_sub_1", job_id: "job_sub_1", activity_limit: 10 }]);
+    const statusStructured = statusResult.structuredContent as Record<string, unknown>;
+    assert.equal(statusStructured.agentId, "agent_sub_1");
+    assert.equal(statusStructured.status, "running");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("MCP follow terminal results close the obligation", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
@@ -522,6 +634,154 @@ test("MCP abort and close end the obligation", async () => {
   }
 });
 
+test("MCP canonical subagents_follow terminal and needs_approval results manage obligations", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  let followCall = 0;
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/follow") {
+        followCall += 1;
+        if (followCall === 1) {
+          return {
+            agentId: "agent_sub_1",
+            jobId: "job_sub_1",
+            status: "completed",
+            deadlineReached: false,
+            gracefulFinalize: false,
+            partial: false,
+            workerAborted: false,
+            resultAvailable: true,
+            progress: {
+              agentId: "agent_sub_1",
+              jobId: "job_sub_1",
+              topic: "canonical follow topic",
+              status: "completed",
+              elapsedSeconds: 10,
+              lastActivityAgoSeconds: 1,
+              currentActivity: "Done",
+              recentActivity: [],
+              filesTouched: [],
+              testSummary: "Passed",
+              resultAvailable: true,
+            },
+          };
+        }
+        return {
+          agentId: "agent_sub_1",
+          jobId: "job_sub_1",
+          status: "needs_approval",
+          deadlineReached: false,
+          gracefulFinalize: false,
+          partial: false,
+          workerAborted: false,
+          resultAvailable: false,
+          permissionId: "permission_sub_9",
+          message: "SubAgents MCP requires explicit approval before continuing.",
+          progress: {
+            agentId: "agent_sub_1",
+            jobId: "job_sub_1",
+            topic: "canonical follow topic",
+            status: "needs_approval",
+            elapsedSeconds: 5,
+            lastActivityAgoSeconds: 1,
+            currentActivity: "Waiting",
+            recentActivity: [],
+            filesTouched: [],
+            testSummary: "Pending",
+            resultAvailable: false,
+          },
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    // 1. Terminal result closes obligation
+    const termResult = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(termResult.isError, undefined);
+    const termText = (termResult.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(termText, /SubAgents MCP follow returned a terminal result/);
+    assert.match(termText, /subagents_close/);
+    const termStructured = termResult.structuredContent as Record<string, unknown>;
+    assert.equal(termStructured.obligationState, "closed");
+    assert.equal(termStructured.status, "completed");
+
+    // 2. Needs approval keeps obligation pending and points to subagents_continue
+    const approvalResult = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(approvalResult.isError, undefined);
+    const approvalText = (approvalResult.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(approvalText, /SubAgents MCP follow requires explicit approval/);
+    assert.match(approvalText, /subagents_continue/);
+    assert.match(approvalText, /subagents_abort or subagents_close/);
+    const approvalStructured = approvalResult.structuredContent as Record<string, unknown>;
+    assert.equal(approvalStructured.obligationState, "pending");
+    assert.equal(approvalStructured.nextRequiredAction, "subagents_continue");
+    assert.equal(approvalStructured.permissionId, "permission_sub_9");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP canonical subagents_abort, subagents_close, and subagents_recover_result end obligations", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/abort") {
+        return { agentId: "agent_sub_1", jobId: "job_sub_1", status: "aborted" };
+      }
+      if (pathname === "/v1/jobs/close") {
+        return { agentId: "agent_sub_1", status: "closed" };
+      }
+      if (pathname === "/v1/jobs/recover") {
+        return { agentId: "agent_sub_1", jobId: "job_sub_1", summary: "Recovered summary" };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const abortResult = await client.callTool({ name: "subagents_abort", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(abortResult.isError, undefined);
+    const abortText = (abortResult.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(abortText, /SubAgents MCP task stopped/);
+    const abortStructured = abortResult.structuredContent as Record<string, unknown>;
+    assert.equal(abortStructured.obligationState, "closed");
+    assert.equal(abortStructured.status, "aborted");
+
+    const closeResult = await client.callTool({ name: "subagents_close", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(closeResult.isError, undefined);
+    const closeText = (closeResult.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(closeText, /SubAgents MCP agent closed/);
+    const closeStructured = closeResult.structuredContent as Record<string, unknown>;
+    assert.equal(closeStructured.obligationState, "closed");
+    assert.equal(closeStructured.status, "closed");
+
+    const recoverResult = await client.callTool({ name: "subagents_recover_result", arguments: { agent_id: "agent_sub_1", job_id: "job_sub_1" } });
+    assert.equal(recoverResult.isError, undefined);
+    const recoverText = (recoverResult.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(recoverText, /Persisted SubAgents MCP result recovered/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("MCP obligation metadata: descriptions, readOnlyHint and output schemas", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
@@ -572,6 +832,36 @@ test("MCP obligation metadata: descriptions, readOnlyHint and output schemas", a
     assert.match(followNextAction, /deepseek_continue/);
     assert.equal(outputProperties(abort).obligationState?.const, "closed");
     assert.equal(outputProperties(close).obligationState?.const, "closed");
+
+    // Canonical tools metadata verification
+    const subSpawn = tools.find((tool) => tool.name === "subagents_spawn");
+    const subContinue = tools.find((tool) => tool.name === "subagents_continue");
+    const subStatus = tools.find((tool) => tool.name === "subagents_status");
+    const subFollow = tools.find((tool) => tool.name === "subagents_follow");
+    const subAbort = tools.find((tool) => tool.name === "subagents_abort");
+    const subClose = tools.find((tool) => tool.name === "subagents_close");
+
+    assert.equal(outputProperties(subSpawn).obligationState?.const, "pending");
+    assert.equal(outputProperties(subSpawn).nextRequiredAction?.const, "subagents_follow");
+    assert.equal(outputProperties(subContinue).obligationState?.const, "pending");
+    assert.equal(outputProperties(subContinue).nextRequiredAction?.const, "subagents_follow");
+    assert.equal(subFollow?.annotations?.readOnlyHint, false);
+    assert.match(subFollow?.description ?? "", /before a dependent gate or a final response/);
+    assert.equal(subStatus?.annotations?.readOnlyHint, true);
+    assert.match(subAbort?.description ?? "", /end its pending obligation/);
+    assert.match(subClose?.description ?? "", /ending any pending obligation/);
+    assert.equal(subAbort?.annotations?.destructiveHint, true);
+    assert.equal(subClose?.annotations?.destructiveHint, false);
+    assert.equal(subSpawn?.annotations?.readOnlyHint, false);
+    assert.equal(subContinue?.annotations?.readOnlyHint, false);
+
+    const subFollowObligation = JSON.stringify(subFollow?.outputSchema?.properties?.obligationState ?? {});
+    assert.match(subFollowObligation, /pending/);
+    assert.match(subFollowObligation, /closed/);
+    const subFollowNextAction = JSON.stringify(subFollow?.outputSchema?.properties?.nextRequiredAction ?? {});
+    assert.match(subFollowNextAction, /subagents_continue/);
+    assert.equal(outputProperties(subAbort).obligationState?.const, "closed");
+    assert.equal(outputProperties(subClose).obligationState?.const, "closed");
   } finally {
     await client.close();
     await server.close();

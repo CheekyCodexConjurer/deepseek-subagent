@@ -1,12 +1,13 @@
 import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, AGY_MODEL, buildAgyArgs } from "./args.js";
 import { parseAgyOutput } from "./parser.js";
-import { AntigravityProcessError, runAgy, type SpawnLike } from "./runner.js";
+import { AntigravityProcessError, runAgy, AGY_DEFAULT_TIMEOUT_MS, type SpawnLike } from "./runner.js";
 import { InvalidRequestError } from "../errors.js";
 import { AntigravitySupervisor } from "./supervisor.js";
 import { AntigravitySpool } from "./spool.js";
 import type {
   AntigravityAttemptManifest,
   AntigravityAttemptStatus,
+  AntigravityHeartbeat,
   AntigravityRunResult,
 } from "./types.js";
 
@@ -28,16 +29,19 @@ export interface AntigravityRunOptions {
   model?: string | undefined;
   signal?: AbortSignal | undefined;
   timeoutMs?: number | undefined;
+  fence?: number | undefined;
   attemptManifest?: AntigravityAttemptManifest | undefined;
   dataDir?: string | undefined;
   agentId?: string | undefined;
   jobId?: string | undefined;
   requestId?: string | undefined;
+  onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
 }
 
 export interface AntigravityProviderLike {
   runPrompt(options: AntigravityRunOptions): Promise<AntigravityRunResult>;
-  runAttempt?(manifest: AntigravityAttemptManifest, signal?: AbortSignal): Promise<AntigravityRunResult>;
+  runAttempt?(manifest: AntigravityAttemptManifest, signal?: AbortSignal, onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>): Promise<AntigravityRunResult>;
+  extendTimeout?(jobIdOrAttemptId: string, timeoutMs: number): boolean;
 }
 
 /**
@@ -65,11 +69,12 @@ export class AntigravityAdapter implements AntigravityProviderLike {
   readonly spawnFn: SpawnLike | undefined;
   readonly killTreeFn: ((pid: number) => Promise<void>) | undefined;
   readonly dataDir: string | undefined;
+  private readonly activeSupervisors = new Map<string, AntigravitySupervisor>();
 
   constructor(options: AntigravityAdapterOptions = {}) {
     this.command = options.command ?? AGY_COMMAND;
     this.model = options.model ?? AGY_MODEL;
-    this.timeoutMs = options.timeoutMs ?? 900_000;
+    this.timeoutMs = options.timeoutMs ?? AGY_DEFAULT_TIMEOUT_MS;
     this.sandbox = options.sandbox === true;
     this.addDirs = [...new Set(options.addDirs ?? [])];
     this.dangerouslySkipPermissions = options.dangerouslySkipPermissions === true;
@@ -78,16 +83,37 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     this.dataDir = options.dataDir;
   }
 
-  async runAttempt(manifest: AntigravityAttemptManifest, signal?: AbortSignal): Promise<AntigravityRunResult> {
+  extendTimeout(jobIdOrAttemptId: string, timeoutMs: number): boolean {
+    const supervisor = this.activeSupervisors.get(jobIdOrAttemptId);
+    if (supervisor) {
+      supervisor.extendTimeout(timeoutMs);
+      return true;
+    }
+    return false;
+  }
+
+  async runAttempt(
+    manifest: AntigravityAttemptManifest,
+    signal?: AbortSignal,
+    onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>,
+  ): Promise<AntigravityRunResult> {
     const supervisor = new AntigravitySupervisor({
       spoolDir: manifest.attemptDir,
       manifest,
       ...(this.spawnFn ? { spawnFn: this.spawnFn } : {}),
       ...(this.killTreeFn ? { killTreeFn: this.killTreeFn } : {}),
       ...(signal ? { signal } : {}),
+      ...(onHeartbeat ? { onHeartbeat } : {}),
     });
-    const status = await supervisor.run();
-    return this.mapAttemptStatusToResult(manifest, status);
+    this.activeSupervisors.set(manifest.attemptId, supervisor);
+    this.activeSupervisors.set(manifest.jobId, supervisor);
+    try {
+      const status = await supervisor.run();
+      return this.mapAttemptStatusToResult(manifest, status);
+    } finally {
+      this.activeSupervisors.delete(manifest.attemptId);
+      this.activeSupervisors.delete(manifest.jobId);
+    }
   }
 
   mapAttemptStatusToResult(manifest: AntigravityAttemptManifest, status: AntigravityAttemptStatus): AntigravityRunResult {
@@ -130,7 +156,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       );
     }
     if (options.attemptManifest) {
-      return await this.runAttempt(options.attemptManifest, options.signal);
+      return await this.runAttempt(options.attemptManifest, options.signal, options.onHeartbeat);
     }
     const dataDir = options.dataDir ?? this.dataDir;
     if (dataDir && options.jobId && options.agentId && options.requestId) {
@@ -147,11 +173,12 @@ export class AntigravityAdapter implements AntigravityProviderLike {
         modelRoute: "antigravity-flash-high",
         command: this.command,
         timeoutMs: options.timeoutMs ?? this.timeoutMs,
+        fence: options.fence,
         sandbox: this.sandbox,
         addDirs: this.addDirs,
         dangerouslySkipPermissions: this.dangerouslySkipPermissions,
       });
-      return await this.runAttempt(manifest, options.signal);
+      return await this.runAttempt(manifest, options.signal, options.onHeartbeat);
     }
 
     const model = options.model ?? this.model;

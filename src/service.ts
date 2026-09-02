@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { canRead, defaultWorkspace, assertInside, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
+import { canRead, defaultWorkspace, assertInside, isProcessAlive, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
 import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions, type WorkerPromptInput } from "./prompts.js";
 import { BridgeStore } from "./store.js";
 import { InboxDelivery } from "./delivery/inbox.js";
@@ -19,8 +19,9 @@ import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/
 import { AntigravityProcessError, AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
 import { AntigravitySpool, isHeartbeatLive } from "./antigravity/spool.js";
+import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
-import type { AntigravityAttemptManifest, AntigravityRunResult } from "./antigravity/types.js";
+import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult } from "./antigravity/types.js";
 
 import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
@@ -28,6 +29,7 @@ import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState }
 import type {
   ActiveRouteSource,
   AgentRecord,
+  AuthoritativeLivenessStatus,
   BridgeConfig,
   ConsultInput,
   ContinueInput,
@@ -121,6 +123,18 @@ export interface ServiceStatus {
   activeRoute: ResolvedRoute | null;
   activeRouteSource: ActiveRouteSource;
   error?: string | null;
+}
+
+export interface QuiescenceProof {
+  stopped: boolean;
+  jobId?: string;
+  supervisorPid?: number | null;
+  agyPid?: number | null;
+  workerPid?: number | null;
+  pidsChecked: number[];
+  alivePids: number[];
+  verifiedAt: string;
+  error?: string;
 }
 
 const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "following", "finalizing", "needs_approval"]);
@@ -244,6 +258,8 @@ export class BridgeService {
   private readonly followLifecycles = new Map<string, FollowLifecycle>();
   private readonly antigravityAbortControllers = new Map<string, AbortController>();
   private readonly antigravityTasks = new Set<Promise<void>>();
+  private readonly antigravityTasksByJob = new Map<string, Promise<void>>();
+  private lastSseEventAt: number | null = null;
   private retentionTimer: NodeJS.Timeout | null = null;
   private retentionState: RetentionPolicyState | null = null;
   private lifecycleState: DaemonLifecycleState = "starting";
@@ -267,6 +283,7 @@ export class BridgeService {
       addDirs: config.antigravityAddDirs,
       dangerouslySkipPermissions: config.antigravityAutoApprovePermissions,
       dataDir: config.dataDir,
+      timeoutMs: this.effectiveWorkerTimeoutMs(),
     });
   }
 
@@ -354,6 +371,7 @@ export class BridgeService {
         new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
       ]);
       this.antigravityTasks.clear();
+      this.antigravityTasksByJob.clear();
     }
     this.streamAbort?.abort();
     this.streamAbort = null;
@@ -635,6 +653,123 @@ export class BridgeService {
     return this.progressSnapshot(agent, job, normalizeActivityLimit(input.activityLimit));
   }
 
+  async getAuthoritativeStatus(agentId: string, jobId?: string): Promise<AuthoritativeLivenessStatus> {
+    const snapshot = await this.consult(jobId ? { agentId, jobId } : { agentId });
+    return snapshot.authoritativeStatus!;
+  }
+
+  private async ensureAntigravityQuiescence(
+    jobId: string,
+    spool: AntigravitySpool,
+    maxWaitMs = 5000,
+  ): Promise<QuiescenceProof> {
+    const deadline = Date.now() + maxWaitMs;
+    const task = this.antigravityTasksByJob.get(jobId);
+    if (task) {
+      const remaining = Math.max(0, deadline - Date.now());
+      await Promise.race([
+        task,
+        new Promise((r) => setTimeout(r, remaining)),
+      ]).catch(() => undefined);
+    }
+    const latestAttempt = await spool.getLatestAttempt(jobId).catch(() => null);
+    let supervisorPid: number | null = null;
+    let agyPid: number | null = null;
+    let supervisorAlive = false;
+    let agyAlive = false;
+
+    while (Date.now() < deadline) {
+      if (latestAttempt) {
+        const heartbeat = await spool.readHeartbeat(latestAttempt.heartbeatPath).catch(() => null);
+        supervisorPid = heartbeat?.supervisorPid ?? null;
+        agyPid = heartbeat?.agyPid ?? null;
+        supervisorAlive = supervisorPid === process.pid
+          ? this.antigravityTasksByJob.has(jobId)
+          : (supervisorPid ? isProcessAlive(supervisorPid) : false);
+        agyAlive = agyPid ? isProcessAlive(agyPid) : false;
+      } else {
+        supervisorAlive = this.antigravityTasksByJob.has(jobId);
+      }
+      if (!supervisorAlive && !agyAlive) {
+        const pidsChecked = [supervisorPid, agyPid].filter((p): p is number => typeof p === "number");
+        return {
+          stopped: true,
+          jobId,
+          supervisorPid,
+          agyPid,
+          pidsChecked,
+          alivePids: [],
+          verifiedAt: new Date().toISOString(),
+        };
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    if (latestAttempt) {
+      const heartbeat = await spool.readHeartbeat(latestAttempt.heartbeatPath).catch(() => null);
+      supervisorPid = heartbeat?.supervisorPid ?? supervisorPid;
+      agyPid = heartbeat?.agyPid ?? agyPid;
+      supervisorAlive = supervisorPid === process.pid
+        ? this.antigravityTasksByJob.has(jobId)
+        : (supervisorPid ? isProcessAlive(supervisorPid) : false);
+      agyAlive = agyPid ? isProcessAlive(agyPid) : false;
+    } else {
+      supervisorAlive = this.antigravityTasksByJob.has(jobId);
+    }
+    const stopped = !supervisorAlive && !agyAlive;
+    const pidsChecked = [supervisorPid, agyPid].filter((p): p is number => typeof p === "number");
+    const alivePids: number[] = [];
+    if (supervisorAlive && supervisorPid && supervisorPid !== process.pid) alivePids.push(supervisorPid);
+    if (agyAlive && agyPid) alivePids.push(agyPid);
+    return {
+      stopped,
+      jobId,
+      supervisorPid,
+      agyPid,
+      pidsChecked,
+      alivePids,
+      verifiedAt: new Date().toISOString(),
+      ...(!stopped ? { error: "Antigravity process did not reach quiescence within " + maxWaitMs + "ms (supervisorPid: " + supervisorPid + ", agyPid: " + agyPid + ")" } : {}),
+    };
+  }
+
+  private async ensureOpenCodeQuiescence(
+    pid?: number | null,
+    maxWaitMs = 5000,
+  ): Promise<QuiescenceProof> {
+    if (!pid || (this.managed?.processId && pid === this.managed.processId)) {
+      return {
+        stopped: true,
+        workerPid: null,
+        pidsChecked: [],
+        alivePids: [],
+        verifiedAt: new Date().toISOString(),
+      };
+    }
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      if (!isProcessAlive(pid)) {
+        return {
+          stopped: true,
+          workerPid: pid,
+          pidsChecked: [pid],
+          alivePids: [],
+          verifiedAt: new Date().toISOString(),
+        };
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const stopped = !isProcessAlive(pid);
+    return {
+      stopped,
+      workerPid: pid,
+      pidsChecked: [pid],
+      alivePids: stopped ? [] : [pid],
+      verifiedAt: new Date().toISOString(),
+      ...(!stopped ? { error: "OpenCode worker process (PID " + pid + ") did not reach quiescence within " + maxWaitMs + "ms" } : {}),
+    };
+  }
+
   async follow(input: FollowInput, signal?: AbortSignal): Promise<FollowResult> {
     this.requireRunning();
     const agent = this.store.getAgent(input.agentId);
@@ -667,7 +802,7 @@ export class BridgeService {
     }
   }
 
-  async abort(agentId: string, reason?: string): Promise<{ agentId: string; jobId: string | null; status: string }> {
+  async abort(agentId: string, reason?: string): Promise<{ agentId: string; jobId: string | null; status: string; proof?: QuiescenceProof; quiescent?: boolean }> {
     this.requireRunning();
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new UnknownAgentError(agentId);
@@ -681,11 +816,12 @@ export class BridgeService {
       // A stopped agent is non-continuable; auto-close it so the obligation
       // ends and the agent is not left in an open intermediate state.
       if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agentId, "closed", reason ?? null);
-      return { agentId, jobId: null, status: "aborted" };
+      return { agentId, jobId: null, status: "aborted", quiescent: true };
     }
     this.clearApprovalTimer(agentId);
     this.store.setApprovalDeadline(active.id, null);
     let remoteError: string | null = null;
+    let proof: QuiescenceProof | undefined;
     const isAntigravityWithoutSession = agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"));
     if (agent.modelProviderId === "antigravity") {
       const controller = this.antigravityAbortControllers.get(active.id);
@@ -698,7 +834,14 @@ export class BridgeService {
         this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
       }
       const spool = new AntigravitySpool(this.config.dataDir);
-      void spool.writeCancelSignal(active.id, reason ?? "Aborted by orchestrator").catch(() => undefined);
+      await spool.writeCancelSignal(active.id, reason ?? "Aborted by orchestrator").catch(() => undefined);
+      const qResult = await this.ensureAntigravityQuiescence(active.id, spool);
+      if (!qResult.stopped) {
+        const errorMsg = qResult.error ?? "Antigravity process failed to stop within deadline";
+        this.recordActivity(agent, active, "error", errorMsg);
+        throw new ConflictError(errorMsg, "state_conflict");
+      }
+      proof = qResult;
     }
     if (!isAntigravityWithoutSession) {
       try {
@@ -706,30 +849,98 @@ export class BridgeService {
       } catch (error) {
         remoteError = redactSecrets(String(error));
       }
+      if (remoteError) {
+        this.recordActivity(agent, active, "error", "OpenCode abort failed: " + remoteError);
+        throw new ConflictError("OpenCode abort failed: " + remoteError, "state_conflict");
+      }
+      const ephemeralWorkerPid = active.workerPid && active.workerPid !== this.managed?.processId
+        ? active.workerPid
+        : null;
+      if (ephemeralWorkerPid && isProcessAlive(ephemeralWorkerPid)) {
+        const qResult = await this.ensureOpenCodeQuiescence(ephemeralWorkerPid);
+        if (!qResult.stopped) {
+          const errorMsg = qResult.error ?? "OpenCode worker process failed to stop within deadline";
+          this.recordActivity(agent, active, "error", errorMsg);
+          throw new ConflictError(errorMsg, "state_conflict");
+        }
+        proof = qResult;
+      } else {
+        proof = {
+          stopped: true,
+          workerPid: null,
+          pidsChecked: [],
+          alivePids: [],
+          verifiedAt: new Date().toISOString(),
+        };
+      }
     }
-    const localReason = reason ?? (remoteError ? "Abort requested; remote abort failed: " + remoteError : "Aborted by orchestrator");
+    const localReason = reason ?? "Aborted by orchestrator";
 
     if (active.status !== "aborted") this.store.updateJobStatus(active.id, "aborted", localReason);
     // Aborted agents are non-continuable; auto-close them safely.
     if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", reason ?? null);
-    this.recordActivity(agent, active, "abort", remoteError ? "Abort requested but OpenCode returned an error" : "Abort requested for the active DeepSeek task");
+    this.recordActivity(agent, active, "abort", "Abort requested for the active DeepSeek task");
     await this.resolveFollow(active.id, {
       status: "aborted",
       error: localReason,
       workerAborted: true,
     });
-    if (remoteError) throw new Error(remoteError);
-    return { agentId, jobId: active.id, status: "aborted" };
+    return {
+      agentId,
+      jobId: active.id,
+      status: "aborted",
+      ...(proof !== undefined ? { proof } : {}),
+      quiescent: true,
+    };
   }
 
-  async close(agentId: string): Promise<{ agentId: string; status: string }> {
+  async close(agentId: string): Promise<{ agentId: string; status: string; proof?: QuiescenceProof; quiescent: boolean }> {
     const agent = this.store.getAgent(agentId);
     if (!agent) throw new UnknownAgentError(agentId);
     const active = this.activeJob(agentId);
-    if (active) await this.abort(agentId, "Closed by orchestrator");
+    let proof: QuiescenceProof | undefined;
+    if (active) {
+      const abortRes = await this.abort(agentId, "Closed by orchestrator");
+      proof = abortRes.proof;
+    }
+    const jobs = this.store.listJobs().filter((j) => j.agentId === agentId);
+    for (const job of jobs) {
+      const ephemeralWorkerPid = job.workerPid && job.workerPid !== this.managed?.processId
+        ? job.workerPid
+        : null;
+      if (ephemeralWorkerPid && isProcessAlive(ephemeralWorkerPid)) {
+        const qResult = await this.ensureOpenCodeQuiescence(ephemeralWorkerPid);
+        if (!qResult.stopped) {
+          throw new ConflictError("Cannot close agent: process PID " + ephemeralWorkerPid + " is still alive", "state_conflict");
+        }
+        proof = qResult;
+      }
+      if (agent.modelProviderId === "antigravity" && this.antigravityTasksByJob.has(job.id)) {
+        const spool = new AntigravitySpool(this.config.dataDir);
+        const qResult = await this.ensureAntigravityQuiescence(job.id, spool);
+        if (!qResult.stopped) {
+          throw new ConflictError("Cannot close agent: antigravity process for job " + job.id + " is still alive", "state_conflict");
+        }
+        proof = qResult;
+      }
+    }
+    if (!proof) {
+      proof = {
+        stopped: true,
+        workerPid: null,
+        pidsChecked: [],
+        alivePids: [],
+        verifiedAt: new Date().toISOString(),
+      };
+    }
     const refreshed = this.store.getAgent(agentId);
     if (refreshed && refreshed.status !== "closed") this.store.updateAgentStatus(agentId, "closed");
-    return { agentId, status: "closed" };
+    return {
+      agentId,
+      status: "closed",
+      ...(proof !== undefined ? { proof } : {}),
+      quiescent: true,
+    };
   }
 
   async recoverResult(jobId: string, agentId?: string): Promise<unknown> {
@@ -1016,13 +1227,17 @@ export class BridgeService {
     });
   }
 
+  private effectiveWorkerTimeoutMs(waitMinutes?: number, graceMinutes?: number): number {
+    const wait = waitMinutes ?? this.config.followDefaultWaitMinutes;
+    const grace = graceMinutes ?? this.config.followDefaultGraceMinutes;
+    const maxMinutes = this.config.workerMaxExecutionMinutes ?? FOLLOW_MAX_TOTAL_MINUTES;
+    return Math.min(wait + grace, maxMinutes) * 60_000;
+  }
+
   private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number, autoArmed = false): FollowLifecycle {
     const existing = this.followLifecycles.get(job.id);
     if (existing) {
-      // An auto-armed lifecycle (unknown dispatch outcome) may be extended by
-      // an explicit follow requesting a larger window; never create a second
-      // lifecycle or timer, and never shrink an active window.
-      if (existing.autoArmed) this.extendFollowLifecycle(job.id, existing, waitMinutes, graceMinutes);
+      this.extendFollowLifecycle(job.id, existing, waitMinutes, graceMinutes);
       return existing;
     }
     const now = Date.now();
@@ -1052,6 +1267,14 @@ export class BridgeService {
       graceDeadlineAt: graceDeadlineAt === null ? null : new Date(graceDeadlineAt).toISOString(),
       gracefulFinalizeAttempted: current.gracefulFinalizeAttempted,
     });
+    const timeoutMs = this.effectiveWorkerTimeoutMs(waitMinutes, effectiveGraceMinutes);
+    const leaseExpiresAt = new Date(startedAt + timeoutMs).toISOString();
+    this.store.updateJobLiveness(job.id, { leaseExpiresAt });
+    const spool = new AntigravitySpool(this.config.dataDir);
+    void spool.writeDeadlineExtension(job.id, timeoutMs).catch(() => undefined);
+    if (typeof (this.antigravity as any)?.extendTimeout === "function") {
+      (this.antigravity as any).extendTimeout(job.id, timeoutMs);
+    }
     let resolve!: (result: FollowResult) => void;
     let reject!: (error: unknown) => void;
     const promise = new Promise<FollowResult>((resolvePromise, rejectPromise) => {
@@ -1085,7 +1308,7 @@ export class BridgeService {
     if (!job || lifecycle.settled || TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") return;
     const startedAt = parseTimestamp(job.followStartedAt) ?? Date.now();
     const currentDeadlineAt = parseTimestamp(job.followDeadlineAt);
-    if (currentDeadlineAt === null) return;
+    if (currentDeadlineAt === null || currentDeadlineAt <= Date.now()) return;
     const requestedDeadlineAt = startedAt + waitMinutes * 60_000;
     const extendedDeadlineAt = Math.max(currentDeadlineAt, requestedDeadlineAt);
     const currentGrace = job.followGraceMinutes ?? lifecycle.graceMinutes;
@@ -1111,6 +1334,14 @@ export class BridgeService {
       graceDeadlineAt,
       gracefulFinalizeAttempted: job.gracefulFinalizeAttempted,
     });
+    const timeoutMs = this.effectiveWorkerTimeoutMs(waitMinutes, extendedGrace);
+    const extendedLeaseExpiresAt = new Date(startedAt + timeoutMs).toISOString();
+    this.store.updateJobLiveness(jobId, { leaseExpiresAt: extendedLeaseExpiresAt });
+    const spool = new AntigravitySpool(this.config.dataDir);
+    void spool.writeDeadlineExtension(jobId, timeoutMs).catch(() => undefined);
+    if (typeof (this.antigravity as any).extendTimeout === "function") {
+      (this.antigravity as any).extendTimeout(jobId, timeoutMs);
+    }
     lifecycle.graceMinutes = extendedGrace;
     if (finalizing) {
       if (graceExtended && graceDeadlineAt) {
@@ -1386,6 +1617,66 @@ export class BridgeService {
     const start = parseTimestamp(job?.startedAt) ?? parseTimestamp(agent.createdAt) ?? Date.now();
     const end = parseTimestamp(job?.completedAt) ?? Date.now();
     const latest = activities[0];
+
+    let heartbeatAt: string | null = job?.heartbeatAt ?? null;
+    let heartbeatAgoSeconds: number | null = null;
+    let leaseExpiresAt: string | null = job?.leaseExpiresAt ?? job?.graceDeadlineAt ?? job?.followDeadlineAt ?? null;
+    let attemptId: string | null = job?.attempt ?? null;
+    let fence: number | null = job?.fence ?? 1;
+    let pid: number | null = job?.workerPid ?? null;
+    let sessionId: string | null = agent.opencodeSessionId ?? null;
+    let resultPersisted = Boolean(job?.resultPath);
+    let isLive = false;
+
+    if (job) {
+      if (agent.modelProviderId === "antigravity" || !agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:")) {
+        const spool = new AntigravitySpool(this.config.dataDir);
+        const latestAttempt = await spool.getLatestAttempt(job.id).catch(() => null);
+        if (latestAttempt) {
+          attemptId = latestAttempt.attemptId;
+          const heartbeat = await spool.readHeartbeat(latestAttempt.heartbeatPath).catch(() => null);
+          if (heartbeat) {
+            heartbeatAt = heartbeat.timestamp || (heartbeat.updatedAt ? new Date(heartbeat.updatedAt).toISOString() : null);
+            if (heartbeat.updatedAt) {
+              heartbeatAgoSeconds = Math.max(0, Math.floor((Date.now() - heartbeat.updatedAt) / 1000));
+            }
+            pid = heartbeat.supervisorPid || heartbeat.agyPid || null;
+            const supervisorAlive = heartbeat.supervisorPid ? isProcessAlive(heartbeat.supervisorPid) : false;
+            const agyAlive = heartbeat.agyPid ? isProcessAlive(heartbeat.agyPid) : false;
+            isLive = supervisorAlive || agyAlive;
+          }
+          if (!leaseExpiresAt) {
+            const createdAtMs = parseTimestamp(latestAttempt.createdAt) ?? start;
+            leaseExpiresAt = new Date(createdAtMs + (latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs())).toISOString();
+          }
+        }
+      } else {
+        pid = job.workerPid ?? null;
+        heartbeatAt = job.heartbeatAt ?? null;
+        if (heartbeatAt) {
+          const hbMs = parseTimestamp(heartbeatAt);
+          if (hbMs !== null) {
+            heartbeatAgoSeconds = Math.max(0, Math.floor((Date.now() - hbMs) / 1000));
+          }
+        }
+        if (pid) {
+          isLive = isProcessAlive(pid);
+        }
+      }
+    }
+
+    const authoritativeStatus: AuthoritativeLivenessStatus = {
+      heartbeatAt,
+      heartbeatAgoSeconds,
+      leaseExpiresAt,
+      attempt: attemptId,
+      fence,
+      pid,
+      sessionId,
+      resultPersisted,
+      isLive,
+    };
+
     return {
       agentId: agent.id,
       jobId: job?.id ?? null,
@@ -1402,6 +1693,15 @@ export class BridgeService {
       filesTouched: envelope?.files ?? [],
       testSummary: envelope?.tests?.join("; ") || "No test result observed yet.",
       resultAvailable: Boolean(job?.resultPath),
+      heartbeatAt,
+      heartbeatAgoSeconds,
+      leaseExpiresAt,
+      attempt: attemptId,
+      fence,
+      pid,
+      sessionId,
+      resultPersisted,
+      authoritativeStatus,
     };
   }
 
@@ -1432,6 +1732,16 @@ export class BridgeService {
     }
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
+    const timeoutMs = this.effectiveWorkerTimeoutMs();
+    const leaseExpiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const workerPid = null;
+    this.store.updateJobLiveness(job.id, {
+      leaseExpiresAt,
+      attempt: "1",
+      fence: job.fence ?? 1,
+      workerPid,
+      heartbeatAt: new Date().toISOString(),
+    });
     if (job.kind === "continue" && !job.lastAssistantMessageId) {
       const baselineAssistantMessageId = this.previousAssistantMessageId(agent.id, job.id);
       if (baselineAssistantMessageId) this.store.setJobMessages(job.id, null, baselineAssistantMessageId);
@@ -1510,17 +1820,32 @@ export class BridgeService {
       this.recordActivity(currentAgent ?? agent, currentJob ?? job, "abort", "Antigravity launch prevented: the agent was aborted before dispatch started");
       return this.accepted(currentJob ?? job);
     }
+    const adapterTimeout = (this.antigravity as any)?.timeoutMs;
+    const timeoutMs = (typeof adapterTimeout === "number" && adapterTimeout !== AGY_DEFAULT_TIMEOUT_MS)
+      ? adapterTimeout
+      : this.effectiveWorkerTimeoutMs();
+    const leaseExpiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const capturedFence = job.fence ?? 1;
+    this.store.updateJobLiveness(job.id, {
+      leaseExpiresAt,
+      attempt: null,
+      fence: capturedFence,
+      workerPid: null,
+      heartbeatAt: new Date().toISOString(),
+    });
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
     this.store.updateJobStatus(job.id, "running");
-    const task = this.runAntigravityAsync(agent, job, prompt, controller, workerInput, contextFiles)
+    const task = this.runAntigravityAsync(agent, job, prompt, controller, timeoutMs, workerInput, contextFiles, capturedFence)
       .catch((error: unknown) => {
         if (this.running) this.lastStreamError = redactSecrets(String(error));
       })
       .finally(() => {
         this.antigravityTasks.delete(task);
+        this.antigravityTasksByJob.delete(job.id);
       });
     this.antigravityTasks.add(task);
+    this.antigravityTasksByJob.set(job.id, task);
     return this.accepted(this.store.getJob(job.id) ?? job);
   }
 
@@ -1534,9 +1859,20 @@ export class BridgeService {
   ): Promise<void> {
     const spool = new AntigravitySpool(this.config.dataDir);
     try {
+      const capturedFence = manifest.fence ?? job.fence ?? 1;
+      const onHeartbeat = (hb: AntigravityHeartbeat) => {
+        try {
+          this.store.updateJobLiveness(job.id, {
+            attempt: manifest.attemptId,
+            workerPid: hb.agyPid ?? hb.supervisorPid ?? null,
+            heartbeatAt: hb.timestamp,
+            fence: capturedFence,
+          });
+        } catch {}
+      };
       let result: AntigravityRunResult;
       if (typeof (this.antigravity as any).runAttempt === "function") {
-        result = await (this.antigravity as any).runAttempt(manifest, controller.signal);
+        result = await (this.antigravity as any).runAttempt(manifest, controller.signal, onHeartbeat);
       } else {
         result = await this.antigravity.runPrompt({
           prompt: manifest.promptPath && existsSync(manifest.promptPath) ? await readFile(manifest.promptPath, "utf8").catch(() => "") : "",
@@ -1544,6 +1880,7 @@ export class BridgeService {
           model: manifest.modelId,
           signal: controller.signal,
           attemptManifest: manifest,
+          onHeartbeat,
         });
       }
       const current = this.store.getJob(job.id);
@@ -1614,10 +1951,29 @@ export class BridgeService {
     job: JobRecord,
     prompt: string,
     controller: AbortController,
+    timeoutMs?: number,
     workerInput?: WorkerPromptInput,
     contextFiles?: string[],
+    fence?: number,
   ): Promise<void> {
     try {
+      const adapterTimeout = (this.antigravity as any)?.timeoutMs;
+      const effectiveTimeoutMs = timeoutMs ?? (
+        (typeof adapterTimeout === "number" && adapterTimeout !== AGY_DEFAULT_TIMEOUT_MS)
+          ? adapterTimeout
+          : this.effectiveWorkerTimeoutMs()
+      );
+      const capturedFence = fence ?? job.fence ?? 1;
+      const onHeartbeat = (hb: AntigravityHeartbeat) => {
+        try {
+          this.store.updateJobLiveness(job.id, {
+            attempt: hb.attemptId ?? null,
+            workerPid: hb.agyPid ?? hb.supervisorPid ?? null,
+            heartbeatAt: hb.timestamp,
+            fence: capturedFence,
+          });
+        } catch {}
+      };
       const result: AntigravityRunResult = await this.antigravity.runPrompt({
         prompt,
         cwd: agent.workspacePath,
@@ -1627,6 +1983,9 @@ export class BridgeService {
         agentId: agent.id,
         jobId: job.id,
         requestId: job.requestId,
+        timeoutMs: effectiveTimeoutMs,
+        fence: capturedFence,
+        onHeartbeat,
       });
       const current = this.store.getJob(job.id);
       if (controller.signal.aborted || current?.status === "aborted") {
@@ -1950,6 +2309,13 @@ export class BridgeService {
       });
       if (!inserted && this.store.isEventProcessed("opencode", sourceEventId)) return;
       this.recordActivity(agent, observedJob, activityTypeForEvent(event), observableEventSummary(event));
+      if (observedJob) {
+        try {
+          this.store.updateJobLiveness(observedJob.id, {
+            heartbeatAt: new Date().toISOString(),
+          });
+        } catch {}
+      }
       const status = findStatus(event.properties);
       if (event.type === "session.error" || event.type.includes(".error")) {
         await this.failActive(agent, redactSecrets(JSON.stringify(event.properties)));
@@ -2523,10 +2889,27 @@ export class BridgeService {
       }
     }
 
-    // 2. Check if supervisor heartbeat is live
+    // 2. Check if supervisor heartbeat is live or process is running
     const heartbeat = await spool.readHeartbeat(latestAttempt.heartbeatPath);
-    if (spool.isHeartbeatLive(heartbeat)) {
-      this.recordActivity(agent, job, "dispatch", "Reattached to live Antigravity attempt " + latestAttempt.attemptId + " (supervisor PID " + heartbeat!.supervisorPid + ")");
+    const supervisorAlive = heartbeat?.supervisorPid ? isProcessAlive(heartbeat.supervisorPid) : false;
+    const agyAlive = heartbeat?.agyPid ? isProcessAlive(heartbeat.agyPid) : false;
+    const processAlive = supervisorAlive || agyAlive;
+    const isHeartbeatLive = spool.isHeartbeatLive(heartbeat);
+    const startTime = heartbeat?.updatedAt
+      ? Math.min(parseTimestamp(latestAttempt.createdAt) ?? heartbeat.updatedAt, heartbeat.updatedAt)
+      : (parseTimestamp(latestAttempt.createdAt) ?? 0);
+    const fallbackLeaseMs = startTime + (latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs());
+    const leaseExpiresAt = job.leaseExpiresAt ? parseTimestamp(job.leaseExpiresAt) : fallbackLeaseMs;
+    const leaseActive = leaseExpiresAt !== null && Date.now() < leaseExpiresAt;
+
+    if (isHeartbeatLive || processAlive) {
+      this.recordActivity(agent, job, "dispatch", "Reattached to live Antigravity attempt " + latestAttempt.attemptId + " (supervisor PID " + (heartbeat?.supervisorPid ?? "unknown") + ")");
+      this.store.updateJobLiveness(job.id, {
+        attempt: latestAttempt.attemptId,
+        workerPid: heartbeat?.agyPid ?? heartbeat?.supervisorPid ?? null,
+        heartbeatAt: heartbeat?.timestamp ?? new Date().toISOString(),
+        fence: job.fence ?? 1,
+      });
       if (["following", "finalizing"].includes(job.status)) {
         this.ensureFollowLifecycle(
           job,
@@ -2540,8 +2923,24 @@ export class BridgeService {
         })
         .finally(() => {
           this.antigravityTasks.delete(task);
+          this.antigravityTasksByJob.delete(job.id);
         });
       this.antigravityTasks.add(task);
+      this.antigravityTasksByJob.set(job.id, task);
+      return;
+    }
+
+    // Explicitly differentiate provably dead from unknown / lease active:
+    // If lease is still active or process liveness is unknown (e.g. no heartbeat / no verified PID),
+    // takeover is blocked! Never start a replacement worker or release the workspace.
+    const hasKnownPids = Boolean(heartbeat?.supervisorPid || heartbeat?.agyPid);
+    const provablyDead = !leaseActive && !processAlive && !isHeartbeatLive && hasKnownPids;
+
+    if (!provablyDead) {
+      const reason = leaseActive
+        ? "Antigravity takeover blocked: lease is still active until " + new Date(leaseExpiresAt!).toISOString()
+        : "Antigravity takeover blocked: worker liveness is unknown (no verifiable PID or heartbeat)";
+      this.recordActivity(agent, job, "dispatch", reason);
       return;
     }
 
@@ -2579,6 +2978,16 @@ export class BridgeService {
       return;
     }
 
+    // Calculate monotonic fence before creating replacement attempt
+    const currentJob = this.store.getJob(job.id) ?? job;
+    const currentFence = Math.max(
+      typeof currentJob.fence === "number" ? currentJob.fence : 1,
+      typeof job.fence === "number" ? job.fence : 1,
+      typeof latestAttempt.fence === "number" ? latestAttempt.fence : 1,
+      1,
+    );
+    const nextFence = currentFence + 1;
+
     // Create replacement attempt
     const replacement = await spool.createAttempt({
       agentId: agent.id,
@@ -2597,6 +3006,14 @@ export class BridgeService {
       dangerouslySkipPermissions: latestAttempt.dangerouslySkipPermissions,
       parentAttemptId: latestAttempt.attemptId,
       maxOutputBytes: latestAttempt.maxOutputBytes,
+      fence: nextFence,
+    });
+
+    this.store.updateJobLiveness(job.id, {
+      attempt: replacement.attemptId,
+      fence: nextFence,
+      heartbeatAt: new Date().toISOString(),
+      leaseExpiresAt: new Date(Date.now() + replacement.timeoutMs).toISOString(),
     });
 
     this.recordActivity(
@@ -2622,8 +3039,10 @@ export class BridgeService {
       })
       .finally(() => {
         this.antigravityTasks.delete(task);
+        this.antigravityTasksByJob.delete(job.id);
       });
     this.antigravityTasks.add(task);
+    this.antigravityTasksByJob.set(job.id, task);
   }
 
   private async monitorReattachedAntigravityAttempt(
@@ -2696,7 +3115,20 @@ export class BridgeService {
         }
 
         const heartbeat = await spool.readHeartbeat(manifest.heartbeatPath);
-        if (!spool.isHeartbeatLive(heartbeat)) {
+        if (heartbeat) {
+          try {
+            this.store.updateJobLiveness(job.id, {
+              attempt: manifest.attemptId,
+              workerPid: heartbeat.agyPid ?? heartbeat.supervisorPid ?? null,
+              heartbeatAt: heartbeat.timestamp,
+              fence: manifest.fence ?? job.fence ?? 1,
+            });
+          } catch {}
+        }
+        const supervisorAlive = heartbeat?.supervisorPid ? isProcessAlive(heartbeat.supervisorPid) : false;
+        const agyAlive = heartbeat?.agyPid ? isProcessAlive(heartbeat.agyPid) : false;
+        const processAlive = supervisorAlive || agyAlive;
+        if (!spool.isHeartbeatLive(heartbeat) && !processAlive) {
           await this.recoverAntigravityJob(agent, job);
           return;
         }

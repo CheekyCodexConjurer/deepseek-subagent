@@ -178,6 +178,11 @@ export interface JobRecord {
   fallbackReason?: string | null;
   fallbackStatus?: string | null;
   fallbackCount?: number;
+  leaseExpiresAt?: string | null;
+  attempt?: string | null;
+  fence?: number | null;
+  workerPid?: number | null;
+  heartbeatAt?: string | null;
 }
 
 
@@ -207,6 +212,18 @@ export interface ProgressActivity {
   timestamp: string;
 }
 
+export interface AuthoritativeLivenessStatus {
+  heartbeatAt: string | null;
+  heartbeatAgoSeconds: number | null;
+  leaseExpiresAt: string | null;
+  attempt: string | null;
+  fence: number | null;
+  pid: number | null;
+  sessionId: string | null;
+  resultPersisted: boolean;
+  isLive: boolean;
+}
+
 export interface ProgressSnapshot {
   agentId: string;
   jobId: string | null;
@@ -219,6 +236,15 @@ export interface ProgressSnapshot {
   filesTouched: string[];
   testSummary: string;
   resultAvailable: boolean;
+  heartbeatAt?: string | null;
+  heartbeatAgoSeconds?: number | null;
+  leaseExpiresAt?: string | null;
+  attempt?: string | null;
+  fence?: number | null;
+  pid?: number | null;
+  sessionId?: string | null;
+  resultPersisted?: boolean;
+  authoritativeStatus?: AuthoritativeLivenessStatus;
 }
 
 export interface FollowResult {
@@ -378,6 +404,7 @@ export interface BridgeConfig {
   maxContextFileBytes: number;
   globalGeminiContextPath: string;
   backupDir: string;
+  workerMaxExecutionMinutes?: number;
 }
 
 

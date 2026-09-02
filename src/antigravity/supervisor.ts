@@ -1,5 +1,5 @@
 import { appendFile, readFile, unlink } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { newId, redactSecrets, writePrivateFile } from "../security.js";
@@ -20,6 +20,7 @@ export interface SupervisorOptions {
   killTreeFn?: ((pid: number) => Promise<void>) | undefined;
   heartbeatIntervalMs?: number | undefined;
   signal?: AbortSignal | undefined;
+  onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
 }
 
 export class AntigravitySupervisor {
@@ -30,10 +31,15 @@ export class AntigravitySupervisor {
   private readonly heartbeatIntervalMs: number;
   private readonly signal: AbortSignal | undefined;
   private readonly nonce: string;
+  private readonly onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
   private child: ChildProcess | null = null;
   private settled = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private cancelWatcherTimer: NodeJS.Timeout | null = null;
+  private timeoutTimer: NodeJS.Timeout | null = null;
+  private effectiveTimeoutMs: number;
+  private startTime = 0;
+  private resetTimeoutFn: ((newTimeoutMs: number) => void) | null = null;
 
   constructor(options: SupervisorOptions) {
     this.spoolDir = options.spoolDir;
@@ -42,11 +48,22 @@ export class AntigravitySupervisor {
     this.killTreeFn = options.killTreeFn ?? defaultKillTree;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 500;
     this.signal = options.signal;
+    this.onHeartbeat = options.onHeartbeat;
+    this.effectiveTimeoutMs = options.manifest.timeoutMs;
     this.nonce = newId("nonce");
+  }
+
+  extendTimeout(newTimeoutMs: number): void {
+    if (this.resetTimeoutFn) {
+      this.resetTimeoutFn(newTimeoutMs);
+    } else if (newTimeoutMs > this.effectiveTimeoutMs) {
+      this.effectiveTimeoutMs = newTimeoutMs;
+    }
   }
 
   async run(): Promise<AntigravityAttemptStatus> {
     if (this.settled) throw new Error("Supervisor has already run");
+    this.startTime = Date.now();
 
     // Write initial heartbeat
     await this.updateHeartbeat(null);
@@ -130,31 +147,64 @@ export class AntigravitySupervisor {
         }, { once: true });
       }
 
-      // Watch for cancel.signal file in spool dir
+      // Execution timeout timer
+      const resetTimeoutTimer = (newTimeoutMs: number) => {
+        if (newTimeoutMs <= this.effectiveTimeoutMs) return;
+        this.effectiveTimeoutMs = newTimeoutMs;
+        if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+        const elapsed = Date.now() - this.startTime;
+        const remaining = Math.max(0, this.effectiveTimeoutMs - elapsed);
+        this.timeoutTimer = setTimeout(() => {
+          void cancelTriggered(
+            this.manifest.command + " did not finish within " + this.effectiveTimeoutMs + "ms; terminated",
+            "timed_out",
+          );
+        }, remaining);
+        this.timeoutTimer.unref?.();
+      };
+      this.resetTimeoutFn = resetTimeoutTimer;
+
+      if (this.effectiveTimeoutMs > 0) {
+        this.timeoutTimer = setTimeout(() => {
+          void cancelTriggered(
+            this.manifest.command + " did not finish within " + this.effectiveTimeoutMs + "ms; terminated",
+            "timed_out",
+          );
+        }, this.effectiveTimeoutMs);
+        this.timeoutTimer.unref?.();
+      }
+
+      // Watch for cancel.signal and deadline.json files in spool dir
       this.cancelWatcherTimer = setInterval(() => {
-        if (existsSync(this.manifest.cancelPath)) {
+        const parentDir = path.dirname(this.spoolDir);
+        const parentCancel = path.join(parentDir, "cancel.signal");
+        if (existsSync(this.manifest.cancelPath) || existsSync(parentCancel)) {
           void cancelTriggered("agy run was cancelled by signal file", "aborted");
+          return;
+        }
+        const deadlinePath = path.join(this.spoolDir, "deadline.json");
+        const parentDeadlinePath = path.join(parentDir, "deadline.json");
+        const activeDeadlinePath = existsSync(deadlinePath)
+          ? deadlinePath
+          : existsSync(parentDeadlinePath)
+            ? parentDeadlinePath
+            : null;
+        if (activeDeadlinePath) {
+          try {
+            const raw = readFileSync(activeDeadlinePath, "utf8");
+            const data = JSON.parse(raw) as { timeoutMs?: number };
+            if (typeof data.timeoutMs === "number" && data.timeoutMs > this.effectiveTimeoutMs) {
+              resetTimeoutTimer(data.timeoutMs);
+            }
+          } catch {}
         }
       }, 200);
       this.cancelWatcherTimer.unref?.();
-
-      // Execution timeout timer
-      let timeoutTimer: NodeJS.Timeout | null = null;
-      if (this.manifest.timeoutMs > 0) {
-        timeoutTimer = setTimeout(() => {
-          void cancelTriggered(
-            this.manifest.command + " did not finish within " + this.manifest.timeoutMs + "ms; terminated",
-            "timed_out",
-          );
-        }, this.manifest.timeoutMs);
-        timeoutTimer.unref?.();
-      }
 
       child.once("error", (error) => {
         if (this.settled) return;
         this.settled = true;
         this.stopTimers();
-        if (timeoutTimer) clearTimeout(timeoutTimer);
         const errorMsg = "Unable to run " + this.manifest.command + ": " + redactSecrets(String(error));
         const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
         const stderrText = Buffer.concat(stderrChunks).toString("utf8");
@@ -165,7 +215,6 @@ export class AntigravitySupervisor {
         if (this.settled) return;
         this.settled = true;
         this.stopTimers();
-        if (timeoutTimer) clearTimeout(timeoutTimer);
         const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
         const stderrText = Buffer.concat(stderrChunks).toString("utf8");
 
@@ -210,20 +259,29 @@ export class AntigravitySupervisor {
 
   private async updateHeartbeat(agyPid: number | null): Promise<void> {
     const heartbeat: AntigravityHeartbeat = {
+      attemptId: this.manifest.attemptId,
       nonce: this.nonce,
       supervisorPid: process.pid,
       agyPid,
       updatedAt: Date.now(),
       timestamp: new Date().toISOString(),
+      fence: this.manifest.fence ?? null,
     };
     await writePrivateFile(this.manifest.heartbeatPath, JSON.stringify(heartbeat, null, 2) + "\n").catch(() => undefined);
+    if (this.onHeartbeat) {
+      try {
+        await this.onHeartbeat(heartbeat);
+      } catch {}
+    }
   }
 
   private stopTimers(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.cancelWatcherTimer) clearInterval(this.cancelWatcherTimer);
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
     this.heartbeatTimer = null;
     this.cancelWatcherTimer = null;
+    this.timeoutTimer = null;
   }
 
   private async finalizeTerminalStatus(

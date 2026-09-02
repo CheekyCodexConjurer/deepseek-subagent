@@ -39,6 +39,14 @@ export class UnavailableCodexDeliveryAdapter implements CodexDeliveryAdapter {
   }
 }
 
+export const CANONICAL_SERVER_NAMES = ["subagents", "subagents-mcp"] as const;
+export const TRANSITION_SERVER_NAMES = ["deepseek-subagent", "deepseek_subagent"] as const;
+export const ACCEPTED_SERVER_NAMES = new Set<string>([...CANONICAL_SERVER_NAMES, ...TRANSITION_SERVER_NAMES]);
+
+export const CANONICAL_SPAWN_TOOLS = ["subagents_spawn", "subagents_continue"] as const;
+export const TRANSITION_SPAWN_TOOLS = ["deepseek_spawn", "deepseek_continue"] as const;
+export const ACCEPTED_SPAWN_TOOLS = new Set<string>([...CANONICAL_SPAWN_TOOLS, ...TRANSITION_SPAWN_TOOLS]);
+
 export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
   readonly available = true;
   readonly reason = null;
@@ -121,8 +129,9 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     if (item.type !== "mcpToolCall") return;
     if (item.status !== "completed") return;
     const tool = typeof item.tool === "string" ? item.tool : "";
-    if (!["deepseek_spawn", "deepseek_continue"].includes(tool)) return;
-    if (item.server !== "deepseek-subagent") return;
+    if (!ACCEPTED_SPAWN_TOOLS.has(tool)) return;
+    const server = typeof item.server === "string" ? item.server : "";
+    if (!ACCEPTED_SERVER_NAMES.has(server)) return;
     const result = asRecord(item.result);
     const structuredContent = asRecord(result.structuredContent);
     if (structuredContent.accepted !== true || structuredContent.status !== "accepted") return;
