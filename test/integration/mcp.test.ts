@@ -1420,3 +1420,148 @@ test("MCP bootstrap fails immediately when daemon is degraded", async () => {
   );
   assert.equal(starts, 0, "must not attempt to restart a degraded daemon");
 });
+
+test("MCP subagents_follow and deepseek_follow expose receipt, earlyExit, escalation, semanticProgress in outputSchema and compact summary", async () => {
+  const mockReceipt = {
+    jobId: "job_sub_1",
+    agentId: "agent_sub_1",
+    provider: "antigravity",
+    model: "gemini-3.8-flash-high",
+    status: "completed",
+    workspace: "C:\\work",
+    startedAt: "2026-09-02T10:00:00.000Z",
+    completedAt: "2026-09-02T10:00:00.150Z",
+    durationMs: 150,
+    attempt: "attempt_1",
+    fence: 1,
+    outputHash: "hash123",
+    quiescent: true,
+    earlyExit: true,
+    filesCount: 3,
+    testsCount: 2,
+  };
+  const mockEarlyExit = {
+    triggered: true,
+    reason: "goal_reached_early",
+    confidence: "high",
+    evidenceSnippet: "all tests passed",
+    signaledAt: "2026-09-02T10:00:00.150Z",
+  };
+  const mockEscalation = {
+    reason: "complexity exceeded",
+    recommendedRoute: "pro-max",
+    targetRole: "Senior Architect",
+    advisoryOnly: true,
+  };
+  const mockSemanticProgress = {
+    stage: "verification",
+    percent: 90,
+    summary: "Verifying tests",
+  };
+
+  const bridgeClient = {
+    call: async (pathname: string, body?: any) => {
+      if (pathname === "/v1/jobs/follow") {
+        if (body?.agent_id === "agent_approval") {
+          return {
+            agentId: "agent_approval",
+            jobId: "job_app_1",
+            status: "needs_approval",
+            resultAvailable: false,
+            permissionId: "perm_1",
+            message: "Need permission to edit files",
+            escalation: mockEscalation,
+            semanticProgress: mockSemanticProgress,
+          };
+        }
+        return {
+          agentId: "agent_sub_1",
+          jobId: "job_sub_1",
+          status: "completed",
+          resultAvailable: true,
+          receipt: mockReceipt,
+          earlyExit: mockEarlyExit,
+          escalation: mockEscalation,
+          semanticProgress: mockSemanticProgress,
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  try {
+    // 1. Verify tools list includes outputSchema with optional adaptive fields
+    const { tools } = await client.listTools();
+    const subFollow = tools.find((t) => t.name === "subagents_follow");
+    const dsFollow = tools.find((t) => t.name === "deepseek_follow");
+
+    assert.ok(subFollow?.outputSchema, "subagents_follow must have outputSchema");
+    assert.ok(dsFollow?.outputSchema, "deepseek_follow must have outputSchema");
+
+    const subProperties = (subFollow.outputSchema as any).properties;
+    assert.ok(subProperties.receipt, "subagents_follow outputSchema must have receipt");
+    assert.ok(subProperties.earlyExit, "subagents_follow outputSchema must have earlyExit");
+    assert.ok(subProperties.escalation, "subagents_follow outputSchema must have escalation");
+    assert.ok(subProperties.semanticProgress, "subagents_follow outputSchema must have semanticProgress");
+
+    const dsProperties = (dsFollow.outputSchema as any).properties;
+    assert.ok(dsProperties.receipt, "deepseek_follow outputSchema must have receipt");
+    assert.ok(dsProperties.earlyExit, "deepseek_follow outputSchema must have earlyExit");
+    assert.ok(dsProperties.escalation, "deepseek_follow outputSchema must have escalation");
+    assert.ok(dsProperties.semanticProgress, "deepseek_follow outputSchema must have semanticProgress");
+
+    // 2. subagents_follow terminal result includes compact summary and structured fields
+    const subRes = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(subRes.isError, undefined);
+    const subText = (subRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+
+    assert.match(subText, /SubAgents MCP follow returned a terminal result/);
+    assert.match(subText, /\[receipt: completed \(150ms\) \| earlyExit: goal_reached_early \| escalation: complexity exceeded -> pro-max \| stage: verification\]/);
+
+    const subStruct = subRes.structuredContent as Record<string, unknown>;
+    assert.equal(subStruct.obligationState, "closed");
+    assert.deepEqual(subStruct.receipt, mockReceipt);
+    assert.deepEqual(subStruct.earlyExit, mockEarlyExit);
+    assert.deepEqual(subStruct.escalation, mockEscalation);
+    assert.deepEqual(subStruct.semanticProgress, mockSemanticProgress);
+
+    // 3. deepseek_follow (alias) includes compact summary and preserves legacy naming
+    const dsRes = await client.callTool({ name: "deepseek_follow", arguments: { agent_id: "agent_sub_1" } });
+    assert.equal(dsRes.isError, undefined);
+    const dsText = (dsRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+
+    assert.match(dsText, /DeepSeek Sub-Agent follow returned a terminal result/);
+    assert.match(dsText, /DeepSeek agent itself remains open and continuable\. Close it with deepseek_close after reviewing the result\./);
+    assert.match(dsText, /\[receipt: completed \(150ms\) \| earlyExit: goal_reached_early \| escalation: complexity exceeded -> pro-max \| stage: verification\]/);
+
+    const dsStruct = dsRes.structuredContent as Record<string, unknown>;
+    assert.equal(dsStruct.obligationState, "closed");
+    assert.deepEqual(dsStruct.receipt, mockReceipt);
+    assert.deepEqual(dsStruct.earlyExit, mockEarlyExit);
+    assert.deepEqual(dsStruct.escalation, mockEscalation);
+    assert.deepEqual(dsStruct.semanticProgress, mockSemanticProgress);
+
+    // 4. needs_approval follow includes compact summary without breaking nextRequiredAction
+    const appRes = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_approval" } });
+    const appText = (appRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+
+    assert.match(appText, /SubAgents MCP follow requires explicit approval before continuing/);
+    assert.match(appText, /subagents_continue/);
+    assert.match(appText, /\[escalation: complexity exceeded -> pro-max \| stage: verification\]/);
+
+    const appStruct = appRes.structuredContent as Record<string, unknown>;
+    assert.equal(appStruct.obligationState, "pending");
+    assert.equal(appStruct.nextRequiredAction, "subagents_continue");
+    assert.deepEqual(appStruct.escalation, mockEscalation);
+    assert.deepEqual(appStruct.semanticProgress, mockSemanticProgress);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});

@@ -8,8 +8,10 @@ const SECRET_PATTERNS = [
   /(authorization\s*:\s*bearer\s+)[^\s]+/gi,
   /(authorization\s*:\s*basic\s+)[^\s]+/gi,
   /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi,
-  /((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;]+/gi,
+  /((?:api[_-]?key|token|password|secret)["']?\s*[=:]\s*["']?)[^\s,"';]+/gi,
   /(-----BEGIN [^-]+-----)[\s\S]*?(-----END [^-]+-----)/gi,
+  /(sk-)[a-zA-Z0-9_-]{16,}/gi,
+  /(ghp_)[a-zA-Z0-9]{30,}/gi,
 ];
 
 export function redactSecrets(value: string): string {

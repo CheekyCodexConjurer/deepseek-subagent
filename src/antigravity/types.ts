@@ -1,3 +1,5 @@
+import type { EarlyExitSignal, EscalationProposal, EvidenceBundle } from "../types.js";
+
 export type AntigravityResultStatus = "completed" | "completed_partial" | "timed_out" | "failed" | "aborted";
 
 /**
@@ -18,6 +20,9 @@ export interface AntigravityRunResult {
   modelDisplayName: string;
   workspace: string;
   rawOutput: string;
+  evidence?: EvidenceBundle;
+  earlyExit?: EarlyExitSignal;
+  escalation?: EscalationProposal;
 }
 
 export type AntigravityProcessErrorKind = "spawn" | "timeout" | "aborted" | "exit" | "invalid_output";

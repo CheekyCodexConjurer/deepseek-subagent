@@ -402,6 +402,51 @@ export function createMcpServer(
     }
   });
 
+  const receiptOutputSchema = z.object({
+    jobId: z.string(),
+    agentId: z.string(),
+    provider: z.string(),
+    model: z.string(),
+    status: z.string(),
+    workspace: z.string(),
+    startedAt: z.string().nullable(),
+    completedAt: z.string(),
+    durationMs: z.number().nullable(),
+    attempt: z.string().nullable(),
+    fence: z.number().nullable(),
+    outputHash: z.string(),
+    quiescent: z.boolean(),
+    earlyExit: z.boolean(),
+    filesCount: z.number(),
+    testsCount: z.number(),
+  }).optional();
+
+  const earlyExitOutputSchema = z.object({
+    triggered: z.boolean(),
+    reason: z.string(),
+    confidence: z.union([z.string(), z.number()]).optional(),
+    evidenceSnippet: z.string().optional(),
+    signaledAt: z.string().optional(),
+  }).optional();
+
+  const escalationOutputSchema = z.object({
+    targetRole: z.string().optional(),
+    recommendedRoute: z.string().optional(),
+    reason: z.string(),
+    advisoryOnly: z.boolean(),
+    suggestedAction: z.string().optional(),
+  }).optional();
+
+  const semanticProgressOutputSchema = z.object({
+    stage: z.string(),
+    percent: z.number().nullable().optional(),
+    summary: z.string(),
+    milestones: z.array(z.string()).optional(),
+    lastActiveAt: z.string().nullable().optional(),
+    isStalled: z.boolean().optional(),
+    earlyExitTriggered: z.boolean().optional(),
+  }).optional();
+
   server.registerTool("subagents_follow", {
     title: DISPLAY_NAME + " · Follow",
     description: "Wait for a job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. Returning a usable terminal result consumes the job obligation explicitly and persistently; a needs_approval follow keeps the obligation pending and requires subagents_continue with permission_id and permission_reply. A terminal follow result closes the job obligation only: the agent stays open and continuable until you close it with subagents_close after reviewing — closing the agent is separate from consuming the obligation. Completed, failed and timed-out agents remain continuable with subagents_continue. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period.",
@@ -416,6 +461,10 @@ export function createMcpServer(
       message: z.string().optional(),
       obligationState: z.union([z.literal("pending"), z.literal("closed")]),
       nextRequiredAction: z.literal("subagents_continue").optional(),
+      receipt: receiptOutputSchema,
+      earlyExit: earlyExitOutputSchema,
+      escalation: escalationOutputSchema,
+      semanticProgress: semanticProgressOutputSchema,
     },
   }, async (args) => {
     try {
@@ -575,6 +624,10 @@ export function createMcpServer(
       message: z.string().optional(),
       obligationState: z.union([z.literal("pending"), z.literal("closed")]),
       nextRequiredAction: z.literal("deepseek_continue").optional(),
+      receipt: receiptOutputSchema,
+      earlyExit: earlyExitOutputSchema,
+      escalation: escalationOutputSchema,
+      semanticProgress: semanticProgressOutputSchema,
     },
   }, async (args) => {
     try {
@@ -715,14 +768,41 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
   const closeTool = isAlias ? "deepseek_close" : "subagents_close";
   const displayName = isAlias ? LEGACY_DISPLAY_NAME : DISPLAY_NAME;
 
+  const receipt = result.receipt as Record<string, unknown> | undefined;
+  const earlyExit = result.earlyExit as Record<string, unknown> | undefined;
+  const escalation = result.escalation as Record<string, unknown> | undefined;
+  const semanticProgress = (result.semanticProgress ?? (result.progress as Record<string, unknown> | undefined)?.semanticProgress) as Record<string, unknown> | undefined;
+
+  const compactParts: string[] = [];
+  if (receipt) {
+    const duration = receipt.durationMs !== null && receipt.durationMs !== undefined ? `${receipt.durationMs}ms` : "n/a";
+    compactParts.push(`receipt: ${receipt.status} (${duration})`);
+  }
+  if (earlyExit?.triggered) {
+    compactParts.push(`earlyExit: ${earlyExit.reason || "triggered"}`);
+  }
+  if (escalation) {
+    const route = escalation.recommendedRoute ? ` -> ${escalation.recommendedRoute}` : "";
+    compactParts.push(`escalation: ${escalation.reason}${route}`);
+  }
+  if (semanticProgress) {
+    compactParts.push(`stage: ${semanticProgress.stage}`);
+  }
+
+  const compactSuffix = compactParts.length > 0 ? " [" + compactParts.join(" | ") + "]" : "";
+
   if (result.status === "needs_approval") {
     return {
       content: [{
         type: "text",
-        text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.`,
+        text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.${compactSuffix}`,
       }],
       structuredContent: {
         ...result,
+        ...(receipt ? { receipt } : {}),
+        ...(earlyExit ? { earlyExit } : {}),
+        ...(escalation ? { escalation } : {}),
+        ...(semanticProgress ? { semanticProgress } : {}),
         obligationState: "pending",
         nextRequiredAction,
       },
@@ -731,9 +811,16 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
   return {
     content: [{
       type: "text",
-      text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.`,
+      text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.${compactSuffix}`,
     }],
-    structuredContent: { ...result, obligationState: "closed" },
+    structuredContent: {
+      ...result,
+      ...(receipt ? { receipt } : {}),
+      ...(earlyExit ? { earlyExit } : {}),
+      ...(escalation ? { escalation } : {}),
+      ...(semanticProgress ? { semanticProgress } : {}),
+      obligationState: "closed",
+    },
   };
 }
 

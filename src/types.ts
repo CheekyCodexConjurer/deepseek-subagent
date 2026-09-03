@@ -183,6 +183,9 @@ export interface JobRecord {
   fence?: number | null;
   workerPid?: number | null;
   heartbeatAt?: string | null;
+  earlyExitAt?: string | null;
+  earlyExitReason?: string | null;
+  escalationProposal?: string | null;
 }
 
 
@@ -224,6 +227,71 @@ export interface AuthoritativeLivenessStatus {
   isLive: boolean;
 }
 
+export interface EvidenceItem {
+  id?: string;
+  type?: string;
+  claim?: string;
+  source?: string;
+  snippet?: string;
+  confidence?: string | number;
+  verified?: boolean;
+  data?: unknown;
+}
+
+export interface EvidenceBundle {
+  items: EvidenceItem[];
+  summary?: string;
+  contradictions?: string[];
+  claimsCount?: number;
+  collectedAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ExecutionReceipt {
+  jobId: string;
+  agentId: string;
+  provider: string;
+  model: string;
+  status: ResultEnvelope["status"];
+  workspace: string;
+  startedAt: string | null;
+  completedAt: string;
+  durationMs: number | null;
+  attempt: string | null;
+  fence: number | null;
+  outputHash: string;
+  quiescent: boolean;
+  earlyExit: boolean;
+  filesCount: number;
+  testsCount: number;
+}
+
+export interface SemanticProgress {
+  stage: "analyzing" | "modifying" | "testing" | "executing" | "awaiting_approval" | "finalizing" | "completed" | "stalled";
+  percent?: number | null;
+  summary: string;
+  milestones?: string[];
+  lastActiveAt?: string | null;
+  isStalled?: boolean;
+  earlyExitTriggered?: boolean;
+}
+
+export interface EarlyExitSignal {
+  triggered: boolean;
+  reason: string;
+  confidence?: string | number;
+  evidenceSnippet?: string;
+  signaledAt?: string;
+}
+
+export interface EscalationProposal {
+  targetRole?: string;
+  recommendedRoute?: string;
+  reason: string;
+  advisoryOnly: true;
+  suggestedAction?: string;
+}
+
 export interface ProgressSnapshot {
   agentId: string;
   jobId: string | null;
@@ -245,6 +313,9 @@ export interface ProgressSnapshot {
   sessionId?: string | null;
   resultPersisted?: boolean;
   authoritativeStatus?: AuthoritativeLivenessStatus;
+  semanticProgress?: SemanticProgress;
+  earlyExit?: EarlyExitSignal;
+  escalation?: EscalationProposal;
 }
 
 export interface FollowResult {
@@ -261,6 +332,10 @@ export interface FollowResult {
   error?: string;
   permissionId?: string | null;
   message?: string;
+  receipt?: ExecutionReceipt;
+  earlyExit?: EarlyExitSignal;
+  escalation?: EscalationProposal;
+  semanticProgress?: SemanticProgress;
 }
 
 export interface CodexBinding {
@@ -364,6 +439,10 @@ export interface ResultEnvelope {
     reason: string;
     status: string;
   };
+  receipt?: ExecutionReceipt;
+  evidence?: EvidenceBundle;
+  earlyExit?: EarlyExitSignal;
+  escalation?: EscalationProposal;
 }
 
 export interface BridgeConfig {

@@ -28,11 +28,14 @@ import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedE
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
   ActiveRouteSource,
+  AgentActivity,
   AgentRecord,
   AuthoritativeLivenessStatus,
   BridgeConfig,
   ConsultInput,
   ContinueInput,
+  EarlyExitSignal,
+  EscalationProposal,
   FollowInput,
   FollowResult,
   JobRecord,
@@ -45,6 +48,7 @@ import type {
   ResolvedRoute,
   ResultEnvelope,
   RouteStatusInfo,
+  SemanticProgress,
   SpawnInput,
 } from "./types.js";
 
@@ -1556,6 +1560,10 @@ export class BridgeService {
     if (["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) && resultAvailable) {
       this.store.consumeResult(job.id);
     }
+    const receipt = envelope?.receipt;
+    const earlyExit = envelope?.earlyExit ?? progress.earlyExit;
+    const escalation = envelope?.escalation ?? progress.escalation;
+    const semanticProgress = progress.semanticProgress;
     return {
       agentId: agent.id,
       jobId: job.id,
@@ -1570,6 +1578,10 @@ export class BridgeService {
       ...(failure ? { error: failure } : {}),
       ...(status === "needs_approval" ? { permissionId: overrides.permissionId ?? job.permissionId } : {}),
       ...(overrides.message ? { message: overrides.message } : {}),
+      ...(receipt ? { receipt } : {}),
+      ...(earlyExit ? { earlyExit } : {}),
+      ...(escalation ? { escalation } : {}),
+      ...(semanticProgress ? { semanticProgress } : {}),
     };
   }
 
@@ -1677,13 +1689,39 @@ export class BridgeService {
       isLive,
     };
 
+    const earlyExit = envelope?.earlyExit ?? (job?.earlyExitAt && job?.earlyExitReason ? {
+      triggered: true,
+      reason: job.earlyExitReason,
+      signaledAt: job.earlyExitAt,
+    } : undefined);
+
+    const escalation = envelope?.escalation ?? (job?.escalationProposal ? (() => {
+      try {
+        return JSON.parse(job.escalationProposal) as EscalationProposal;
+      } catch {
+        return { reason: job.escalationProposal, advisoryOnly: true as const };
+      }
+    })() : undefined);
+
+    const lastActivityAgoSeconds = latest ? Math.max(0, Math.floor((Date.now() - (parseTimestamp(latest.createdAt) ?? Date.now())) / 1_000)) : null;
+
+    const semanticProgress = deriveSemanticProgress(
+      activities,
+      job,
+      isLive,
+      heartbeatAt,
+      heartbeatAgoSeconds,
+      lastActivityAgoSeconds,
+      earlyExit,
+    );
+
     return {
       agentId: agent.id,
       jobId: job?.id ?? null,
       topic: agent.topic,
       status: job?.status ?? agent.status,
       elapsedSeconds: Math.max(0, Math.floor((end - start) / 1_000)),
-      lastActivityAgoSeconds: latest ? Math.max(0, Math.floor((Date.now() - (parseTimestamp(latest.createdAt) ?? Date.now())) / 1_000)) : null,
+      lastActivityAgoSeconds,
       currentActivity: latest?.summary ?? "No observable activity recorded.",
       recentActivity: activities.map((activity): ProgressActivity => ({
         type: activity.activityType,
@@ -1702,6 +1740,9 @@ export class BridgeService {
       sessionId,
       resultPersisted,
       authoritativeStatus,
+      semanticProgress,
+      ...(earlyExit ? { earlyExit } : {}),
+      ...(escalation ? { escalation } : {}),
     };
   }
 
@@ -1858,8 +1899,8 @@ export class BridgeService {
     contextFiles?: string[],
   ): Promise<void> {
     const spool = new AntigravitySpool(this.config.dataDir);
+    const capturedFence = manifest.fence ?? job.fence ?? 1;
     try {
-      const capturedFence = manifest.fence ?? job.fence ?? 1;
       const onHeartbeat = (hb: AntigravityHeartbeat) => {
         try {
           this.store.updateJobLiveness(job.id, {
@@ -1893,26 +1934,43 @@ export class BridgeService {
         return;
       }
       const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
-      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-      const completed = this.store.getJob(job.id) ?? job;
-      if (["running", "following", "finalizing"].includes(completed.status)) {
-        this.store.updateJobStatus(job.id, "completed");
+      try {
+        this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
+        if (stored.envelope.earlyExit?.triggered) {
+          this.store.setJobEarlyExit(job.id, {
+            earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
+            reason: stored.envelope.earlyExit.reason,
+          }, capturedFence);
+        }
+        if (stored.envelope.escalation) {
+          this.store.setJobEscalation(job.id, JSON.stringify(stored.envelope.escalation), capturedFence);
+        }
+        const completed = this.store.getJob(job.id) ?? job;
+        if (["running", "following", "finalizing"].includes(completed.status)) {
+          this.store.updateJobStatus(job.id, "completed", null, capturedFence);
+        }
+        const completedAgent = this.store.getAgent(agent.id) ?? agent;
+        if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
+        this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, {
+            status: "completed",
+            resultAvailable: true,
+            envelope: stored.envelope,
+          });
+        }
+        const pending = this.store.getJob(job.id) ?? job;
+        if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending", null, capturedFence);
+        const deliveryJob = this.store.getJob(job.id) ?? job;
+        await this.deliverEnvelope(stored.envelope, deliveryJob);
+        await spool.cleanupPrompt(manifest.attemptId, job.id);
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt completion rejected by fence check: " + err.message);
+          return;
+        }
+        throw err;
       }
-      const completedAgent = this.store.getAgent(agent.id) ?? agent;
-      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
-      this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, {
-          status: "completed",
-          resultAvailable: true,
-          envelope: stored.envelope,
-        });
-      }
-      const pending = this.store.getJob(job.id) ?? job;
-      if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
-      const deliveryJob = this.store.getJob(job.id) ?? job;
-      await this.deliverEnvelope(stored.envelope, deliveryJob);
-      await spool.cleanupPrompt(manifest.attemptId, job.id);
     } catch (error) {
       const message = redactSecrets(String(error));
       const current = this.store.getJob(job.id);
@@ -1929,7 +1987,17 @@ export class BridgeService {
         await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
         return;
       }
-      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      if (current && current.status !== "failed") {
+        try {
+          this.store.updateJobStatus(job.id, "failed", message, capturedFence);
+        } catch (err) {
+          if (err instanceof ConflictError) {
+            this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt failure rejected by fence check: " + err.message);
+            return;
+          }
+          throw err;
+        }
+      }
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
       this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
@@ -1956,6 +2024,7 @@ export class BridgeService {
     contextFiles?: string[],
     fence?: number,
   ): Promise<void> {
+    const capturedFence = fence ?? job.fence ?? 1;
     try {
       const adapterTimeout = (this.antigravity as any)?.timeoutMs;
       const effectiveTimeoutMs = timeoutMs ?? (
@@ -1963,7 +2032,6 @@ export class BridgeService {
           ? adapterTimeout
           : this.effectiveWorkerTimeoutMs()
       );
-      const capturedFence = fence ?? job.fence ?? 1;
       const onHeartbeat = (hb: AntigravityHeartbeat) => {
         try {
           this.store.updateJobLiveness(job.id, {
@@ -1997,29 +2065,46 @@ export class BridgeService {
         return;
       }
       const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
-      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-      const completed = this.store.getJob(job.id) ?? job;
-      if (["running", "following", "finalizing"].includes(completed.status)) {
-        this.store.updateJobStatus(job.id, "completed");
-      }
-      const completedAgent = this.store.getAgent(agent.id) ?? agent;
-      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
-      this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, {
-          status: "completed",
-          resultAvailable: true,
-          envelope: stored.envelope,
-        });
-      }
-      const pending = this.store.getJob(job.id) ?? job;
-      if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
-      const deliveryJob = this.store.getJob(job.id) ?? job;
-      await this.deliverEnvelope(stored.envelope, deliveryJob);
-      const spool = new AntigravitySpool(this.config.dataDir);
-      const attempts = await spool.listAttempts(job.id);
-      if (attempts.length > 0) {
-        await spool.cleanupPrompt(attempts[attempts.length - 1]!.attemptId, job.id);
+      try {
+        this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
+        if (stored.envelope.earlyExit?.triggered) {
+          this.store.setJobEarlyExit(job.id, {
+            earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
+            reason: stored.envelope.earlyExit.reason,
+          }, capturedFence);
+        }
+        if (stored.envelope.escalation) {
+          this.store.setJobEscalation(job.id, JSON.stringify(stored.envelope.escalation), capturedFence);
+        }
+        const completed = this.store.getJob(job.id) ?? job;
+        if (["running", "following", "finalizing"].includes(completed.status)) {
+          this.store.updateJobStatus(job.id, "completed", null, capturedFence);
+        }
+        const completedAgent = this.store.getAgent(agent.id) ?? agent;
+        if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
+        this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, {
+            status: "completed",
+            resultAvailable: true,
+            envelope: stored.envelope,
+          });
+        }
+        const pending = this.store.getJob(job.id) ?? job;
+        if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending", null, capturedFence);
+        const deliveryJob = this.store.getJob(job.id) ?? job;
+        await this.deliverEnvelope(stored.envelope, deliveryJob);
+        const spool = new AntigravitySpool(this.config.dataDir);
+        const attempts = await spool.listAttempts(job.id);
+        if (attempts.length > 0) {
+          await spool.cleanupPrompt(attempts[attempts.length - 1]!.attemptId, job.id);
+        }
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt completion rejected by fence check: " + err.message);
+          return;
+        }
+        throw err;
       }
     } catch (error) {
       const message = redactSecrets(String(error));
@@ -2043,7 +2128,17 @@ export class BridgeService {
         await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
         return;
       }
-      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
+      if (current && current.status !== "failed") {
+        try {
+          this.store.updateJobStatus(job.id, "failed", message, capturedFence);
+        } catch (err) {
+          if (err instanceof ConflictError) {
+            this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt failure rejected by fence check: " + err.message);
+            return;
+          }
+          throw err;
+        }
+      }
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
       this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
@@ -2381,28 +2476,46 @@ export class BridgeService {
       } : {}),
     });
 
-    this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
-    this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-    const completedJob = this.store.getJob(job.id) ?? job;
-    if (["running", "following", "finalizing"].includes(completedJob.status)) {
-      this.store.updateJobStatus(job.id, partial ? "completed_partial" : "completed");
+    const capturedFence = currentJob.fence ?? job.fence ?? 1;
+    try {
+      this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
+      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
+      if (stored.envelope.earlyExit?.triggered) {
+        this.store.setJobEarlyExit(job.id, {
+          earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
+          reason: stored.envelope.earlyExit.reason,
+        }, capturedFence);
+      }
+      if (stored.envelope.escalation) {
+        this.store.setJobEscalation(job.id, JSON.stringify(stored.envelope.escalation), capturedFence);
+      }
+      const completedJob = this.store.getJob(job.id) ?? job;
+      if (["running", "following", "finalizing"].includes(completedJob.status)) {
+        this.store.updateJobStatus(job.id, partial ? "completed_partial" : "completed", null, capturedFence);
+      }
+      const completedAgent = this.store.getAgent(agent.id) ?? agent;
+      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
+      this.recordActivity(agent, this.store.getJob(job.id), "result", partial ? "Graceful finalization produced a partial result" : "OpenCode session became idle and the result was persisted");
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, {
+          status: partial ? "completed_partial" : "completed",
+          deadlineReached: partial,
+          gracefulFinalize: partial,
+          partial,
+          resultAvailable: true,
+          envelope: stored.envelope,
+        });
+      }
+      const deliveryJob = this.store.getJob(job.id) ?? job;
+      if (["completed", "completed_partial"].includes(deliveryJob.status)) this.store.updateJobStatus(job.id, "delivery_pending", null, capturedFence);
+      await this.deliverEnvelope(stored.envelope, this.store.getJob(job.id) ?? job);
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale session completion rejected by fence check: " + err.message);
+        return;
+      }
+      throw err;
     }
-    const completedAgent = this.store.getAgent(agent.id) ?? agent;
-    if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
-    this.recordActivity(agent, this.store.getJob(job.id), "result", partial ? "Graceful finalization produced a partial result" : "OpenCode session became idle and the result was persisted");
-    if (this.followLifecycles.has(job.id)) {
-      await this.resolveFollow(job.id, {
-        status: partial ? "completed_partial" : "completed",
-        deadlineReached: partial,
-        gracefulFinalize: partial,
-        partial,
-        resultAvailable: true,
-        envelope: stored.envelope,
-      });
-    }
-    const deliveryJob = this.store.getJob(job.id) ?? job;
-    if (["completed", "completed_partial"].includes(deliveryJob.status)) this.store.updateJobStatus(job.id, "delivery_pending");
-    await this.deliverEnvelope(stored.envelope, this.store.getJob(job.id) ?? job);
   }
 
   private async deliverPersistedJob(job: JobRecord): Promise<void> {
@@ -2865,18 +2978,27 @@ export class BridgeService {
           rawOutput: terminalStatus.stdout,
         };
         const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
-        this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-        this.store.updateJobStatus(job.id, terminalStatus.status);
-        const currentAgent = this.store.getAgent(agent.id) ?? agent;
-        if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, terminalStatus.status);
-        this.recordActivity(agent, this.store.getJob(job.id), "result", "Recovered completed Antigravity result from durable spool");
-        this.store.updateJobStatus(job.id, "delivery_pending");
-        const deliveryJob = this.store.getJob(job.id) ?? job;
-        await this.deliverEnvelope(stored.envelope, deliveryJob).catch((error) => {
-          this.lastStreamError = redactSecrets(String(error));
-        });
-        await spool.cleanupPrompt(latestAttempt.attemptId, job.id);
-        return;
+        const attemptFence = latestAttempt.fence ?? job.fence ?? 1;
+        try {
+          this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, attemptFence);
+          this.store.updateJobStatus(job.id, terminalStatus.status, null, attemptFence);
+          const currentAgent = this.store.getAgent(agent.id) ?? agent;
+          if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, terminalStatus.status);
+          this.recordActivity(agent, this.store.getJob(job.id), "result", "Recovered completed Antigravity result from durable spool");
+          this.store.updateJobStatus(job.id, "delivery_pending", null, attemptFence);
+          const deliveryJob = this.store.getJob(job.id) ?? job;
+          await this.deliverEnvelope(stored.envelope, deliveryJob).catch((error) => {
+            this.lastStreamError = redactSecrets(String(error));
+          });
+          await spool.cleanupPrompt(latestAttempt.attemptId, job.id);
+          return;
+        } catch (err) {
+          if (err instanceof ConflictError) {
+            this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale recovery rejected by fence check: " + err.message);
+            return;
+          }
+          throw err;
+        }
       } else {
         const reason = terminalStatus.error || ("Antigravity run ended with status " + terminalStatus.status);
         const finalStatus = terminalStatus.status === "aborted" ? "aborted" : terminalStatus.status === "timed_out" ? "timed_out" : "failed";
@@ -3078,27 +3200,36 @@ export class BridgeService {
               rawOutput: status.stdout,
             };
             const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
-            this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-            const current = this.store.getJob(job.id) ?? job;
-            if (["running", "following", "finalizing"].includes(current.status)) {
-              this.store.updateJobStatus(job.id, status.status);
+            const attemptFence = manifest.fence ?? job.fence ?? 1;
+            try {
+              this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, attemptFence);
+              const current = this.store.getJob(job.id) ?? job;
+              if (["running", "following", "finalizing"].includes(current.status)) {
+                this.store.updateJobStatus(job.id, status.status, null, attemptFence);
+              }
+              const currentAgent = this.store.getAgent(agent.id) ?? agent;
+              if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, status.status);
+              this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and result was persisted");
+              if (this.followLifecycles.has(job.id)) {
+                await this.resolveFollow(job.id, {
+                  status: status.status,
+                  resultAvailable: true,
+                  envelope: stored.envelope,
+                });
+              }
+              const pending = this.store.getJob(job.id) ?? job;
+              if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending", null, attemptFence);
+              const deliveryJob = this.store.getJob(job.id) ?? job;
+              await this.deliverEnvelope(stored.envelope, deliveryJob);
+              await spool.cleanupPrompt(manifest.attemptId, job.id);
+              return;
+            } catch (err) {
+              if (err instanceof ConflictError) {
+                this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale recovery rejected by fence check: " + err.message);
+                return;
+              }
+              throw err;
             }
-            const currentAgent = this.store.getAgent(agent.id) ?? agent;
-            if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, status.status);
-            this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and result was persisted");
-            if (this.followLifecycles.has(job.id)) {
-              await this.resolveFollow(job.id, {
-                status: status.status,
-                resultAvailable: true,
-                envelope: stored.envelope,
-              });
-            }
-            const pending = this.store.getJob(job.id) ?? job;
-            if (["completed", "completed_partial"].includes(pending.status)) this.store.updateJobStatus(job.id, "delivery_pending");
-            const deliveryJob = this.store.getJob(job.id) ?? job;
-            await this.deliverEnvelope(stored.envelope, deliveryJob);
-            await spool.cleanupPrompt(manifest.attemptId, job.id);
-            return;
           } else {
             const reason = status.error || ("Antigravity run ended with status " + status.status);
             const finalStatus = status.status === "aborted" ? "aborted" : status.status === "timed_out" ? "timed_out" : "failed";
@@ -3308,6 +3439,60 @@ function observableEventSummary(event: OpenCodeEvent): string {
   if (event.type.includes("error")) return "OpenCode emitted an error event";
   if (event.type === "session.idle") return "OpenCode emitted session.idle";
   return "OpenCode emitted observable event " + truncate(event.type, 120);
+}
+
+function deriveSemanticProgress(
+  activities: AgentActivity[],
+  job: JobRecord | null,
+  isLive: boolean,
+  heartbeatAt: string | null,
+  heartbeatAgoSeconds: number | null,
+  lastActivityAgoSeconds: number | null,
+  earlyExitSignal?: EarlyExitSignal,
+): SemanticProgress {
+  const latest = activities[0];
+  let stage: SemanticProgress["stage"] = "executing";
+
+  if (job?.status === "completed" || job?.status === "completed_partial") {
+    stage = "completed";
+  } else if (job?.status === "finalizing" || job?.gracefulFinalizeAttempted) {
+    stage = "finalizing";
+  } else if (job?.status === "needs_approval") {
+    stage = "awaiting_approval";
+  } else if (latest) {
+    const sum = latest.summary.toLowerCase();
+    if (sum.includes("test") || sum.includes("pytest") || sum.includes("vitest")) {
+      stage = "testing";
+    } else if (sum.includes("edit") || sum.includes("patch") || sum.includes("write") || sum.includes("modify")) {
+      stage = "modifying";
+    } else if (sum.includes("read") || sum.includes("inspect") || sum.includes("analyze") || sum.includes("grep") || sum.includes("search")) {
+      stage = "analyzing";
+    } else if (sum.includes("idle") || sum.includes("complete")) {
+      stage = "completed";
+    }
+  }
+
+  // Contract: 900s is only a window/deadline, NEVER proof of death. A job is stalled only if not live and heartbeat/activity is stale.
+  const isStalled = !isLive && (heartbeatAgoSeconds !== null ? heartbeatAgoSeconds > 120 : (lastActivityAgoSeconds !== null ? lastActivityAgoSeconds > 300 : false));
+  if (isStalled && stage !== "completed" && stage !== "awaiting_approval") {
+    stage = "stalled";
+  }
+
+  const milestones = activities
+    .filter((a) => a.activityType === "result" || a.activityType === "approval" || a.summary.toLowerCase().includes("milestone") || a.summary.toLowerCase().includes("completed"))
+    .map((a) => a.summary)
+    .slice(0, 5);
+
+  const lastActiveAt = heartbeatAt ?? (latest ? latest.createdAt : null);
+
+  return {
+    stage,
+    summary: latest?.summary ?? "No observable activity recorded.",
+    ...(milestones.length > 0 ? { milestones } : {}),
+    lastActiveAt,
+    isStalled,
+    earlyExitTriggered: Boolean(earlyExitSignal?.triggered),
+  };
 }
 
 function isApprovalRequestEvent(type: string, properties: Record<string, unknown>): boolean {

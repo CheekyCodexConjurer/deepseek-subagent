@@ -1,10 +1,34 @@
+import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { writePrivateFile, redactSecrets, redactUnknown, truncate } from "./security.js";
 import type { AntigravityRunResult } from "./antigravity/types.js";
-import type { AgentRecord, JobRecord, OpenCodeMessage, ResultEnvelope } from "./types.js";
+import type {
+  AgentRecord,
+  EarlyExitSignal,
+  EscalationProposal,
+  EvidenceBundle,
+  EvidenceItem,
+  ExecutionReceipt,
+  JobRecord,
+  OpenCodeMessage,
+  ResultEnvelope,
+} from "./types.js";
 
-const PROTOCOL_HEADINGS = ["STATUS", "SUMMARY", "ASSUMPTIONS", "CHANGES", "FILES", "TESTS", "RISKS", "UNRESOLVED"];
+const PROTOCOL_HEADINGS = [
+  "STATUS",
+  "SUMMARY",
+  "ASSUMPTIONS",
+  "CHANGES",
+  "FILES",
+  "TESTS",
+  "RISKS",
+  "UNRESOLVED",
+  "EARLY_EXIT",
+  "ESCALATION_PROPOSAL",
+  "ESCALATION",
+  "EVIDENCE",
+];
 
 // A heading value runs until the next known protocol heading or the end of the
 // text. Arbitrary uppercase lines such as "NOTE:" inside a value must not
@@ -22,6 +46,9 @@ export interface ParsedSubagentResult {
   hasText: boolean;
   assistantMessageId: string | null;
   userMessageId: string | null;
+  earlyExit?: EarlyExitSignal;
+  escalation?: EscalationProposal;
+  evidence?: EvidenceBundle;
 }
 
 /**
@@ -76,6 +103,20 @@ export async function persistResult(
     reason: job.fallbackReason ?? "timeout",
     status: job.fallbackStatus ?? "succeeded",
   } : undefined);
+  const outputHash = computeOutputHash(parsed.summary, diffSummary);
+  const receipt = createExecutionReceipt({
+    job,
+    agent,
+    provider: "opencode",
+    model: agent.modelProviderId + "/" + agent.modelId + (agent.modelVariant ? " · " + agent.modelVariant : ""),
+    status: options.statusOverride ?? parsed.status,
+    workspace: agent.workspacePath,
+    earlyExit: Boolean(parsed.earlyExit?.triggered),
+    filesCount: parsed.files.length,
+    testsCount: parsed.tests.length,
+    outputHash,
+  });
+
   const envelope: ResultEnvelope = {
     version: 1,
     agentId: redactSecrets(agent.id),
@@ -98,6 +139,10 @@ export async function persistResult(
     ...(options.partial === undefined ? {} : { partial: options.partial }),
     ...(options.workerAborted === undefined ? {} : { workerAborted: options.workerAborted }),
     ...(fallback ? { fallback } : {}),
+    receipt,
+    ...(parsed.evidence ? { evidence: parsed.evidence } : {}),
+    ...(parsed.earlyExit ? { earlyExit: parsed.earlyExit } : {}),
+    ...(parsed.escalation ? { escalation: parsed.escalation } : {}),
   };
 
   await mkdir(path.dirname(resultPath), { recursive: true });
@@ -131,6 +176,19 @@ export async function persistAntigravityResult(
   maxLength: number,
 ): Promise<{ envelope: ResultEnvelope; resultPath: string }> {
   const resultPath = path.join(dataDir, "results", job.id + ".json");
+  const outputHash = computeOutputHash(result.summary, result.diffSummary);
+  const receipt = createExecutionReceipt({
+    job,
+    agent,
+    provider: "antigravity",
+    model: result.model,
+    status: result.status,
+    workspace: result.workspace,
+    earlyExit: Boolean(result.earlyExit?.triggered),
+    filesCount: result.files.length,
+    testsCount: result.tests.length,
+    outputHash,
+  });
   const envelope: ResultEnvelope = {
     version: 1,
     agentId: redactSecrets(agent.id),
@@ -148,6 +206,19 @@ export async function persistAntigravityResult(
     diffSummary: truncate(redactSecrets(result.diffSummary), 10_000),
     fullResultPath: redactSecrets(resultPath),
     orchestratorInstruction: redactSecrets("Continue this agent only with deepseek_continue after reviewing this result."),
+    receipt,
+    ...(result.evidence ? (() => {
+      const safe = projectSafeEvidence(result.evidence);
+      return safe ? { evidence: safe } : {};
+    })() : {}),
+    ...(result.earlyExit ? (() => {
+      const safe = projectSafeEarlyExit(result.earlyExit);
+      return safe ? { earlyExit: safe } : {};
+    })() : {}),
+    ...(result.escalation ? (() => {
+      const safe = projectSafeEscalation(result.escalation);
+      return safe ? { escalation: safe } : {};
+    })() : {}),
   };
   await mkdir(path.dirname(resultPath), { recursive: true });
   await writePrivateFile(
@@ -156,7 +227,7 @@ export async function persistAntigravityResult(
       envelope,
       rawAssistantText: truncate(redactSecrets(result.summary), maxLength),
       messages: [],
-      diff: { source: "antigravity", runId: result.runId === null ? null : redactSecrets(result.runId) },
+      diff: { source: "antigravity", runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200) },
       savedAt: new Date().toISOString(),
     }, null, 2) + "\n",
   );
@@ -218,7 +289,138 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
       status: truncate(redactSecrets(String(fb.status ?? "")), 100),
     };
   }
+  if (value.receipt && typeof value.receipt === "object") {
+    const r = projectSafeReceipt(value.receipt);
+    if (r) output.receipt = r;
+  }
+  if (value.evidence && typeof value.evidence === "object") {
+    const ev = projectSafeEvidence(value.evidence);
+    if (ev) output.evidence = ev;
+  }
+  if (value.earlyExit && typeof value.earlyExit === "object") {
+    const ee = projectSafeEarlyExit(value.earlyExit);
+    if (ee) output.earlyExit = ee;
+  }
+  if (value.escalation && typeof value.escalation === "object") {
+    const esc = projectSafeEscalation(value.escalation);
+    if (esc) output.escalation = esc;
+  }
   return output;
+}
+
+export function computeOutputHash(summary: string, diffSummary: string): string {
+  return createHash("sha256")
+    .update((summary || "").trim() + "\n---\n" + (diffSummary || "").trim())
+    .digest("hex");
+}
+
+export function createExecutionReceipt(input: {
+  job: JobRecord;
+  agent: AgentRecord;
+  provider: string;
+  model: string;
+  status: ResultEnvelope["status"];
+  workspace: string;
+  earlyExit?: boolean;
+  filesCount?: number;
+  testsCount?: number;
+  outputHash: string;
+  now?: string;
+}): ExecutionReceipt {
+  const completedAt = input.now ?? new Date().toISOString();
+  const startedAtMs = input.job.startedAt ? Date.parse(input.job.startedAt) : null;
+  const completedAtMs = Date.parse(completedAt);
+  const durationMs = startedAtMs !== null && !isNaN(startedAtMs) ? Math.max(0, completedAtMs - startedAtMs) : null;
+
+  return {
+    jobId: input.job.id,
+    agentId: input.agent.id,
+    provider: input.provider,
+    model: input.model,
+    status: input.status,
+    workspace: input.workspace,
+    startedAt: input.job.startedAt ?? null,
+    completedAt,
+    durationMs,
+    attempt: input.job.attempt ?? null,
+    fence: input.job.fence ?? null,
+    outputHash: input.outputHash,
+    quiescent: true,
+    earlyExit: Boolean(input.earlyExit),
+    filesCount: input.filesCount ?? 0,
+    testsCount: input.testsCount ?? 0,
+  };
+}
+
+function projectSafeReceipt(value: unknown): ExecutionReceipt | null {
+  if (!isRecord(value)) return null;
+  const requiredStrings = ["jobId", "agentId", "provider", "model", "status", "workspace", "completedAt", "outputHash"];
+  if (requiredStrings.some((key) => typeof value[key] !== "string")) return null;
+  return {
+    jobId: truncate(redactSecrets(String(value.jobId)), 100),
+    agentId: truncate(redactSecrets(String(value.agentId)), 100),
+    provider: truncate(redactSecrets(String(value.provider)), 100),
+    model: truncate(redactSecrets(String(value.model)), 200),
+    status: value.status as ResultEnvelope["status"],
+    workspace: truncate(redactSecrets(String(value.workspace)), 1_000),
+    startedAt: typeof value.startedAt === "string" ? redactSecrets(value.startedAt) : null,
+    completedAt: redactSecrets(String(value.completedAt)),
+    durationMs: typeof value.durationMs === "number" ? value.durationMs : null,
+    attempt: typeof value.attempt === "string" ? truncate(redactSecrets(value.attempt), 50) : null,
+    fence: typeof value.fence === "number" ? value.fence : null,
+    outputHash: truncate(redactSecrets(String(value.outputHash)), 100),
+    quiescent: Boolean(value.quiescent ?? true),
+    earlyExit: Boolean(value.earlyExit),
+    filesCount: typeof value.filesCount === "number" ? value.filesCount : 0,
+    testsCount: typeof value.testsCount === "number" ? value.testsCount : 0,
+  };
+}
+
+function projectSafeEarlyExit(value: unknown): EarlyExitSignal | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.triggered !== "boolean" || typeof value.reason !== "string") return null;
+  return {
+    triggered: value.triggered,
+    reason: truncate(redactSecrets(value.reason), 1_000),
+    ...(value.confidence !== undefined ? { confidence: value.confidence as any } : {}),
+    ...(typeof value.evidenceSnippet === "string" ? { evidenceSnippet: truncate(redactSecrets(value.evidenceSnippet), 2_000) } : {}),
+    ...(typeof value.signaledAt === "string" ? { signaledAt: redactSecrets(value.signaledAt) } : {}),
+  };
+}
+
+function projectSafeEscalation(value: unknown): EscalationProposal | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.reason !== "string") return null;
+  return {
+    reason: truncate(redactSecrets(value.reason), 2_000),
+    advisoryOnly: true,
+    ...(typeof value.targetRole === "string" ? { targetRole: truncate(redactSecrets(value.targetRole), 200) } : {}),
+    ...(typeof value.recommendedRoute === "string" ? { recommendedRoute: truncate(redactSecrets(value.recommendedRoute), 200) } : {}),
+    ...(typeof value.suggestedAction === "string" ? { suggestedAction: truncate(redactSecrets(value.suggestedAction), 1_000) } : {}),
+  };
+}
+
+function projectSafeEvidence(value: unknown): EvidenceBundle | null {
+  if (!isRecord(value)) return null;
+  const rawItems = Array.isArray(value.items) ? value.items : [];
+  const items: EvidenceItem[] = rawItems
+    .filter((item: unknown): item is Record<string, unknown> => isRecord(item))
+    .slice(0, 100)
+    .map((item) => ({
+      ...(typeof item.id === "string" ? { id: truncate(redactSecrets(item.id), 100) } : {}),
+      ...(typeof item.type === "string" ? { type: truncate(redactSecrets(item.type), 100) } : {}),
+      ...(typeof item.claim === "string" ? { claim: truncate(redactSecrets(item.claim), 2_000) } : {}),
+      ...(typeof item.source === "string" ? { source: truncate(redactSecrets(item.source), 1_000) } : {}),
+      ...(typeof item.snippet === "string" ? { snippet: truncate(redactSecrets(item.snippet), 2_000) } : {}),
+      ...(item.confidence !== undefined ? { confidence: item.confidence as any } : {}),
+      ...(typeof item.verified === "boolean" ? { verified: item.verified } : {}),
+    }));
+  return {
+    items,
+    ...(typeof value.summary === "string" ? { summary: truncate(redactSecrets(value.summary), 2_000) } : {}),
+    claimsCount: typeof value.claimsCount === "number" ? value.claimsCount : items.length,
+    ...(typeof value.collectedAt === "string" ? { collectedAt: redactSecrets(value.collectedAt) } : {}),
+  };
 }
 
 function projectSafeMessages(messages: unknown[]): unknown[] {
@@ -301,10 +503,131 @@ export function formatHumanResult(envelope: ResultEnvelope): string {
     lines.push("fallback: from " + envelope.fallback.from + " to " + envelope.fallback.to + " (" + envelope.fallback.reason + ")");
     lines.push("fallback_status: " + envelope.fallback.status);
   }
+  if (envelope.earlyExit?.triggered) {
+    lines.push("", "EARLY EXIT", envelope.earlyExit.reason || "Triggered");
+  }
+  if (envelope.evidence && envelope.evidence.items.length > 0) {
+    lines.push("", "EVIDENCE", ...envelope.evidence.items.slice(0, 10).map((item) => "• " + (item.claim || item.type || "evidence")));
+  }
+  if (envelope.escalation) {
+    lines.push("", "ESCALATION PROPOSAL (ADVISORY ONLY)", envelope.escalation.reason);
+    if (envelope.escalation.recommendedRoute) {
+      lines.push("recommended_route: " + envelope.escalation.recommendedRoute);
+    }
+  }
   lines.push("", "ORCHESTRATOR INSTRUCTION", envelope.orchestratorInstruction);
   return lines.join("\n");
 }
 
+
+export function parseEarlyExit(text: string): EarlyExitSignal | undefined {
+  const marker = /\[EARLY_EXIT\]([\s\S]*?)\[\/EARLY_EXIT\]/i.exec(text);
+  if (marker?.[1]) {
+    try {
+      const parsed = JSON.parse(marker[1].trim());
+      if (parsed && typeof parsed === "object") {
+        return {
+          triggered: Boolean(parsed.triggered ?? true),
+          reason: truncate(redactSecrets(String(parsed.reason ?? "Early exit triggered")), 1_000),
+          ...(parsed.confidence !== undefined ? { confidence: parsed.confidence } : {}),
+          ...(typeof parsed.evidenceSnippet === "string" ? { evidenceSnippet: truncate(redactSecrets(parsed.evidenceSnippet), 2_000) } : {}),
+          signaledAt: typeof parsed.signaledAt === "string" ? parsed.signaledAt : new Date().toISOString(),
+        };
+      }
+    } catch {}
+  }
+  const val = headingValue(text, "EARLY_EXIT");
+  if (val && !/^(?:none|false|no)$/i.test(val.trim())) {
+    return {
+      triggered: true,
+      reason: truncate(redactSecrets(val.trim()), 1_000),
+      signaledAt: new Date().toISOString(),
+    };
+  }
+  return undefined;
+}
+
+export function parseEscalation(text: string): EscalationProposal | undefined {
+  const marker = /\[ESCALATION(?:_PROPOSAL)?\]([\s\S]*?)\[\/ESCALATION(?:_PROPOSAL)?\]/i.exec(text);
+  if (marker?.[1]) {
+    try {
+      const parsed = JSON.parse(marker[1].trim());
+      if (parsed && typeof parsed === "object") {
+        return {
+          reason: truncate(redactSecrets(String(parsed.reason ?? "Escalation proposed")), 2_000),
+          advisoryOnly: true,
+          ...(typeof parsed.targetRole === "string" ? { targetRole: truncate(redactSecrets(parsed.targetRole), 200) } : {}),
+          ...(typeof parsed.recommendedRoute === "string" ? { recommendedRoute: truncate(redactSecrets(parsed.recommendedRoute), 200) } : {}),
+          ...(typeof parsed.suggestedAction === "string" ? { suggestedAction: truncate(redactSecrets(parsed.suggestedAction), 1_000) } : {}),
+        };
+      }
+    } catch {}
+  }
+  const val = headingValue(text, "ESCALATION") || headingValue(text, "ESCALATION_PROPOSAL");
+  if (val && !/^(?:none|false|no)$/i.test(val.trim())) {
+    const trimmed = val.trim();
+    const routeMatch = /\b(?:pro-max|flash-max|gemini-3\.[78]-flash-high|antigravity-flash-high)\b/i.exec(trimmed);
+    return {
+      reason: truncate(redactSecrets(trimmed), 2_000),
+      advisoryOnly: true,
+      ...(routeMatch ? { recommendedRoute: routeMatch[0].toLowerCase() } : {}),
+    };
+  }
+  return undefined;
+}
+
+export function parseEvidence(text: string): EvidenceBundle | undefined {
+  const marker = /\[EVIDENCE(?:_BUNDLE)?\]([\s\S]*?)\[\/EVIDENCE(?:_BUNDLE)?\]/i.exec(text);
+  if (marker?.[1]) {
+    try {
+      const parsed = JSON.parse(marker[1].trim());
+      if (parsed && typeof parsed === "object") {
+        const rawItems: unknown[] = Array.isArray(parsed.items) ? parsed.items : [];
+        const items: EvidenceItem[] = rawItems
+          .filter((item: unknown): item is Record<string, unknown> => isRecord(item))
+          .map((item: Record<string, unknown>): EvidenceItem => ({
+            ...(typeof item.id === "string" ? { id: truncate(redactSecrets(item.id), 100) } : {}),
+            ...(typeof item.type === "string" ? { type: truncate(redactSecrets(item.type), 100) } : {}),
+            ...(typeof item.claim === "string" ? { claim: truncate(redactSecrets(item.claim), 2_000) } : {}),
+            ...(typeof item.source === "string" ? { source: truncate(redactSecrets(item.source), 1_000) } : {}),
+            ...(typeof item.snippet === "string" ? { snippet: truncate(redactSecrets(item.snippet), 2_000) } : {}),
+            ...(item.confidence !== undefined ? { confidence: item.confidence as any } : {}),
+            ...(typeof item.verified === "boolean" ? { verified: item.verified } : {}),
+          }));
+        return {
+          items,
+          ...(typeof parsed.summary === "string" ? { summary: truncate(redactSecrets(parsed.summary), 2_000) } : {}),
+          claimsCount: items.length,
+          collectedAt: typeof parsed.collectedAt === "string" ? parsed.collectedAt : new Date().toISOString(),
+        };
+      }
+    } catch {}
+  }
+  const itemsList = headingList(text, "EVIDENCE");
+  if (itemsList.length > 0) {
+    const items: EvidenceItem[] = itemsList.map((line, idx) => {
+      const typeMatch = /^\[([a-zA-Z0-9_-]+)\]\s*(.*)$/.exec(line);
+      if (typeMatch && typeMatch[1] && typeMatch[2]) {
+        return {
+          id: `ev_${idx + 1}`,
+          type: truncate(redactSecrets(typeMatch[1]), 50),
+          claim: truncate(redactSecrets(typeMatch[2]), 2_000),
+          verified: true,
+        };
+      }
+      return {
+        id: `ev_${idx + 1}`,
+        claim: truncate(redactSecrets(line), 2_000),
+      };
+    });
+    return {
+      items,
+      claimsCount: items.length,
+      collectedAt: new Date().toISOString(),
+    };
+  }
+  return undefined;
+}
 
 function parseMessages(messages: OpenCodeMessage[], baselineAssistantId: string | null = null): ParsedSubagentResult {
   const users = messages.filter((message) => message.info?.role === "user");
@@ -318,6 +641,9 @@ function parseMessages(messages: OpenCodeMessage[], baselineAssistantId: string 
     : statusValue === "aborted"
       ? "aborted"
       : "completed";
+  const earlyExit = parseEarlyExit(fullText);
+  const escalation = parseEscalation(fullText);
+  const evidence = parseEvidence(fullText);
   return {
     status,
     summary: headingValue(fullText, "SUMMARY") || firstParagraph(fullText) || "DeepSeek completed without a structured summary.",
@@ -329,6 +655,9 @@ function parseMessages(messages: OpenCodeMessage[], baselineAssistantId: string 
     hasText: output.hasText,
     assistantMessageId: latest?.info?.id ?? null,
     userMessageId: users.at(-1)?.info?.id ?? null,
+    ...(earlyExit ? { earlyExit } : {}),
+    ...(escalation ? { escalation } : {}),
+    ...(evidence ? { evidence } : {}),
   };
 }
 
@@ -384,7 +713,7 @@ function firstParagraph(text: string): string {
   return text
     .split(/\r?\n\s*\r?\n/)
     .map((part) => part.replace(/^\s*#+\s*/, "").trim())
-    .find((part) => part.length > 0 && !/^(STATUS|SUMMARY|ASSUMPTIONS|CHANGES|FILES|TESTS|RISKS|UNRESOLVED)\s*:/i.test(part)) ?? "";
+    .find((part) => part.length > 0 && !/^(STATUS|SUMMARY|ASSUMPTIONS|CHANGES|FILES|TESTS|RISKS|UNRESOLVED|EARLY_EXIT|ESCALATION|ESCALATION_PROPOSAL|EVIDENCE)\s*:/i.test(part)) ?? "";
 }
 
 function summarizeDiff(diff: unknown): string {

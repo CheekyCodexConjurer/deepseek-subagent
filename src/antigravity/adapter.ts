@@ -2,6 +2,7 @@ import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, AGY_MODEL, buildAgyArgs } from "./a
 import { parseAgyOutput } from "./parser.js";
 import { AntigravityProcessError, runAgy, AGY_DEFAULT_TIMEOUT_MS, type SpawnLike } from "./runner.js";
 import { InvalidRequestError } from "../errors.js";
+import { redactSecrets, truncate } from "../security.js";
 import { AntigravitySupervisor } from "./supervisor.js";
 import { AntigravitySpool } from "./spool.js";
 import type {
@@ -220,7 +221,10 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       model,
       modelDisplayName: "Antigravity · " + model,
       workspace: options.cwd,
-      rawOutput: captured.stdout,
+      rawOutput: truncate(redactSecrets(captured.stdout), 100_000),
+      ...(parsed.evidence ? { evidence: parsed.evidence } : {}),
+      ...(parsed.earlyExit ? { earlyExit: parsed.earlyExit } : {}),
+      ...(parsed.escalation ? { escalation: parsed.escalation } : {}),
     };
   }
 }

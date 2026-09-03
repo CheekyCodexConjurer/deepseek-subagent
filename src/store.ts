@@ -234,6 +234,20 @@ export class BridgeStore {
     if (!livenessMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(13, ?)").run(new Date().toISOString());
     }
+    const adaptiveCols = this.db.prepare("PRAGMA table_info(jobs)").all() as Row[];
+    for (const [name, definition] of [
+      ["early_exit_at", "TEXT"],
+      ["early_exit_reason", "TEXT"],
+      ["escalation_proposal", "TEXT"],
+    ] as const) {
+      if (!adaptiveCols.some((column) => column.name === name)) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition);
+      }
+    }
+    const adaptiveMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 14").get() as Row | undefined;
+    if (!adaptiveMigration) {
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?)").run(new Date().toISOString());
+    }
   }
 
   /** True only when no business rows exist at all (fresh database). */
@@ -372,20 +386,32 @@ export class BridgeStore {
     return rows.map((row) => this.toJob(row));
   }
 
-  updateJobStatus(id: string, status: JobStatus, error: string | null = null): JobRecord {
+  updateJobStatus(id: string, status: JobStatus, error: string | null = null, expectedFence?: number | null): JobRecord {
     const current = this.getJob(id);
     if (!current) throw new Error("Unknown job: " + id);
+    if (expectedFence !== undefined && expectedFence !== null && current.fence !== null && current.fence !== undefined && expectedFence < current.fence) {
+      throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + current.fence, "state_conflict");
+    }
     assertJobTransition(current.status, status);
     const now = new Date().toISOString();
     const startedAt = status === "running" && current.startedAt === null ? now : current.startedAt;
     const completedAt = ["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) ? now : current.completedAt;
-    this.db.prepare("UPDATE jobs SET status = ?, started_at = ?, completed_at = ?, error = ? WHERE id = ?").run(
-      status,
-      startedAt,
-      completedAt,
-      error,
-      id,
-    );
+
+    let sql = "UPDATE jobs SET status = ?, started_at = ?, completed_at = ?, error = ? WHERE id = ?";
+    const params: (string | number | null)[] = [status, startedAt, completedAt, error, id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
@@ -531,8 +557,22 @@ export class BridgeStore {
     return row !== undefined;
   }
 
-  setJobResult(id: string, resultPath: string, summary: string): JobRecord {
-    this.db.prepare("UPDATE jobs SET result_path = ?, result_summary = ? WHERE id = ?").run(resultPath, summary, id);
+  setJobResult(id: string, resultPath: string, summary: string, expectedFence?: number | null): JobRecord {
+    let sql = "UPDATE jobs SET result_path = ?, result_summary = ? WHERE id = ?";
+    const params: (string | number | null)[] = [resultPath, summary, id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
@@ -602,6 +642,48 @@ export class BridgeStore {
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
+  }
+
+  setJobEarlyExit(id: string, input: { earlyExitAt: string; reason: string }, expectedFence?: number | null): JobRecord {
+    let sql = "UPDATE jobs SET early_exit_at = ?, early_exit_reason = ? WHERE id = ?";
+    const params: (string | number | null)[] = [input.earlyExitAt, input.reason, id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
+  }
+
+  setJobEscalation(id: string, proposalJson: string, expectedFence?: number | null): JobRecord {
+    let sql = "UPDATE jobs SET escalation_proposal = ? WHERE id = ?";
+    const params: (string | number | null)[] = [proposalJson, id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
   }
 
   /**
@@ -975,6 +1057,9 @@ export class BridgeStore {
       fence: typeof row.fence === "number" || typeof row.fence === "bigint" ? Number(row.fence) : 1,
       workerPid: typeof row.worker_pid === "number" || typeof row.worker_pid === "bigint" ? Number(row.worker_pid) : null,
       heartbeatAt: nullableString(row, "heartbeat_at"),
+      earlyExitAt: nullableString(row, "early_exit_at"),
+      earlyExitReason: nullableString(row, "early_exit_reason"),
+      escalationProposal: nullableString(row, "escalation_proposal"),
     };
   }
 
