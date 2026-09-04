@@ -21,7 +21,7 @@ import type {
   OpenCodeMessage,
   WakeEnvelope,
 } from "../../src/types.js";
-import { ConflictError } from "../../src/errors.js";
+import { ConflictError, InvalidRequestError } from "../../src/errors.js";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { BridgeHttpServer, BridgeHttpClient } from "../../src/http-server.js";
 import { createMcpServer } from "../../src/mcp.js";
@@ -193,6 +193,9 @@ test("authoritative correlation: rejects mixed threads and treats caller thread 
     // Parking with job1 must NOT return armed because caller hint is NOT authority
     const unconfirmedReceipt = await service.park({ job_ids: [job1.id] });
     assert.equal(unconfirmedReceipt.armed, false, "Must return armed: false when bridge correlation is missing");
+    assert.equal(unconfirmedReceipt.deliveryMode, "none");
+    assert.notEqual(unconfirmedReceipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(unconfirmedReceipt.parkId), false, "Zero in-memory waiter allocation");
 
     // Bind job1 to thread_A and job2 to thread_B via authoritative bridge correlation
     store.bindJob({ jobId: job1.id, threadId: "thread_A", originatingTurnId: "turn_A", originatingItemId: "item_A" });
@@ -212,6 +215,9 @@ test("authoritative correlation: rejects mixed threads and treats caller thread 
     const armedReceipt = await service.park({ job_ids: [job1.id, job3.id] });
     assert.equal(armedReceipt.armed, true, "Must return armed: true when all jobs map to same authoritative thread");
     assert.equal(armedReceipt.targetIdentity, "thread_A");
+    assert.equal(armedReceipt.deliveryMode, "cli_resume");
+    assert.notEqual(armedReceipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(armedReceipt.parkId), false, "Zero in-memory waiter allocation");
     assert.equal(armedReceipt.obligationState, "pending");
   } finally {
     await service.stop();
@@ -261,6 +267,9 @@ test("result-before-wake: wake is not eligible until worker result is durably pe
 
     const receipt = await service.park({ job_ids: [job.id] });
     assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     // Job transitions to completed, but resultPath is null (not yet durably persisted)
     store.updateJobStatus(job.id, "dispatching");
@@ -327,6 +336,9 @@ test("exactly one wake/generation: generation fencing ensures at most one wake p
 
     const receipt = await service.park({ job_ids: [job1.id, job2.id] });
     assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
     assert.equal(receipt.generation, 1);
 
     // Persist result for job1
@@ -423,8 +435,11 @@ test("coalescing: already-ready jobs are coalesced into a single wake envelope",
     store.updateJobStatus(job3.id, "dispatching");
     store.updateJobStatus(job3.id, "running");
 
-    const receipt = await service.park({ job_ids: [job1.id, job2.id, job3.id] });
+    const receipt = await service.park({ job_ids: [job1.id, job2.id, job3.id], predicate: "ANY" });
     assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     // Evaluate wakes
     await service.evaluateParkWakes(job1.id);
@@ -632,7 +647,11 @@ test("needs-approval/failure/timeout: wake is triggered for needs_approval, fail
     const jobApproval = store.createJob({ id: "job_na", agentId: agent.id, kind: "spawn", requestId: "req_na", promptHash: "hna" });
     store.bindJob({ jobId: jobApproval.id, threadId: "thread_na", originatingTurnId: "turn_na", originatingItemId: "item_na" });
 
-    await service.park({ job_ids: [jobApproval.id] });
+    const receiptAppr = await service.park({ job_ids: [jobApproval.id] });
+    assert.equal(receiptAppr.armed, true);
+    assert.equal(receiptAppr.deliveryMode, "cli_resume");
+    assert.notEqual(receiptAppr.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receiptAppr.parkId), false, "Zero in-memory waiter allocation");
 
     // Job transitions to needs_approval
     store.updateJobStatus(jobApproval.id, "dispatching");
@@ -647,7 +666,11 @@ test("needs-approval/failure/timeout: wake is triggered for needs_approval, fail
     // Failure with error
     const jobFail = store.createJob({ id: "job_fl", agentId: agent.id, kind: "spawn", requestId: "req_fl", promptHash: "hfl" });
     store.bindJob({ jobId: jobFail.id, threadId: "thread_fl", originatingTurnId: "turn_fl", originatingItemId: "item_fl" });
-    await service.park({ job_ids: [jobFail.id] });
+    const receiptFail = await service.park({ job_ids: [jobFail.id] });
+    assert.equal(receiptFail.armed, true);
+    assert.equal(receiptFail.deliveryMode, "cli_resume");
+    assert.notEqual(receiptFail.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receiptFail.parkId), false, "Zero in-memory waiter allocation");
 
     store.updateJobStatus(jobFail.id, "dispatching");
     store.updateJobStatus(jobFail.id, "running");
@@ -783,6 +806,9 @@ test("unsupported authoritative attachment: returns armed: false when adapter is
 
     const receipt = await service.park({ job_ids: [job.id], wait: false });
     assert.equal(receipt.armed, false, "Must return armed: false when authoritative attachment is unsupported");
+    assert.equal(receipt.deliveryMode, "none");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
     assert.equal(receipt.nextAction, "subagents_follow");
   } finally {
     await service.stop();
@@ -839,6 +865,9 @@ test("parking never consumes a job: job remains unconsumed with pending obligati
 
     const receipt = await service.park({ job_ids: [job.id] });
     assert.equal(receipt.obligationState, "pending");
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     const refreshedJob = store.getJob(job.id);
     assert.equal(refreshedJob?.resultConsumedAt, null, "resultConsumedAt must NOT be set by parking");
@@ -880,10 +909,10 @@ test("migration v16: adds delivery_mode, wake_state, next_attempt_at, and proven
 });
 
 // ---------------------------------------------------------------------------
-// 15. loaded event wait: holds single event waiter and returns wake receipt in-turn
-// Catches: returning immediately without waiting on loaded caller or omitting in-turn wake receipt
+// 15. v3 park semantics: park never waits in-turn, explicit wait=true is rejected, omitted wait returns immediately
+// Catches: in-memory waiter allocation or preserving legacy in-turn waiting
 // ---------------------------------------------------------------------------
-test("loaded event wait: holds single event waiter and returns wake receipt in-turn without polling", async () => {
+test("v3 park semantics: park never waits in-turn, explicit wait=true is rejected, omitted wait returns immediately with zero in-memory waiters", async () => {
   const { tmp, config, store } = await createTestEnv();
   const fakeCodex = new FakeCodexDelivery();
   const service = new BridgeService(config, {
@@ -915,28 +944,30 @@ test("loaded event wait: holds single event waiter and returns wake receipt in-t
     store.updateJobStatus(job.id, "dispatching");
     store.updateJobStatus(job.id, "running");
 
-    let resolved = false;
-    const parkPromise = service.park({ job_ids: [job.id], wait: true, mcp_session_id: "session_wait_turn" }).then((res) => {
-      resolved = true;
-      return res;
-    });
+    // 1. Explicit wait=true must fail closed with 400 directing to subagents_follow
+    await assert.rejects(
+      () => service.park({ job_ids: [job.id], wait: true, mcp_session_id: "session_wait_turn" }),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.equal((err as InvalidRequestError).status, 400);
+        assert.match((err as Error).message, /subagents_follow/i);
+        return true;
+      },
+    );
 
-    await new Promise((r) => setTimeout(r, 50));
-    assert.equal(resolved, false, "Must hold the waiter pending while job is running");
+    // 2. Omitted wait returns immediately with armed=true, deliveryMode="cli_resume", and zero in-memory waiters
+    const receipt = await service.park({ job_ids: [job.id], mcp_session_id: "session_wait_turn" });
+    assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(receipt.wakeState, "waiting");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
-    const resFile = path.join(tmp, "res_wait.json");
-    await writeFile(resFile, JSON.stringify({ envelope: { summary: "done" } }));
-    store.setJobResult(job.id, resFile, "done");
-    store.updateJobStatus(job.id, "completed");
-
-    await service.evaluateParkWakes(job.id);
-
-    const receipt = await parkPromise;
-    assert.equal(resolved, true, "Must resolve when job completes");
-    assert.equal(receipt.deliveryMode, "in_turn");
-    assert.equal(receipt.wakeState, "delivered");
-    assert.deepEqual(receipt.readyJobIds, ["job_wait"]);
-    assert.equal(receipt.nextAction, "subagents_follow");
+    const barrier = store.getParkBarrier(receipt.parkId)!;
+    assert.notEqual(barrier.deliveryMode, "in_turn", "No new in_turn barrier created");
+    assert.equal(barrier.deliveryMode, "cli_resume");
+    assert.equal(service.hasParkWaiter(barrier.id), false, "Zero in-memory waiter on barrier");
+    assert.equal(service.hasParkWaiter(job.id), false, "Zero in-memory waiter on job");
   } finally {
     await service.stop();
     store.close();
@@ -945,10 +976,11 @@ test("loaded event wait: holds single event waiter and returns wake receipt in-t
 });
 
 // ---------------------------------------------------------------------------
-// 16. cancellation durability: aborting loaded waiter cleans up in-memory waiter while preserving durable barrier
-// Catches: disarming or destroying durable barrier on caller disconnect
+// 16. external park durability: arms immediately with zero in-memory waiters while preserving durable barrier
+// Catches: disarming or destroying durable barrier or attempting in-memory waiter allocation
+// Note: Replaces legacy v2 in-turn cancellation durability; in v3, park never waits in-turn and allocates zero waiters.
 // ---------------------------------------------------------------------------
-test("cancellation durability: aborting loaded MCP waiter cleans up in-memory waiter while preserving durable barrier", async () => {
+test("external park durability: arms immediately with zero in-memory waiters while preserving durable barrier", async () => {
   const { tmp, config, store } = await createTestEnv();
   const fakeCodex = new FakeCodexDelivery();
   const service = new BridgeService(config, {
@@ -962,42 +994,57 @@ test("cancellation durability: aborting loaded MCP waiter cleans up in-memory wa
   await service.start();
   try {
     const agent = store.createAgent({
-      id: "agent_canc",
+      id: "agent_dur",
       title: "Test",
       topic: "Topic",
       repositoryRoot: tmp,
       workspacePath: tmp,
       workspaceStrategy: "shared",
       opencodeServerId: "srv",
-      opencodeSessionId: "session_canc",
+      opencodeSessionId: "session_dur",
       modelProviderId: "deepseek",
       modelId: "deepseek-chat",
       modelVariant: null,
     });
-    const job = store.createJob({ id: "job_canc", agentId: agent.id, kind: "spawn", requestId: "req_canc", promptHash: "hcanc", mcpSessionId: "session_canc_mcp" });
-    store.bindJob({ jobId: job.id, threadId: "thread_canc", originatingTurnId: "turn_canc", originatingItemId: "item_canc" });
+    const job = store.createJob({ id: "job_dur", agentId: agent.id, kind: "spawn", requestId: "req_dur", promptHash: "hdur", mcpSessionId: "session_dur_mcp" });
+    store.bindJob({ jobId: job.id, threadId: "thread_dur", originatingTurnId: "turn_dur", originatingItemId: "item_dur" });
 
     store.updateJobStatus(job.id, "dispatching");
     store.updateJobStatus(job.id, "running");
 
-    const controller = new AbortController();
-    const parkPromise = service.park({ job_ids: [job.id], wait: true, mcp_session_id: "session_canc_mcp" }, false, controller.signal);
+    // 1. Explicit wait=true fails closed directing to follow
+    await assert.rejects(
+      () => service.park({ job_ids: [job.id], wait: true, mcp_session_id: "session_dur_mcp" }),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.equal((err as InvalidRequestError).status, 400);
+        assert.match((err as Error).message, /subagents_follow/i);
+        return true;
+      },
+    );
 
-    controller.abort();
+    // 2. Normal external park arms immediately and remains durable with zero in-memory waiters
+    const receipt = await service.park({ job_ids: [job.id], mcp_session_id: "session_dur_mcp" });
+    assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(receipt.wakeState, "waiting");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
-    await assert.rejects(parkPromise, (err: unknown) => err instanceof Error);
-
-    const barrier = store.getParkBarrierByThread("thread_canc");
+    const barrier = store.getParkBarrierByThread("thread_dur");
     assert.ok(barrier, "Park barrier must be preserved in SQLite");
     assert.equal(barrier.armed, true, "Barrier must remain armed for external wake");
+    assert.notEqual(barrier.deliveryMode, "in_turn", "No in_turn barrier created");
+    assert.equal(barrier.deliveryMode, "cli_resume");
+    assert.equal(service.hasParkWaiter(barrier.id), false, "Zero in-memory waiter on barrier");
 
-    const resFile = path.join(tmp, "res_canc.json");
+    const resFile = path.join(tmp, "res_dur.json");
     await writeFile(resFile, JSON.stringify({ envelope: { summary: "done" } }));
     store.setJobResult(job.id, resFile, "done");
     store.updateJobStatus(job.id, "completed");
 
     await service.evaluateParkWakes(job.id);
-    assert.equal(fakeCodex.deliveredWakes.length, 1, "External wake outbox must deliver when loaded waiter is disconnected");
+    assert.equal(fakeCodex.deliveredWakes.length, 1, "External wake outbox must deliver");
   } finally {
     await service.stop();
     store.close();
@@ -1041,6 +1088,9 @@ test("trusted identity: caller thread mismatch fails closed and caller hints alo
     const receipt = await service.park({ job_ids: [job.id], thread_id: "thread_trusted" });
     assert.equal(receipt.armed, true);
     assert.equal(receipt.targetIdentity, "thread_trusted");
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     await assert.rejects(
       () => service.park({ job_ids: [job.id], thread_id: "thread_spoofed" }),
@@ -1107,6 +1157,9 @@ test("active writer deferral: classifies active writer as deferred_active_writer
 
     const receipt = await service.park({ job_ids: [job.id] });
     assert.equal(receipt.armed, true);
+    assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     const resFile = path.join(tmp, "res_act.json");
     await writeFile(resFile, JSON.stringify({ envelope: { summary: "done" } }));
@@ -1207,6 +1260,8 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
     const receipt = await service.park({ job_ids: [job.id], wait: false });
     assert.equal(receipt.armed, true, "Must arm when compatible CLI transport is available");
     assert.equal(receipt.deliveryMode, "cli_resume");
+    assert.notEqual(receipt.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt.parkId), false, "Zero in-memory waiter allocation");
 
     const resFile = path.join(tmp, "res_cli1.json");
     await writeFile(resFile, JSON.stringify({ envelope: { summary: "done" } }));
@@ -1243,6 +1298,9 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
       version: "0.153.0",
     };
     const receipt2 = await service.park({ job_ids: [job2.id], wait: false });
+    assert.equal(receipt2.deliveryMode, "cli_resume");
+    assert.notEqual(receipt2.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt2.parkId), false, "Zero in-memory waiter allocation");
 
     const resFile2 = path.join(tmp, "res_cli2.json");
     await writeFile(resFile2, JSON.stringify({ envelope: { summary: "done 2" } }));
@@ -1277,6 +1335,9 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
       version: "0.153.0",
     };
     const receipt3 = await service.park({ job_ids: [job3.id], wait: false });
+    assert.equal(receipt3.deliveryMode, "cli_resume");
+    assert.notEqual(receipt3.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt3.parkId), false, "Zero in-memory waiter allocation");
 
     const resFile3 = path.join(tmp, "res_cli3.json");
     await writeFile(resFile3, JSON.stringify({ envelope: { summary: "done 3" } }));
@@ -1300,15 +1361,22 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
 });
 
 // ---------------------------------------------------------------------------
-// 21. BLK-BRIDGE-2: loaded in-turn waiter arms from same MCP session without App Server attachment and resolves once
+// 21. BLK-BRIDGE-2: default unattached MCP path rejects wait=true, requires authoritative binding for cli_resume, and allocates zero in-memory waiters
+// Catches: legacy in-turn waiter allocation or accepting wait=true in default unattached MCP path
 // ---------------------------------------------------------------------------
-test("BLK-BRIDGE-2: loaded in-turn waiter arms from same MCP session without App Server attachment and resolves once", async () => {
+test("BLK-BRIDGE-2: default unattached MCP path rejects wait=true, requires authoritative binding for cli_resume, and allocates zero in-memory waiters", async () => {
   const { tmp, config, store } = await createTestEnv();
   config.daemonPort = await freePort();
+
+  const fakeCli: CodexCliTransport = {
+    probeCapabilities: async () => ({ compatible: true, version: "0.153.0" }),
+    deliverWake: async () => ({ success: true, accepted: true, executablePath: "C:\\Codex\\codex.exe", version: "0.153.0" }),
+  };
 
   const service = new BridgeService(config, {
     store,
     codex: new UnavailableCodexDeliveryAdapter(), // REAL default path, NOT FakeCodexDelivery
+    cliTransport: fakeCli,
     manager: {
       start: async () => ({ serverId: "srv", baseUrl: "http://127.0.0.1:9999", client: new FakeOpenCodeClient(), processId: null, stop: async () => {} }),
       stop: async () => {},
@@ -1320,7 +1388,7 @@ test("BLK-BRIDGE-2: loaded in-turn waiter arms from same MCP session without App
   await httpServer.start();
 
   const httpClient = new BridgeHttpClient(config);
-  const mcpServer = createMcpServer(httpClient);
+  const mcpServer = createMcpServer(httpClient, { env: {} });
   const mcpClient = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await mcpServer.connect(serverTransport);
@@ -1330,40 +1398,61 @@ test("BLK-BRIDGE-2: loaded in-turn waiter arms from same MCP session without App
     // 1. Spawn a job under this MCP session
     const spawnRes = await mcpClient.callTool({
       name: "subagents_spawn",
-      arguments: { topic: "default path wait", task: "do work" },
+      arguments: { topic: "default unattached path v3", task: "do work" },
     });
     const spawnData = spawnRes.structuredContent as Record<string, unknown>;
     const jobId = spawnData.jobId as string;
     assert.ok(jobId, "Job ID must be returned from spawn");
 
-    // 2. Issue park with wait=true in the real default unattached path
-    let resolved = false;
-    const parkPromise = mcpClient.callTool({
+    // 2. Issue park with wait=true fails closed with typed 400 error directing to subagents_follow
+    const waitTrueRes = await mcpClient.callTool({
       name: "subagents_park",
       arguments: { job_ids: [jobId], wait: true },
-    }).then((res) => {
-      resolved = true;
-      return res;
     });
+    assert.equal(waitTrueRes.isError, true);
+    assert.match((waitTrueRes.content[0] as { text: string }).text, /subagents_follow/i);
 
-    await new Promise((r) => setTimeout(r, 60));
-    assert.equal(resolved, false, "Must hold the in-turn waiter pending while job is running");
+    // 3. Unbound job fails closed (armed: false, deliveryMode: "none", zero in-memory waiters)
+    const parkResUnbound = await mcpClient.callTool({
+      name: "subagents_park",
+      arguments: { job_ids: [jobId] },
+    });
+    const parkDataUnbound = parkResUnbound.structuredContent as Record<string, unknown>;
+    assert.equal(parkDataUnbound.armed, false, "Must fail closed when unattached/unbound");
+    assert.equal(parkDataUnbound.deliveryMode, "none");
+    assert.notEqual(parkDataUnbound.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(parkDataUnbound.parkId as string), false, "Zero in-memory waiter allocation");
 
-    // 3. Make job terminal and evaluate wakes
+    // 4. Bound job arms immediately with deliveryMode="cli_resume" and zero in-memory waiters
+    store.bindJob({ jobId, threadId: "22222222-2222-2222-2222-222222222222", originatingTurnId: "turn_blk2", originatingItemId: "item_blk2" });
+    const parkRes = await mcpClient.callTool({
+      name: "subagents_park",
+      arguments: { job_ids: [jobId] },
+    });
+    const parkData = parkRes.structuredContent as Record<string, unknown>;
+    assert.equal(parkData.armed, true, "Must be armed with cli_resume");
+    assert.equal(parkData.deliveryMode, "cli_resume");
+    assert.notEqual(parkData.deliveryMode, "in_turn");
+    assert.equal(parkData.wakeState, "waiting");
+    assert.equal(service.hasParkWaiter(parkData.parkId as string), false, "Zero in-memory waiter allocation");
+
+    const barrierBeforeWake = store.getParkBarrier(parkData.parkId as string)!;
+    assert.notEqual(barrierBeforeWake.deliveryMode, "in_turn", "Must not create in_turn barrier");
+    assert.equal(barrierBeforeWake.deliveryMode, "cli_resume");
+    assert.equal(service.hasParkWaiter(barrierBeforeWake.id), false, "Zero in-memory waiter on barrier");
+
+    // 5. Make job terminal and evaluate wakes
     const resFile = path.join(tmp, "res_blk2.json");
     await writeFile(resFile, JSON.stringify({ envelope: { summary: "worker finished" } }));
     store.setJobResult(jobId, resFile, "worker finished");
     store.updateJobStatus(jobId, "completed");
 
     await service.evaluateParkWakes(jobId);
-
-    const parkRes = await parkPromise;
-    assert.equal(resolved, true, "Must resolve once job completes");
-    const parkData = parkRes.structuredContent as Record<string, unknown>;
-    assert.equal(parkData.armed, true, "Must be armed in-turn");
-    assert.equal(parkData.deliveryMode, "in_turn");
-    assert.equal(parkData.wakeState, "delivered");
-    assert.deepEqual(parkData.readyJobIds, [jobId]);
+    const barrier = store.getParkBarrier(parkData.parkId as string)!;
+    assert.equal(barrier.state, "woken");
+    assert.notEqual(barrier.deliveryMode, "in_turn");
+    assert.equal(barrier.deliveryMode, "cli_resume");
+    assert.equal(service.hasParkWaiter(barrier.id), false, "Zero in-memory waiter on barrier after wake");
   } finally {
     await mcpClient.close();
     await mcpServer.close();
@@ -1450,6 +1539,9 @@ test("BLK-BRIDGE-3: resolves trusted task identity from CODEX_THREAD_ID/CODEX_SE
       arguments: { job_ids: [jobIdA], thread_id: validUuid, wait: false },
     });
     assert.equal(parkCorroborated.isError, undefined);
+    const parkCorroboratedData = parkCorroborated.structuredContent as Record<string, unknown>;
+    assert.notEqual(parkCorroboratedData.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(parkCorroboratedData.parkId as string), false, "Zero in-memory waiter allocation");
 
     // Mismatched caller thread hint fails closed
     const parkMismatched = await mcpClientA.callTool({
@@ -1474,29 +1566,17 @@ test("BLK-BRIDGE-3: resolves trusted task identity from CODEX_THREAD_ID/CODEX_SE
     });
     const parkDataB = parkExternalB.structuredContent as Record<string, unknown>;
     assert.equal(parkDataB.armed, false, "Missing/malformed env must fail closed for external wake");
+    assert.equal(parkDataB.deliveryMode, "none");
+    assert.notEqual(parkDataB.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(parkDataB.parkId as string), false, "Zero in-memory waiter allocation");
 
-    // Same-session in-turn wait still behaves safely
-    let resolvedB = false;
-    const parkInTurnPromise = mcpClientB.callTool({
+    // In v3, explicit wait=true fails closed with error message directing to subagents_follow
+    const parkInTurnRes = await mcpClientB.callTool({
       name: "subagents_park",
       arguments: { job_ids: [jobIdB], wait: true },
-    }).then((res) => {
-      resolvedB = true;
-      return res;
     });
-
-    await new Promise((r) => setTimeout(r, 50));
-    assert.equal(resolvedB, false);
-
-    const resFileB = path.join(tmp, "res_blk3.json");
-    await writeFile(resFileB, JSON.stringify({ envelope: { summary: "b done" } }));
-    store.setJobResult(jobIdB, resFileB, "b done");
-    store.updateJobStatus(jobIdB, "completed");
-
-    await service.evaluateParkWakes(jobIdB);
-    const inTurnRes = await parkInTurnPromise;
-    assert.equal(resolvedB, true);
-    assert.equal((inTurnRes.structuredContent as Record<string, unknown>).deliveryMode, "in_turn");
+    assert.equal(parkInTurnRes.isError, true);
+    assert.match((parkInTurnRes.content[0] as { text: string }).text, /subagents_follow/i);
   } finally {
     await mcpClientA.close();
     await mcpServerA.close();
@@ -1511,9 +1591,10 @@ test("BLK-BRIDGE-3: resolves trusted task identity from CODEX_THREAD_ID/CODEX_SE
 });
 
 // ---------------------------------------------------------------------------
-// 23. BLK-BRIDGE-4: cancellation aborts HTTP waiter, cleans up in-memory waiter, and preserves durable barrier
+// 23. BLK-BRIDGE-4: MCP park rejects wait=true, arms immediately with zero in-memory waiters, and preserves durable barrier
+// Catches: allocating in-memory waiters over MCP JSON-RPC, accepting wait=true, or failing to preserve durable barrier in SQLite
 // ---------------------------------------------------------------------------
-test("BLK-BRIDGE-4: cancellation aborts HTTP waiter, cleans up in-memory waiter, and preserves durable barrier", async () => {
+test("BLK-BRIDGE-4: MCP park rejects wait=true, arms immediately with zero in-memory waiters, and preserves durable barrier", async () => {
   const { tmp, config, store } = await createTestEnv();
   config.daemonPort = await freePort();
 
@@ -1543,54 +1624,48 @@ test("BLK-BRIDGE-4: cancellation aborts HTTP waiter, cleans up in-memory waiter,
   try {
     const spawnRes = await mcpClient.callTool({
       name: "subagents_spawn",
-      arguments: { topic: "canc test", task: "do work" },
+      arguments: { topic: "external park durability", task: "do work" },
     });
     const jobId = (spawnRes.structuredContent as Record<string, unknown>).jobId as string;
 
     // Bind for authoritative external wake
-    store.bindJob({ jobId, threadId: "44444444-4444-4444-4444-444444444444", originatingTurnId: "turn_canc", originatingItemId: "item_canc" });
+    store.bindJob({ jobId, threadId: "44444444-4444-4444-4444-444444444444", originatingTurnId: "turn_mcp_e2e", originatingItemId: "item_mcp_e2e" });
 
-    const controller = new AbortController();
-    const parkPromise = mcpClient.callTool(
-      {
-        name: "subagents_park",
-        arguments: { job_ids: [jobId], wait: true },
-      },
-      undefined,
-      { signal: controller.signal },
-    );
+    // 1. Explicit wait=true fails closed with error directing to subagents_follow
+    const waitTrueRes = await mcpClient.callTool({
+      name: "subagents_park",
+      arguments: { job_ids: [jobId], wait: true },
+    });
+    assert.equal(waitTrueRes.isError, true);
+    assert.match((waitTrueRes.content[0] as { text: string }).text, /subagents_follow/i);
 
-    await new Promise((r) => setTimeout(r, 60));
+    // 2. Omitted wait arms external barrier immediately with zero in-memory waiters
+    const parkRes = await mcpClient.callTool({
+      name: "subagents_park",
+      arguments: { job_ids: [jobId] },
+    });
+    const parkData = parkRes.structuredContent as Record<string, unknown>;
+    assert.equal(parkData.armed, true);
+    assert.equal(parkData.deliveryMode, "cli_resume");
+    assert.notEqual(parkData.deliveryMode, "in_turn");
+    assert.equal(parkData.wakeState, "waiting");
+    assert.equal(service.hasParkWaiter(parkData.parkId as string), false, "Zero in-memory waiter allocation");
 
     const barrier = store.getParkBarrierByThread("44444444-4444-4444-4444-444444444444");
     assert.ok(barrier, "Barrier must exist in SQLite");
-    assert.equal(service.hasParkWaiter(barrier.id), true, "Waiter must be active in service");
-
-    // Abort from client side
-    controller.abort();
-
-    await assert.rejects(parkPromise);
-
-    // Assert in-memory waiter is cleaned up
-    for (let i = 0; i < 20; i++) {
-      if (!service.hasParkWaiter(barrier.id)) break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    assert.equal(service.hasParkWaiter(barrier.id), false, "In-memory waiter must be deleted on abort");
-
-    // Assert durable barrier in SQLite is preserved and armed for external wake
-    const refreshedBarrier = store.getParkBarrier(barrier.id);
-    assert.ok(refreshedBarrier);
-    assert.equal(refreshedBarrier.armed, true, "Durable barrier must remain armed in SQLite");
+    assert.equal(service.hasParkWaiter(barrier.id), false, "Must not register in-memory waiter");
+    assert.equal(barrier.armed, true, "Durable barrier must remain armed in SQLite");
+    assert.notEqual(barrier.deliveryMode, "in_turn", "Must not create in_turn barrier");
+    assert.equal(barrier.deliveryMode, "cli_resume");
 
     // Make job complete and evaluate wakes -> external outbox must be triggered
-    const resFile = path.join(tmp, "res_canc_e2e.json");
+    const resFile = path.join(tmp, "res_mcp_e2e.json");
     await writeFile(resFile, JSON.stringify({ envelope: { summary: "done" } }));
     store.setJobResult(jobId, resFile, "done");
     store.updateJobStatus(jobId, "completed");
 
     await service.evaluateParkWakes(jobId);
-    assert.equal(fakeCodex.deliveredWakes.length, 1, "External wake must be emitted after disconnect");
+    assert.equal(fakeCodex.deliveredWakes.length, 1, "External wake must be emitted for armed durable barrier upon job completion");
   } finally {
     await mcpClient.close();
     await mcpServer.close();
@@ -1717,9 +1792,10 @@ test("BLK-BRIDGE-5: capability-based CLI invocation, candidate precedence, schem
 });
 
 // ---------------------------------------------------------------------------
-// 26. in-turn arming session provenance: missing or mismatched MCP session id fails closed
+// 26. session provenance: missing or mismatched MCP session id fails closed with zero in-memory waiters
+// Catches: session spoofing, missing session provenance, or allocating in-memory waiters on session mismatch
 // ---------------------------------------------------------------------------
-test("in-turn arming: missing or mismatched MCP session id fails closed", async () => {
+test("session provenance: missing or mismatched MCP session id fails closed with zero in-memory waiters", async () => {
   const { tmp, config, store } = await createTestEnv();
   const service = new BridgeService(config, {
     store,
@@ -1746,41 +1822,47 @@ test("in-turn arming: missing or mismatched MCP session id fails closed", async 
       modelVariant: null,
     });
 
-    // 1. Job without MCP session id + caller without MCP session id -> fails closed (armed: false, deliveryMode: "none")
     const jobNoSess = store.createJob({ id: "job_no_sess", agentId: agent.id, kind: "spawn", requestId: "r1", promptHash: "p1" });
-    const receipt1 = await service.park({ job_ids: [jobNoSess.id], wait: true });
+
+    // 1. Explicit wait=true fails closed with InvalidRequestError
+    await assert.rejects(
+      () => service.park({ job_ids: [jobNoSess.id], wait: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.equal((err as InvalidRequestError).status, 400);
+        assert.match((err as Error).message, /subagents_follow/i);
+        return true;
+      },
+    );
+
+    // 2. Job without MCP session id + caller without MCP session id -> fails closed (armed: false, deliveryMode: "none", zero in-memory waiters)
+    const receipt1 = await service.park({ job_ids: [jobNoSess.id] });
     assert.equal(receipt1.armed, false, "Must fail closed (armed: false) when session provenance is missing");
     assert.equal(receipt1.deliveryMode, "none");
+    assert.notEqual(receipt1.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt1.parkId), false, "Zero in-memory waiter allocation");
 
-    // 2. Job with MCP session id + caller without MCP session id -> fails closed
+    // 3. Job with MCP session id + caller without MCP session id -> fails closed
     const jobWithSess = store.createJob({ id: "job_with_sess", agentId: agent.id, kind: "spawn", requestId: "r2", promptHash: "p2", mcpSessionId: "sess_alpha" });
-    const receipt2 = await service.park({ job_ids: [jobWithSess.id], wait: true });
+    const receipt2 = await service.park({ job_ids: [jobWithSess.id] });
     assert.equal(receipt2.armed, false, "Must fail closed when caller lacks mcp_session_id");
     assert.equal(receipt2.deliveryMode, "none");
+    assert.notEqual(receipt2.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt2.parkId), false, "Zero in-memory waiter allocation");
 
-    // 3. Job without MCP session id + caller with MCP session id -> fails closed
-    const receipt3 = await service.park({ job_ids: [jobNoSess.id], wait: true, mcp_session_id: "sess_alpha" });
+    // 4. Job without MCP session id + caller with MCP session id -> fails closed
+    const receipt3 = await service.park({ job_ids: [jobNoSess.id], mcp_session_id: "sess_alpha" });
     assert.equal(receipt3.armed, false, "Must fail closed when job lacks mcpSessionId");
     assert.equal(receipt3.deliveryMode, "none");
+    assert.notEqual(receipt3.deliveryMode, "in_turn");
+    assert.equal(service.hasParkWaiter(receipt3.parkId), false, "Zero in-memory waiter allocation");
 
-    // 4. Mismatched caller session vs job session throws identity_mismatch
+    // 5. Mismatched caller session vs job session throws identity_mismatch
     await assert.rejects(
-      () => service.park({ job_ids: [jobWithSess.id], wait: true, mcp_session_id: "sess_beta" }),
+      () => service.park({ job_ids: [jobWithSess.id], mcp_session_id: "sess_beta" }),
       (err: unknown) => err instanceof ConflictError && err.code === "identity_mismatch",
       "Must throw identity_mismatch when caller session does not match job session",
     );
-
-    // 5. Matching session provenance arms in-turn immediately
-    const resAlpha = path.join(tmp, "res_alpha.json");
-    await writeFile(resAlpha, JSON.stringify({ envelope: { summary: "alpha done" } }));
-    const jobReady = store.createJob({ id: "job_ready", agentId: agent.id, kind: "spawn", requestId: "r3", promptHash: "p3", mcpSessionId: "sess_alpha" });
-    store.updateJobStatus(jobReady.id, "dispatching");
-    store.updateJobStatus(jobReady.id, "running");
-    store.setJobResult(jobReady.id, resAlpha, "alpha done");
-    store.updateJobStatus(jobReady.id, "completed");
-    const receipt4 = await service.park({ job_ids: [jobReady.id], wait: true, mcp_session_id: "sess_alpha" });
-    assert.equal(receipt4.armed, true, "Must arm when session provenance matches");
-    assert.equal(receipt4.deliveryMode, "in_turn");
   } finally {
     await service.stop();
     store.close();

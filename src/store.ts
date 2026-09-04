@@ -18,6 +18,7 @@ import type {
   JobRecord,
   JobStatus,
   ParkBarrierRecord,
+  ParkPredicateType,
   WakeOutboxRecord,
   WorkspaceStrategy,
 } from "./types.js";
@@ -352,6 +353,61 @@ export class BridgeStore {
       }
 
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?)").run(new Date().toISOString());
+    }
+    const v17Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 17").get() as Row | undefined;
+    if (!v17Migration) {
+      const barrierCols = (this.db.prepare("PRAGMA table_info(park_barriers)").all() as Row[]).map((c) => stringValue(c, "name"));
+      if (!barrierCols.includes("predicate_type")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN predicate_type TEXT NOT NULL DEFAULT 'ALL';");
+      }
+      if (!barrierCols.includes("quorum_count")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN quorum_count INTEGER;");
+      }
+      if (!barrierCols.includes("required_job_ids")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN required_job_ids TEXT;");
+      }
+      if (!barrierCols.includes("wake_on_exception")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN wake_on_exception INTEGER NOT NULL DEFAULT 1;");
+      }
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(17, ?)").run(new Date().toISOString());
+    }
+    const v18Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 18").get() as Row | undefined;
+    if (!v18Migration) {
+      const outboxCols = (this.db.prepare("PRAGMA table_info(wake_outbox)").all() as Row[]).map((c) => stringValue(c, "name"));
+      const outboxTableSql = ((this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_outbox'").get() as Row | undefined)?.sql as string | undefined) ?? "";
+      if (!outboxTableSql.includes("superseded") || !outboxCols.includes("message_id")) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS wake_outbox_v18 (
+            id TEXT PRIMARY KEY,
+            park_id TEXT NOT NULL REFERENCES park_barriers(id),
+            generation INTEGER NOT NULL,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'cli_resume',
+            status TEXT NOT NULL CHECK (status IN ('pending','waking','deferred_active_writer','delivered','failed','superseded')),
+            wake_state TEXT NOT NULL DEFAULT 'waiting' CHECK (wake_state IN ('waiting','deferred_active_writer','delivered','failed','superseded')),
+            wake_marker TEXT NOT NULL,
+            reason TEXT,
+            payload_json TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            selected_executable TEXT,
+            executable_version TEXT,
+            message_id TEXT,
+            created_at TEXT NOT NULL,
+            woken_at TEXT,
+            last_error TEXT,
+            UNIQUE(park_id, generation)
+          );
+          INSERT OR IGNORE INTO wake_outbox_v18 (
+            id, park_id, generation, thread_id, turn_id, delivery_mode, status, wake_state, wake_marker, reason, payload_json, attempts, next_attempt_at, selected_executable, executable_version, message_id, created_at, woken_at, last_error
+          ) SELECT id, park_id, generation, thread_id, turn_id, delivery_mode, status, wake_state, wake_marker, reason, payload_json, attempts, next_attempt_at, selected_executable, executable_version, ${outboxCols.includes("message_id") ? "message_id" : "NULL"}, created_at, woken_at, last_error FROM wake_outbox;
+          DROP TABLE wake_outbox;
+          ALTER TABLE wake_outbox_v18 RENAME TO wake_outbox;
+          CREATE INDEX IF NOT EXISTS idx_wake_outbox_status ON wake_outbox(status);
+        `);
+      }
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(18, ?)").run(new Date().toISOString());
     }
   }
 
@@ -1211,42 +1267,101 @@ export class BridgeStore {
     turnId?: string | null;
     generation?: number;
     armed: boolean;
-    deliveryMode?: "in_turn" | "cli_resume" | "none";
+    deliveryMode?: "in_turn" | "cli_resume" | "queued" | "none";
     state: "armed" | "waking" | "woken" | "idle" | "cancelled";
     reason?: string | null;
     goalId?: string | null;
     pausedByBridge?: boolean;
     mcpSessionId?: string | null;
+    predicateType?: ParkPredicateType;
+    quorumCount?: number | null;
+    requiredJobIds?: string[] | null;
+    wakeOnException?: boolean;
   }): ParkBarrierRecord {
     const id = input.id ?? newId("park");
     const existing = this.getParkBarrier(id);
     const now = new Date().toISOString();
     const deliveryMode = input.deliveryMode ?? (existing ? existing.deliveryMode : "none");
     const mcpSessionId = input.mcpSessionId !== undefined ? input.mcpSessionId : (existing ? existing.mcpSessionId : null);
+    const predicateType = input.predicateType ?? (existing ? existing.predicateType : "ALL");
+    const quorumCount = input.quorumCount !== undefined ? input.quorumCount : (existing ? existing.quorumCount : null);
+    const requiredJobIds = input.requiredJobIds !== undefined
+      ? (input.requiredJobIds ? JSON.stringify(input.requiredJobIds) : null)
+      : (existing && existing.requiredJobIds ? JSON.stringify(existing.requiredJobIds) : null);
+    const wakeOnException = input.wakeOnException !== undefined
+      ? (input.wakeOnException ? 1 : 0)
+      : (existing ? (existing.wakeOnException ? 1 : 0) : 1);
+
     if (existing) {
       const generation = input.generation ?? (existing.generation + 1);
-      this.db.prepare(`
-        UPDATE park_barriers
-        SET thread_id = ?, turn_id = ?, generation = ?, armed = ?, delivery_mode = ?, state = ?, reason = ?, goal_id = ?, paused_by_bridge = ?, mcp_session_id = ?, updated_at = ?
-        WHERE id = ?
-      `).run(
-        input.threadId,
-        input.turnId !== undefined ? input.turnId : existing.turnId,
-        generation,
-        input.armed ? 1 : 0,
-        deliveryMode,
-        input.state,
-        input.reason !== undefined ? input.reason : existing.reason,
-        input.goalId !== undefined ? input.goalId : existing.goalId,
-        input.pausedByBridge !== undefined ? (input.pausedByBridge ? 1 : 0) : (existing.pausedByBridge ? 1 : 0),
-        mcpSessionId,
-        now,
-        id,
-      );
+      const advances = generation > existing.generation;
+      if (advances) {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          this.db.prepare(`
+            UPDATE park_barriers
+            SET thread_id = ?, turn_id = ?, generation = ?, armed = ?, delivery_mode = ?, state = ?, reason = ?, goal_id = ?, paused_by_bridge = ?, mcp_session_id = ?, predicate_type = ?, quorum_count = ?, required_job_ids = ?, wake_on_exception = ?, updated_at = ?
+            WHERE id = ?
+          `).run(
+            input.threadId,
+            input.turnId !== undefined ? input.turnId : existing.turnId,
+            generation,
+            input.armed ? 1 : 0,
+            deliveryMode,
+            input.state,
+            input.reason !== undefined ? input.reason : existing.reason,
+            input.goalId !== undefined ? input.goalId : existing.goalId,
+            input.pausedByBridge !== undefined ? (input.pausedByBridge ? 1 : 0) : (existing.pausedByBridge ? 1 : 0),
+            mcpSessionId,
+            predicateType,
+            quorumCount,
+            requiredJobIds,
+            wakeOnException,
+            now,
+            id,
+          );
+          this.db.prepare(`
+            UPDATE wake_outbox
+            SET status = 'superseded',
+                wake_state = 'superseded',
+                last_error = COALESCE(last_error, 'Superseded by barrier generation ' || ?)
+            WHERE park_id = ?
+              AND generation < ?
+              AND status IN ('pending', 'waking', 'deferred_active_writer')
+          `).run(generation, id, generation);
+          this.db.exec("COMMIT");
+        } catch (error) {
+          this.db.exec("ROLLBACK");
+          throw error;
+        }
+      } else {
+        this.db.prepare(`
+          UPDATE park_barriers
+          SET thread_id = ?, turn_id = ?, generation = ?, armed = ?, delivery_mode = ?, state = ?, reason = ?, goal_id = ?, paused_by_bridge = ?, mcp_session_id = ?, predicate_type = ?, quorum_count = ?, required_job_ids = ?, wake_on_exception = ?, updated_at = ?
+          WHERE id = ?
+        `).run(
+          input.threadId,
+          input.turnId !== undefined ? input.turnId : existing.turnId,
+          generation,
+          input.armed ? 1 : 0,
+          deliveryMode,
+          input.state,
+          input.reason !== undefined ? input.reason : existing.reason,
+          input.goalId !== undefined ? input.goalId : existing.goalId,
+          input.pausedByBridge !== undefined ? (input.pausedByBridge ? 1 : 0) : (existing.pausedByBridge ? 1 : 0),
+          mcpSessionId,
+          predicateType,
+          quorumCount,
+          requiredJobIds,
+          wakeOnException,
+          now,
+          id,
+        );
+      }
     } else {
       this.db.prepare(`
-        INSERT INTO park_barriers (id, thread_id, turn_id, generation, armed, delivery_mode, state, reason, goal_id, paused_by_bridge, mcp_session_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO park_barriers (id, thread_id, turn_id, generation, armed, delivery_mode, state, reason, goal_id, paused_by_bridge, mcp_session_id, predicate_type, quorum_count, required_job_ids, wake_on_exception, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         input.threadId,
@@ -1259,6 +1374,10 @@ export class BridgeStore {
         input.goalId ?? null,
         input.pausedByBridge ? 1 : 0,
         mcpSessionId,
+        predicateType,
+        quorumCount,
+        requiredJobIds,
+        wakeOnException,
         now,
         now,
       );
@@ -1298,6 +1417,13 @@ export class BridgeStore {
     return rows.map((r) => this.toParkBarrier(r));
   }
 
+  listArmedBarriers(): ParkBarrierRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM park_barriers WHERE state = 'armed' AND armed = 1",
+    ).all() as Row[];
+    return rows.map((r) => this.toParkBarrier(r));
+  }
+
   claimParkWake(parkId: string, generation: number): boolean {
     const now = new Date().toISOString();
     const info = this.db.prepare(
@@ -1313,28 +1439,62 @@ export class BridgeStore {
     ).run(now, parkId, generation);
   }
 
+  setParkArmed(parkId: string, generation: number): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      "UPDATE park_barriers SET state = 'armed', armed = 1, updated_at = ? WHERE id = ? AND generation = ?",
+    ).run(now, parkId, generation);
+  }
+
+  claimWakeOutbox(id: string): boolean;
+  claimWakeOutbox(parkId: string, generation: number): boolean;
+  claimWakeOutbox(idOrParkId: string, generation?: number): boolean {
+    const sql = generation !== undefined
+      ? `UPDATE wake_outbox
+         SET status = 'waking', attempts = attempts + 1
+         WHERE park_id = ?
+           AND generation = ?
+           AND status IN ('pending', 'deferred_active_writer')
+           AND generation = (SELECT pb.generation FROM park_barriers pb WHERE pb.id = wake_outbox.park_id)`
+      : `UPDATE wake_outbox
+         SET status = 'waking', attempts = attempts + 1
+         WHERE id = ?
+           AND status IN ('pending', 'deferred_active_writer')
+           AND generation = (SELECT pb.generation FROM park_barriers pb WHERE pb.id = wake_outbox.park_id)`;
+    const info = generation !== undefined
+      ? this.db.prepare(sql).run(idOrParkId, generation)
+      : this.db.prepare(sql).run(idOrParkId);
+    return Number(info.changes) === 1;
+  }
+
   createWakeOutbox(record: {
     id: string;
     parkId: string;
     generation: number;
     threadId: string;
     turnId?: string | null;
-    deliveryMode?: "in_turn" | "cli_resume" | "none";
-    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed";
-    wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+    deliveryMode?: "in_turn" | "cli_resume" | "queued" | "none";
+    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed" | "superseded";
+    wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed" | "superseded";
     wakeMarker: string;
     reason?: string | null;
     payloadJson: string;
     nextAttemptAt?: string | null;
     selectedExecutable?: string | null;
     executableVersion?: string | null;
+    messageId?: string | null;
   }): WakeOutboxRecord {
     const now = new Date().toISOString();
     const deliveryMode = record.deliveryMode ?? "cli_resume";
-    const wakeState = record.wakeState ?? (record.status === "delivered" ? "delivered" : (record.status === "deferred_active_writer" ? "deferred_active_writer" : "waiting"));
+    const wakeState = record.wakeState ?? (
+      record.status === "delivered" ? "delivered" :
+      record.status === "deferred_active_writer" ? "deferred_active_writer" :
+      record.status === "superseded" ? "superseded" :
+      "waiting"
+    );
     this.db.prepare(`
-      INSERT INTO wake_outbox (id, park_id, generation, thread_id, turn_id, delivery_mode, status, wake_state, wake_marker, reason, payload_json, attempts, next_attempt_at, selected_executable, executable_version, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+      INSERT INTO wake_outbox (id, park_id, generation, thread_id, turn_id, delivery_mode, status, wake_state, wake_marker, reason, payload_json, attempts, next_attempt_at, selected_executable, executable_version, message_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
       ON CONFLICT(park_id, generation) DO NOTHING
     `).run(
       record.id,
@@ -1351,6 +1511,7 @@ export class BridgeStore {
       record.nextAttemptAt ?? null,
       record.selectedExecutable ?? null,
       record.executableVersion ?? null,
+      record.messageId ?? null,
       now,
     );
     const result = this.getWakeOutbox(record.parkId, record.generation);
@@ -1370,32 +1531,40 @@ export class BridgeStore {
 
   updateWakeOutboxStatus(
     id: string,
-    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed",
+    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed" | "superseded",
     error?: string | null,
     extra?: {
-      wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+      wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed" | "superseded";
       nextAttemptAt?: string | null;
       selectedExecutable?: string | null;
       executableVersion?: string | null;
+      deliveryMode?: "in_turn" | "cli_resume" | "queued" | "none";
+      messageId?: string | null;
     },
   ): void {
     const now = new Date().toISOString();
-    const wakeState = extra?.wakeState ?? (status === "delivered" ? "delivered" : (status === "deferred_active_writer" ? "deferred_active_writer" : (status === "failed" ? "failed" : "waiting")));
+    const wakeState = extra?.wakeState ?? (
+      status === "delivered" ? "delivered" :
+      status === "deferred_active_writer" ? "deferred_active_writer" :
+      status === "failed" ? "failed" :
+      status === "superseded" ? "superseded" :
+      "waiting"
+    );
     this.db.prepare(`
       UPDATE wake_outbox
       SET status = ?,
           wake_state = ?,
-          attempts = CASE WHEN ? = 'waking' THEN attempts ELSE attempts + 1 END,
           woken_at = CASE WHEN ? = 'delivered' THEN ? ELSE woken_at END,
           last_error = ?,
           next_attempt_at = CASE WHEN ? IS NOT NULL THEN ? ELSE next_attempt_at END,
           selected_executable = CASE WHEN ? IS NOT NULL THEN ? ELSE selected_executable END,
-          executable_version = CASE WHEN ? IS NOT NULL THEN ? ELSE executable_version END
-      WHERE id = ?
+          executable_version = CASE WHEN ? IS NOT NULL THEN ? ELSE executable_version END,
+          delivery_mode = CASE WHEN ? IS NOT NULL THEN ? ELSE delivery_mode END,
+          message_id = CASE WHEN ? IS NOT NULL THEN ? ELSE message_id END
+      WHERE id = ? AND status != 'delivered'
     `).run(
       status,
       wakeState,
-      status,
       status,
       now,
       error ?? null,
@@ -1405,14 +1574,22 @@ export class BridgeStore {
       extra?.selectedExecutable ?? null,
       extra?.executableVersion ?? null,
       extra?.executableVersion ?? null,
+      extra?.deliveryMode ?? null,
+      extra?.deliveryMode ?? null,
+      extra?.messageId ?? null,
+      extra?.messageId ?? null,
       id,
     );
   }
 
   listPendingWakeOutbox(): WakeOutboxRecord[] {
-    const rows = this.db.prepare(
-      "SELECT * FROM wake_outbox WHERE status IN ('pending', 'waking', 'deferred_active_writer') ORDER BY created_at ASC",
-    ).all() as Row[];
+    const rows = this.db.prepare(`
+      SELECT w.* FROM wake_outbox w
+      JOIN park_barriers p ON p.id = w.park_id
+      WHERE w.status IN ('pending', 'deferred_active_writer', 'waking')
+        AND w.generation = p.generation
+      ORDER BY w.created_at ASC
+    `).all() as Row[];
     return rows.map((r) => this.toWakeOutbox(r));
   }
 
@@ -1448,6 +1625,10 @@ export class BridgeStore {
       goalId: nullableString(row, "goal_id"),
       pausedByBridge: numberValue(row, "paused_by_bridge") === 1,
       mcpSessionId: nullableString(row, "mcp_session_id"),
+      predicateType: (stringValue(row, "predicate_type") as ParkPredicateType) || "ALL",
+      quorumCount: row.quorum_count !== null && row.quorum_count !== undefined ? numberValue(row, "quorum_count") : null,
+      requiredJobIds: row.required_job_ids ? JSON.parse(stringValue(row, "required_job_ids")) : null,
+      wakeOnException: row.wake_on_exception !== null && row.wake_on_exception !== undefined ? numberValue(row, "wake_on_exception") === 1 : true,
       createdAt: stringValue(row, "created_at"),
       updatedAt: stringValue(row, "updated_at"),
     };
@@ -1470,6 +1651,7 @@ export class BridgeStore {
       nextAttemptAt: nullableString(row, "next_attempt_at"),
       selectedExecutable: nullableString(row, "selected_executable"),
       executableVersion: nullableString(row, "executable_version"),
+      messageId: nullableString(row, "message_id"),
       createdAt: stringValue(row, "created_at"),
       wokenAt: nullableString(row, "woken_at"),
       lastError: nullableString(row, "last_error"),

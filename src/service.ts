@@ -14,6 +14,7 @@ import {
   UnavailableCodexDeliveryAdapter,
 } from "./codex/adapter.js";
 import { DefaultCodexCliTransport, type CodexCliTransport } from "./codex/cli-resolver.js";
+import { TranscriptAttestor } from "./codex/transcript-attestor.js";
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
@@ -47,6 +48,7 @@ import type {
   OpenCodeMessage,
   ParkBarrierRecord,
   ParkInput,
+  ParkPredicateType,
   ParkReceipt,
   ProgressActivity,
   ProgressSnapshot,
@@ -79,6 +81,8 @@ export interface ServiceDependencies {
   cliTransport?: CodexCliTransport;
   inbox?: InboxDelivery;
   antigravity?: AntigravityProviderLike;
+  transcriptAttestor?: TranscriptAttestor;
+  sessionsDir?: string;
 }
 
 export interface OpenCodeManagerLike {
@@ -250,6 +254,7 @@ export class BridgeService {
   private readonly inbox: InboxDelivery;
   private readonly antigravity: AntigravityProviderLike;
   private readonly cliTransport: CodexCliTransport;
+  private readonly transcriptAttestor: TranscriptAttestor;
   private codex: CodexDeliveryAdapter;
   private managed: ManagedOpenCodeLike | null = null;
   private client: OpenCodeClientLike | null = null;
@@ -314,6 +319,7 @@ export class BridgeService {
       dataDir: config.dataDir,
       timeoutMs: this.effectiveWorkerTimeoutMs(),
     });
+    this.transcriptAttestor = dependencies.transcriptAttestor ?? new TranscriptAttestor({ sessionsDir: dependencies.sessionsDir });
   }
 
   isReady(): boolean {
@@ -814,6 +820,15 @@ export class BridgeService {
 
   async park(input: ParkInput, isAlias = false, signal?: AbortSignal): Promise<ParkReceipt> {
     this.requireRunning();
+
+    if (input.wait === true) {
+      const nextAction = isAlias ? "deepseek_follow" : "subagents_follow";
+      throw new InvalidRequestError(
+        `wait=true is no longer supported for park. Use ${nextAction} for same-run in-turn waiting, or omit wait for external park_and_wake.`,
+        "invalid_request",
+      );
+    }
+
     const rawJobIds = input.job_ids ?? input.jobIds;
     const jobIds = Array.isArray(rawJobIds)
       ? rawJobIds.filter((j): j is string => typeof j === "string" && j.length > 0)
@@ -822,6 +837,37 @@ export class BridgeService {
     if (jobIds.length === 0) {
       throw new InvalidRequestError("job_ids must contain at least one job id", "invalid_request");
     }
+
+    const rawPred = (input.predicate ?? input.predicate_type ?? input.predicateType ?? "ALL").toUpperCase();
+    if (!["ALL", "ANY", "QUORUM", "REQUIRED"].includes(rawPred)) {
+      throw new InvalidRequestError(`Invalid predicate "${rawPred}". Supported predicates: ALL, ANY, QUORUM, REQUIRED.`, "invalid_request");
+    }
+    const predicateType = rawPred as ParkPredicateType;
+    let quorumCount: number | null = null;
+    if (predicateType === "QUORUM") {
+      const k = input.quorum_count ?? input.quorumCount;
+      if (typeof k !== "number" || !Number.isInteger(k) || k < 1 || k > jobIds.length) {
+        throw new InvalidRequestError(`QUORUM predicate requires quorum_count between 1 and ${jobIds.length}, received ${k}`, "invalid_request");
+      }
+      quorumCount = k;
+    }
+    let requiredJobIds: string[] | null = null;
+    if (predicateType === "REQUIRED") {
+      const req = input.required_job_ids ?? input.requiredJobIds;
+      if (!Array.isArray(req) || req.length === 0) {
+        throw new InvalidRequestError(`REQUIRED predicate requires a non-empty required_job_ids array`, "invalid_request");
+      }
+      const jobSet = new Set(jobIds);
+      for (const rId of req) {
+        if (typeof rId !== "string" || !jobSet.has(rId)) {
+          throw new InvalidRequestError(`REQUIRED job_id "${rId}" is not among the parked jobs`, "invalid_request");
+        }
+      }
+      requiredJobIds = req;
+    }
+    const wakeOnException = input.wake_on_exception !== undefined
+      ? Boolean(input.wake_on_exception)
+      : (input.wakeOnException !== undefined ? Boolean(input.wakeOnException) : true);
 
     const jobs: JobRecord[] = [];
     for (const id of jobIds) {
@@ -847,8 +893,26 @@ export class BridgeService {
         }
       }
 
-      const binding = this.store.getBinding(job.id);
-      const threadId = binding?.threadId ?? job.trustedThreadId;
+      let binding = this.store.getBinding(job.id);
+      if (!binding && this.transcriptAttestor) {
+        const match = await this.transcriptAttestor.attestJob(job.id, {
+          callerHint: {
+            threadId: job.hintThreadId ?? job.trustedThreadId ?? undefined,
+            turnId: job.hintTurnId ?? undefined,
+          },
+          jobCreatedAt: job.createdAt,
+        });
+        if (match) {
+          binding = this.store.bindJob({
+            jobId: job.id,
+            threadId: match.threadId,
+            originatingTurnId: match.turnId,
+            originatingItemId: match.itemId,
+          });
+        }
+      }
+
+      const threadId = binding?.threadId ?? job.trustedThreadId ?? null;
       const turnId = binding?.originatingTurnId ?? null;
       if (!threadId) {
         allCorrelated = false;
@@ -894,41 +958,21 @@ export class BridgeService {
       );
     }
 
-    const wait = Boolean(input.wait);
-
-    // In-turn arming: every selected job must have the same non-null MCP session id matching the current caller session.
-    // Missing session provenance must fail closed.
-    const hasValidSessionProvenance =
-      Boolean(callerMcpSession) &&
-      jobs.length > 0 &&
-      jobs.every((job) => Boolean(job.mcpSessionId && job.mcpSessionId === callerMcpSession));
-    const inTurnArmed = wait && hasValidSessionProvenance;
-
-    // External-wake arming: requires authoritative trusted thread id and compatible CLI capability (or authoritative App Server attachment).
-    // On wait: true in-turn park, do not probe real CLI candidates—keep the loaded path event-driven and fast, with external eligibility handled safely/lazily.
     const hasAuthoritativeAttachment = this.codex.capabilities?.authoritativeAttachment === true;
-    let externalArmed = false;
-    if (!wait) {
-      let cliCompatible = false;
-      if (!hasAuthoritativeAttachment && allCorrelated && commonThreadId !== null && this.cliTransport) {
-        try {
-          const probe = await this.cliTransport.probeCapabilities(
-            this.config.codexAppServerCommand || undefined,
-          );
-          cliCompatible = probe.compatible;
-        } catch {
-          cliCompatible = false;
-        }
+    let cliCompatible = false;
+    if (!hasAuthoritativeAttachment && allCorrelated && commonThreadId !== null && this.cliTransport) {
+      try {
+        const probe = await this.cliTransport.probeCapabilities(
+          this.config.codexAppServerCommand || undefined,
+        );
+        cliCompatible = probe.compatible;
+      } catch {
+        cliCompatible = false;
       }
-      externalArmed = allCorrelated && commonThreadId !== null && (hasAuthoritativeAttachment || cliCompatible);
-    } else {
-      externalArmed = allCorrelated && commonThreadId !== null && hasAuthoritativeAttachment;
     }
 
-    const armed = wait ? inTurnArmed : externalArmed;
-    const deliveryMode: "in_turn" | "cli_resume" | "none" = wait
-      ? (inTurnArmed ? "in_turn" : "none")
-      : (externalArmed ? "cli_resume" : "none");
+    const armed = allCorrelated && commonThreadId !== null && (hasAuthoritativeAttachment || cliCompatible);
+    const deliveryMode: "cli_resume" | "none" = armed ? "cli_resume" : "none";
 
     let parkId = input.park_id ?? input.parkId;
     let existingBarrier = parkId ? this.store.getParkBarrier(parkId) : null;
@@ -944,6 +988,20 @@ export class BridgeService {
     const generation = existingBarrier ? existingBarrier.generation + 1 : 1;
     const targetIdentity = commonThreadId ?? "unbound";
 
+    if (existingBarrier) {
+      const prevOutbox = this.store.getWakeOutbox(existingBarrier.id, existingBarrier.generation);
+      if (prevOutbox && ["pending", "deferred_active_writer", "waking"].includes(prevOutbox.status)) {
+        (this.store as any).updateWakeOutboxStatus(prevOutbox.id, "superseded", `Superseded by barrier generation ${generation}`, {
+          wakeState: "failed",
+        });
+        const timer = this.wakeRetryTimers.get(prevOutbox.id);
+        if (timer) {
+          clearTimeout(timer);
+          this.wakeRetryTimers.delete(prevOutbox.id);
+        }
+      }
+    }
+
     const barrier = this.store.createOrUpdateParkBarrier({
       id: parkId,
       threadId: targetIdentity,
@@ -955,6 +1013,10 @@ export class BridgeService {
       reason: input.reason ?? null,
       goalId: input.goal_id ?? input.goalId ?? null,
       mcpSessionId: input.mcp_session_id ?? input.mcpSessionId ?? null,
+      predicateType,
+      quorumCount,
+      requiredJobIds,
+      wakeOnException,
     });
 
     this.store.setParkJobs(barrier.id, jobIds);
@@ -976,89 +1038,7 @@ export class BridgeService {
     const pendingCount = jobs.length - readyCount;
     const nextAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
 
-    if (wait && inTurnArmed) {
-      if (readyCount > 0) {
-        this.store.claimParkWake(barrier.id, barrier.generation);
-        this.store.setParkWoken(barrier.id, barrier.generation);
-
-        const statuses: Record<string, string> = {};
-        const resultHashes: Record<string, string> = {};
-        for (const rj of readyJobs) {
-          statuses[rj.id] = rj.status;
-          if (rj.resultPath) {
-            try {
-              const content = await readFile(rj.resultPath, "utf8");
-              resultHashes[rj.id] = createHash("sha256").update(content).digest("hex").slice(0, 16);
-            } catch {
-              resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
-            }
-          } else {
-            resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
-          }
-        }
-
-        return {
-          parkId: barrier.id,
-          generation: barrier.generation,
-          armed,
-          targetIdentity,
-          deliveryMode: "in_turn",
-          wakeState: "delivered",
-          obligationState: "pending",
-          nextAction,
-          nextRequiredAction: nextAction,
-          jobIds,
-          readyJobIds,
-          statuses,
-          resultHashes,
-          reason: input.reason ?? null,
-          pendingCount,
-          readyCount,
-        };
-      }
-
-      if (signal?.aborted) {
-        throw new Error("Park operation aborted by caller");
-      }
-
-      return new Promise<ParkReceipt>((resolve, reject) => {
-        let cleanupSignal: (() => void) | undefined;
-        if (signal) {
-          const onAbort = async () => {
-            this.parkWaiters.delete(barrier.id);
-            let canExternal = externalArmed;
-            if (!canExternal && allCorrelated && commonThreadId !== null && this.cliTransport) {
-              try {
-                const probe = await this.cliTransport.probeCapabilities(
-                  this.config.codexAppServerCommand || undefined,
-                );
-                canExternal = probe.compatible;
-              } catch {
-                canExternal = false;
-              }
-            }
-            if (!canExternal) {
-              this.store.setParkWoken(barrier.id, barrier.generation);
-            }
-            reject(new Error("Park operation aborted by caller"));
-          };
-          signal.addEventListener("abort", onAbort, { once: true });
-          cleanupSignal = () => signal.removeEventListener("abort", onAbort);
-        }
-        this.parkWaiters.set(barrier.id, {
-          parkId: barrier.id,
-          generation: barrier.generation,
-          jobIds: new Set(jobIds),
-          isAlias,
-          resolve,
-          reject,
-          ...(signal !== undefined ? { signal } : {}),
-          ...(cleanupSignal !== undefined ? { cleanupSignal } : {}),
-        });
-      });
-    }
-
-    if (armed && readyCount > 0) {
+    if (armed) {
       await this.evaluateParkWakesForBarrier(barrier).catch((err) => {
         this.lastStreamError = redactSecrets(String(err));
       });
@@ -1079,6 +1059,9 @@ export class BridgeService {
       reason: input.reason ?? null,
       pendingCount,
       readyCount,
+      predicateType,
+      quorumCount,
+      requiredJobIds,
     };
   }
 
@@ -1086,10 +1069,10 @@ export class BridgeService {
     if (job.status === "needs_approval") {
       return true;
     }
-    if (["completed", "completed_partial", "timed_out"].includes(job.status)) {
+    if (["completed", "completed_partial", "delivered", "delivery_pending"].includes(job.status)) {
       return job.resultPath !== null;
     }
-    if (["failed", "aborted"].includes(job.status)) {
+    if (["failed", "aborted", "timed_out"].includes(job.status)) {
       return true;
     }
     return false;
@@ -1105,67 +1088,91 @@ export class BridgeService {
   }
 
   private async evaluateParkWakesForBarrier(barrier: ParkBarrierRecord): Promise<void> {
-    const waiter = this.parkWaiters.get(barrier.id);
-    if (waiter && waiter.generation === barrier.generation) {
-      const claimed = this.store.claimParkWake(barrier.id, barrier.generation);
-      if (!claimed) return;
+    if (!barrier.armed) return;
 
-      this.parkWaiters.delete(barrier.id);
-      waiter.cleanupSignal?.();
-      this.store.setParkWoken(barrier.id, barrier.generation);
+    const jobIds = this.store.getParkBarrierJobs(barrier.id);
+    const jobs = jobIds.map((id) => this.store.getJob(id)).filter((j): j is JobRecord => j !== null);
+    if (jobs.length === 0) return;
 
-      const jobIds = this.store.getParkBarrierJobs(barrier.id);
-      const jobs = jobIds.map((id) => this.store.getJob(id)).filter((j): j is JobRecord => j !== null);
-      const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
-      const readyJobIds = readyJobs.map((j) => j.id);
-      const pendingCount = jobs.length - readyJobIds.length;
+    const isSuccessfulTerminal = (j: JobRecord) =>
+      ["completed", "completed_partial", "delivered", "delivery_pending"].includes(j.status) && j.resultPath !== null;
 
-      const statuses: Record<string, string> = {};
-      const resultHashes: Record<string, string> = {};
-      for (const rj of readyJobs) {
-        statuses[rj.id] = rj.status;
-        if (rj.resultPath) {
-          try {
-            const content = await readFile(rj.resultPath, "utf8");
-            resultHashes[rj.id] = createHash("sha256").update(content).digest("hex").slice(0, 16);
-          } catch {
-            resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
+    const isException = (j: JobRecord) =>
+      ["needs_approval", "failed", "aborted", "timed_out"].includes(j.status);
+
+    const isTerminal = (j: JobRecord) =>
+      ["completed", "completed_partial", "delivered", "delivery_pending", "failed", "aborted", "timed_out"].includes(j.status);
+
+    const successfulJobs = jobs.filter(isSuccessfulTerminal);
+    const successfulSet = new Set(successfulJobs.map((j) => j.id));
+    const successfulCount = successfulJobs.length;
+
+    // Check exception wake: by default (wakeOnException !== false), approval/failure wake immediately
+    const hasException = barrier.wakeOnException !== false && jobs.some(isException);
+
+    let satisfied = hasException;
+
+    const pred = barrier.predicateType ?? "ALL";
+    if (!satisfied) {
+      if (pred === "ALL") {
+        satisfied = successfulCount === jobs.length && jobs.length > 0;
+      } else if (pred === "ANY") {
+        satisfied = successfulCount >= 1;
+      } else if (pred === "QUORUM") {
+        const quorum = barrier.quorumCount ?? jobs.length;
+        satisfied = successfulCount >= quorum;
+      } else if (pred === "REQUIRED") {
+        const required = barrier.requiredJobIds ?? [];
+        satisfied = required.length > 0 && required.every((id) => successfulSet.has(id));
+      }
+    }
+
+    // If configured otherwise (wakeOnException === false), wake when quorum becomes impossible or all jobs are terminal so no deadlock
+    if (!satisfied && barrier.wakeOnException === false) {
+      const allTerminal = jobs.every(isTerminal);
+      if (allTerminal) {
+        satisfied = true;
+      } else {
+        const potentiallySuccessful = jobs.filter((j) => !isTerminal(j) || isSuccessfulTerminal(j)).length;
+        if (pred === "QUORUM") {
+          const quorum = barrier.quorumCount ?? jobs.length;
+          if (potentiallySuccessful < quorum) {
+            satisfied = true;
           }
-        } else {
-          resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+        } else if (pred === "ALL") {
+          const hasUnsuccessfulTerminal = jobs.some((j) => isTerminal(j) && !isSuccessfulTerminal(j));
+          if (hasUnsuccessfulTerminal) {
+            satisfied = true;
+          }
+        } else if (pred === "REQUIRED") {
+          const required = barrier.requiredJobIds ?? [];
+          const requiredFailed = required.some((reqId) => {
+            const j = jobs.find((job) => job.id === reqId);
+            return j && isTerminal(j) && !isSuccessfulTerminal(j);
+          });
+          if (requiredFailed) {
+            satisfied = true;
+          }
         }
       }
+    }
 
-      waiter.resolve({
-        parkId: barrier.id,
-        generation: barrier.generation,
-        armed: barrier.armed,
-        targetIdentity: barrier.threadId,
-        deliveryMode: "in_turn",
-        wakeState: "delivered",
-        obligationState: "pending",
-        nextAction: waiter.isAlias ? "deepseek_follow" : "subagents_follow",
-        nextRequiredAction: waiter.isAlias ? "deepseek_follow" : "subagents_follow",
-        jobIds,
-        readyJobIds,
-        statuses,
-        resultHashes,
-        reason: barrier.reason,
-        pendingCount,
-        readyCount: readyJobIds.length,
-      });
+    if (!satisfied) {
+      return;
+    }
+
+    const existingOutbox = this.store.getWakeOutbox(barrier.id, barrier.generation);
+    if (existingOutbox && (existingOutbox.status === "pending" || existingOutbox.status === "deferred_active_writer" || existingOutbox.status === "waking" || existingOutbox.status === "delivered")) {
       return;
     }
 
     const claimed = this.store.claimParkWake(barrier.id, barrier.generation);
     if (!claimed) return;
 
-    const jobIds = this.store.getParkBarrierJobs(barrier.id);
-    const jobs = jobIds.map((id) => this.store.getJob(id)).filter((j): j is JobRecord => j !== null);
-
     const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
     const readyJobIds = readyJobs.map((j) => j.id);
-    const pendingCount = jobs.length - readyJobIds.length;
+    const readyCount = readyJobs.length;
+    const pendingCount = jobs.length - readyCount;
 
     const statuses: Record<string, string> = {};
     const resultHashes: Record<string, string> = {};
@@ -1216,36 +1223,67 @@ export class BridgeService {
   }
 
   private async dispatchWakeOutbox(outbox: WakeOutboxRecord, envelope: WakeEnvelope): Promise<void> {
-    if (outbox.nextAttemptAt && Date.now() < new Date(outbox.nextAttemptAt).getTime()) {
+    if ((outbox as any).status === "superseded") {
+      return;
+    }
+    // Fence against current park generation/state and stale outbox
+    const barrier = this.store.getParkBarrier(outbox.parkId);
+    if (!barrier || barrier.generation !== outbox.generation || barrier.state === "woken" || barrier.state === "idle" || barrier.state === "cancelled") {
+      if (barrier && barrier.generation > outbox.generation && (outbox as any).status !== "superseded") {
+        (this.store as any).updateWakeOutboxStatus(outbox.id, "superseded", `Superseded by barrier generation ${barrier.generation}`, {
+          wakeState: "failed",
+        });
+      }
+      return;
+    }
+
+    // Must deliver only after winning the atomic SQLite CAS claim
+    const wonClaim = this.store.claimWakeOutbox(outbox.id);
+    if (!wonClaim) {
+      return;
+    }
+
+    if (barrier.state === "armed") {
+      this.store.claimParkWake(barrier.id, barrier.generation);
+    }
+
+    const currentOutbox = this.store.getWakeOutboxById(outbox.id) ?? outbox;
+    if ((currentOutbox as any).status === "superseded") {
       return;
     }
 
     const binding: CodexBinding = {
       jobId: envelope.jobIds[0] ?? "unbound",
-      threadId: outbox.threadId,
-      originatingTurnId: outbox.turnId,
+      threadId: currentOutbox.threadId,
+      originatingTurnId: currentOutbox.turnId,
       originatingItemId: null,
-      boundAt: outbox.createdAt,
+      boundAt: currentOutbox.createdAt,
     };
 
     try {
-      this.store.updateWakeOutboxStatus(outbox.id, "waking");
-
       if (this.codex.capabilities?.authoritativeAttachment === true) {
         await this.codex.deliverWake(envelope, binding);
-        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
-        this.store.setParkWoken(outbox.parkId, outbox.generation);
+        (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "delivered", null, {
+          wakeState: "delivered",
+          deliveryMode: "in_turn",
+        });
+        this.store.setParkWoken(currentOutbox.parkId, currentOutbox.generation);
       } else {
-        const cliResult = await this.cliTransport.deliverWake(outbox.threadId, outbox.wakeMarker);
+        const cliResult = await this.cliTransport.deliverWake(currentOutbox.threadId, currentOutbox.wakeMarker);
         if (cliResult.success) {
-          this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, {
+          const deliveryMode = (cliResult as any).deliveryMode ?? "cli_resume";
+          const messageId = (cliResult as any).messageId ?? null;
+          (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "delivered", null, {
             wakeState: "delivered",
+            deliveryMode,
+            messageId,
             selectedExecutable: cliResult.executablePath ?? null,
             executableVersion: cliResult.version ?? null,
+            nextAttemptAt: null,
           });
-          this.store.setParkWoken(outbox.parkId, outbox.generation);
+          this.store.setParkWoken(currentOutbox.parkId, currentOutbox.generation);
         } else if (cliResult.activeWriter) {
-          const attempts = outbox.attempts + 1;
+          const attempts = currentOutbox.attempts;
           const baseDelayMs = 2000;
           const maxDelayMs = 300_000;
           const backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempts - 1));
@@ -1253,16 +1291,19 @@ export class BridgeService {
           const totalDelay = backoffMs + jitterMs;
           const nextAttemptAt = new Date(Date.now() + totalDelay).toISOString();
 
-          this.store.updateWakeOutboxStatus(outbox.id, "deferred_active_writer", cliResult.error ?? "Active writer conflict", {
+          (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "deferred_active_writer", cliResult.error ?? "Active writer conflict", {
             wakeState: "deferred_active_writer",
+            deliveryMode: (cliResult as any).deliveryMode ?? currentOutbox.deliveryMode,
             nextAttemptAt,
             selectedExecutable: cliResult.executablePath ?? null,
             executableVersion: cliResult.version ?? null,
           });
-          this.scheduleWakeRetry(outbox.id, totalDelay);
+          this.store.setParkArmed(currentOutbox.parkId, currentOutbox.generation);
+          this.scheduleWakeRetry(currentOutbox.id, totalDelay);
         } else {
-          this.store.updateWakeOutboxStatus(outbox.id, "failed", cliResult.error ?? "CLI wake delivery failed", {
+          (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "failed", cliResult.error ?? "CLI wake delivery failed", {
             wakeState: "failed",
+            deliveryMode: (cliResult as any).deliveryMode ?? currentOutbox.deliveryMode,
             selectedExecutable: cliResult.executablePath ?? null,
             executableVersion: cliResult.version ?? null,
           });
@@ -1275,7 +1316,7 @@ export class BridgeService {
         message.toLowerCase().includes("thread-store conflict");
 
       if (isActiveWriter) {
-        const attempts = outbox.attempts + 1;
+        const attempts = currentOutbox.attempts;
         const baseDelayMs = 2000;
         const maxDelayMs = 300_000;
         const backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempts - 1));
@@ -1283,20 +1324,22 @@ export class BridgeService {
         const totalDelay = backoffMs + jitterMs;
         const nextAttemptAt = new Date(Date.now() + totalDelay).toISOString();
 
-        this.store.updateWakeOutboxStatus(outbox.id, "deferred_active_writer", message, {
+        (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "deferred_active_writer", message, {
           wakeState: "deferred_active_writer",
+          deliveryMode: currentOutbox.deliveryMode,
           nextAttemptAt,
         });
-        this.scheduleWakeRetry(outbox.id, totalDelay);
+        this.store.setParkArmed(currentOutbox.parkId, currentOutbox.generation);
+        this.scheduleWakeRetry(currentOutbox.id, totalDelay);
         return;
       }
 
-      const reconciled = await this.codex.reconcileSend(outbox.threadId, outbox.wakeMarker).catch(() => false);
+      const reconciled = await this.codex.reconcileSend(currentOutbox.threadId, currentOutbox.wakeMarker).catch(() => false);
       if (reconciled) {
-        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
-        this.store.setParkWoken(outbox.parkId, outbox.generation);
+        (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "delivered", null, { wakeState: "delivered" });
+        this.store.setParkWoken(currentOutbox.parkId, currentOutbox.generation);
       } else {
-        this.store.updateWakeOutboxStatus(outbox.id, "failed", message, { wakeState: "failed" });
+        (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "failed", message, { wakeState: "failed" });
       }
     }
   }
@@ -1319,28 +1362,124 @@ export class BridgeService {
   }
 
   private async recoverWakeOutbox(): Promise<void> {
-    const pendingOutbox = this.store.listPendingWakeOutbox();
+    let pendingOutbox: WakeOutboxRecord[];
+    if ((this.store as any).db?.prepare) {
+      const rows = (this.store as any).db.prepare(`
+        SELECT w.id FROM wake_outbox w
+        JOIN park_barriers p ON p.id = w.park_id
+        WHERE w.status IN ('pending', 'waking', 'deferred_active_writer')
+          AND w.generation = p.generation
+        ORDER BY w.created_at ASC
+      `).all() as Array<{ id: string }>;
+      pendingOutbox = rows
+        .map((r) => this.store.getWakeOutboxById(r.id))
+        .filter((o): o is WakeOutboxRecord => o !== null);
+    } else {
+      pendingOutbox = this.store.listPendingWakeOutbox();
+    }
+
     for (const outbox of pendingOutbox) {
+      if ((outbox as any).status === "superseded") {
+        continue;
+      }
+
+      // Recovery must fence stale/superseded generation before dispatch and reconciliation
+      const barrier = this.store.getParkBarrier(outbox.parkId);
+      if (
+        !barrier ||
+        barrier.generation !== outbox.generation ||
+        barrier.state === "woken" ||
+        barrier.state === "idle" ||
+        barrier.state === "cancelled"
+      ) {
+        if (barrier && barrier.generation > outbox.generation && (outbox as any).status !== "superseded") {
+          (this.store as any).updateWakeOutboxStatus(outbox.id, "superseded", `Superseded by barrier generation ${barrier.generation}`, {
+            wakeState: "failed",
+          });
+        }
+        continue;
+      }
+
       let envelope: WakeEnvelope;
       try {
         envelope = JSON.parse(outbox.payloadJson) as WakeEnvelope;
       } catch {
         continue;
       }
+
+      // Integrate optional cliTransport.reconcileQueuedWake(threadId, wakeMarker)
+      // during recoverWakeOutbox BEFORE transcript reconciliation/dispatch.
+      let queuedDelivery: { messageId?: string | null; deliveryMode?: string } | null = null;
+      if (typeof (this.cliTransport as any)?.reconcileQueuedWake === "function") {
+        try {
+          const raw = await (this.cliTransport as any).reconcileQueuedWake(outbox.threadId, outbox.wakeMarker);
+          if (raw) {
+            if (typeof raw === "object") {
+              if (raw.found !== false && raw.success !== false && raw.matched !== false) {
+                queuedDelivery = {
+                  messageId: raw.messageId ?? raw.message_id ?? raw.id ?? null,
+                  deliveryMode: raw.deliveryMode ?? "queued",
+                };
+              }
+            } else if (raw === true) {
+              queuedDelivery = { messageId: null, deliveryMode: "queued" };
+            } else if (typeof raw === "string") {
+              queuedDelivery = { messageId: raw, deliveryMode: "queued" };
+            }
+          }
+        } catch {
+          queuedDelivery = null;
+        }
+      }
+
+      // If a waking outbox marker exists in Codex queue DB, mark delivered with deliveryMode queued/messageId and set park woken.
+      if (queuedDelivery) {
+        (this.store as any).updateWakeOutboxStatus(outbox.id, "delivered", null, {
+          wakeState: "delivered",
+          deliveryMode: (queuedDelivery.deliveryMode as any) ?? "queued",
+          messageId: queuedDelivery.messageId ?? null,
+        });
+        this.store.setParkWoken(outbox.parkId, outbox.generation);
+        continue;
+      }
+
+      // If transcript reconciliation succeeds, mark delivered.
       const reconciled = await this.codex.reconcileSend(outbox.threadId, outbox.wakeMarker).catch(() => false);
       if (reconciled) {
-        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
+        (this.store as any).updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
         this.store.setParkWoken(outbox.parkId, outbox.generation);
-      } else {
-        if (outbox.status === "deferred_active_writer" && outbox.nextAttemptAt) {
-          const waitRemaining = new Date(outbox.nextAttemptAt).getTime() - Date.now();
-          if (waitRemaining > 0) {
-            this.scheduleWakeRetry(outbox.id, waitRemaining);
-            continue;
-          }
-        }
-        await this.dispatchWakeOutbox(outbox, envelope);
+        continue;
       }
+
+      // If waking remains unproven, NEVER call dispatchWakeOutbox or reset/retry;
+      // leave it indeterminate/fail-closed with a diagnostic so no duplicate queue can be created.
+      if (outbox.status === "waking") {
+        const diagnostic = `Indeterminate waking outbox marker ${outbox.wakeMarker} unproven during recovery; fail-closed to prevent duplicate queue`;
+        this.lastStreamError = diagnostic;
+        (this.store as any).updateWakeOutboxStatus(outbox.id, "waking", diagnostic, {
+          wakeState: (outbox as any).wakeState ?? "waiting",
+        });
+        continue;
+      }
+
+      // Pending/deferred rows retain normal routing.
+      if (outbox.status === "deferred_active_writer" && outbox.nextAttemptAt) {
+        const waitRemaining = new Date(outbox.nextAttemptAt).getTime() - Date.now();
+        if (waitRemaining > 0) {
+          this.scheduleWakeRetry(outbox.id, waitRemaining);
+          continue;
+        }
+      }
+      await this.dispatchWakeOutbox(outbox, envelope);
+    }
+  }
+
+  private async recoverArmedBarriers(): Promise<void> {
+    const armedBarriers = this.store.listArmedBarriers();
+    for (const barrier of armedBarriers) {
+      await this.evaluateParkWakesForBarrier(barrier).catch((error) => {
+        this.lastStreamError = redactSecrets(String(error));
+      });
     }
   }
 
@@ -1356,7 +1495,11 @@ export class BridgeService {
       return this.followNeedsApproval(agent, job);
     }
     if (TERMINAL_JOB_STATUSES.has(job.status) || ["delivery_pending"].includes(job.status)) {
-      return this.followResultForJob(agent, job);
+      const result = await this.followResultForJob(agent, job);
+      if (["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(result.status) && result.resultAvailable) {
+        this.store.consumeResult(job.id);
+      }
+      return result;
     }
     if (!ACTIVE_JOB_STATUSES.has(job.status)) {
       throw new ConflictError("Job " + job.id + " is not followable in state " + job.status, "not_followable");
@@ -1370,7 +1513,11 @@ export class BridgeService {
     const waiter = Symbol("follow-waiter");
     lifecycle.waiters.add(waiter);
     try {
-      return await waitWithAbort(lifecycle.promise, signal);
+      const result = await waitWithAbort(lifecycle.promise, signal);
+      if (["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(result.status) && result.resultAvailable) {
+        this.store.consumeResult(job.id);
+      }
+      return result;
     } finally {
       lifecycle.waiters.delete(waiter);
     }
@@ -1458,6 +1605,9 @@ export class BridgeService {
       status: "aborted",
       error: localReason,
       workerAborted: true,
+    });
+    await this.evaluateParkWakes(active.id).catch((error: unknown) => {
+      this.lastStreamError = redactSecrets(String(error));
     });
     return {
       agentId,
@@ -2042,6 +2192,10 @@ export class BridgeService {
       void this.deliverPersistedJob(this.store.getJob(job.id) ?? pending).catch((error: unknown) => {
         this.lastStreamError = redactSecrets(String(error));
       });
+    } else {
+      await this.evaluateParkWakes(job.id).catch((error: unknown) => {
+        this.lastStreamError = redactSecrets(String(error));
+      });
     }
   }
 
@@ -2123,13 +2277,11 @@ export class BridgeService {
     const progress = await this.progressSnapshot(agent, job, 10);
     const failure = overrides.error ?? job.error;
     const resultAvailable = overrides.resultAvailable ?? Boolean(job.resultPath || envelope);
-    // Explicit consumption semantics: a terminal follow result with a usable
-    // final result consumes the job obligation; needs_approval and
-    // non-terminal states keep the obligation pending. Consumption is
-    // persisted and is separate from closing the agent.
-    if (["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) && resultAvailable) {
-      this.store.consumeResult(job.id);
-    }
+    // Explicit consumption semantics: result_consumed_at is ONLY set by explicit
+    // public follow/recover operations (never by background park readiness or
+    // background follow lifecycle resolution). Needs_approval and non-terminal
+    // states keep the obligation pending. Consumption is persisted and is
+    // separate from closing the agent.
     const receipt = envelope?.receipt;
     const earlyExit = envelope?.earlyExit ?? progress.earlyExit;
     const escalation = envelope?.escalation ?? progress.escalation;
@@ -3308,6 +3460,9 @@ export class BridgeService {
         });
       }
     }
+    await this.recoverArmedBarriers().catch((error) => {
+      this.lastStreamError = redactSecrets(String(error));
+    });
     await this.recoverWakeOutbox().catch((error) => {
       this.lastStreamError = redactSecrets(String(error));
     });

@@ -4,7 +4,7 @@ import { Agent, fetch, type Dispatcher } from "undici";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
 import { BridgeError, InvalidRequestError } from "./errors.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
-import type { AgentMode, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkReceipt, SpawnInput, WorkspaceStrategy } from "./types.js";
+import type { AgentMode, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkPredicateType, ParkReceipt, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
 
 // The follow endpoint holds the HTTP response open until the worker finishes.
@@ -173,7 +173,7 @@ export class BridgeHttpServer {
         const value = asRecord(body);
         const isAlias = Boolean(value.is_alias ?? value.isAlias);
         const result = await this.service.park(toParkInput(body), isAlias, cancellation.signal);
-        if (!response.writableEnded) writeJson(response, 200, result);
+        if (!response.writableEnded) writeJson(response, 200, serializeParkReceipt(result));
       } catch (error) {
         if (cancellation.signal.aborted || response.destroyed || response.writableEnded) {
           return;
@@ -550,9 +550,61 @@ function toParkInput(body: unknown): ParkInput {
   const turnId = optionalString(value.turn_id ?? value.turnId);
   const goalId = optionalString(value.goal_id ?? value.goalId);
   const reason = optionalString(value.reason);
-  const wait = value.wait !== undefined ? Boolean(value.wait) : undefined;
+  const wait = value.wait !== undefined ? booleanValue(value.wait, "wait") : undefined;
   const mcpSessionId = optionalString(value.mcp_session_id ?? value.mcpSessionId);
   const trustedThreadId = optionalString(value.trusted_thread_id ?? value.trustedThreadId);
+
+  const rawPredicate = value.predicate ?? value.predicate_type ?? value.predicateType;
+  let predicate: ParkPredicateType | undefined;
+  if (rawPredicate !== undefined) {
+    if (typeof rawPredicate !== "string") {
+      throw new InvalidRequestError("predicate must be a string");
+    }
+    const normalized = rawPredicate.trim().toUpperCase();
+    if (!["ALL", "ANY", "QUORUM", "REQUIRED"].includes(normalized)) {
+      throw new InvalidRequestError("predicate must be one of: ALL, ANY, QUORUM, REQUIRED");
+    }
+    predicate = normalized as ParkPredicateType;
+  }
+
+  const rawQuorumCount = value.quorum_count ?? value.quorumCount;
+  let quorumCount: number | undefined;
+  if (rawQuorumCount !== undefined) {
+    if (typeof rawQuorumCount !== "number" || !Number.isInteger(rawQuorumCount) || rawQuorumCount < 1) {
+      throw new InvalidRequestError("quorum_count must be a positive integer");
+    }
+    quorumCount = rawQuorumCount;
+  }
+
+  const rawRequiredJobIds = value.required_job_ids ?? value.requiredJobIds;
+  let requiredJobIds: string[] | undefined;
+  if (rawRequiredJobIds !== undefined) {
+    if (Array.isArray(rawRequiredJobIds)) {
+      if (rawRequiredJobIds.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+        throw new InvalidRequestError("required_job_ids must contain non-empty strings");
+      }
+      requiredJobIds = rawRequiredJobIds.map((s) => s.trim());
+    } else if (typeof rawRequiredJobIds === "string" && rawRequiredJobIds.trim().length > 0) {
+      requiredJobIds = [rawRequiredJobIds.trim()];
+    } else {
+      throw new InvalidRequestError("required_job_ids must be an array of strings");
+    }
+  }
+
+  const rawWakeOnException = value.wake_on_exception ?? value.wakeOnException;
+  const wakeOnException = rawWakeOnException !== undefined
+    ? booleanValue(rawWakeOnException, "wake_on_exception")
+    : undefined;
+
+  const rawDeliveryMode = value.delivery_mode ?? value.deliveryMode;
+  const deliveryMode = rawDeliveryMode !== undefined
+    ? enumValue(rawDeliveryMode, ["cli_resume", "none", "in_turn", "queued"], "delivery_mode") as "cli_resume" | "none" | "in_turn" | "queued"
+    : undefined;
+
+  const rawQueueMessageId = optionalString(
+    value.queue_message_id ?? value.queueMessageId ?? value.message_id ?? value.messageId
+  );
+
   return {
     jobIds,
     job_ids: jobIds,
@@ -562,8 +614,52 @@ function toParkInput(body: unknown): ParkInput {
     ...(goalId ? { goalId, goal_id: goalId } : {}),
     ...(reason ? { reason } : {}),
     ...(wait !== undefined ? { wait } : {}),
+    ...(deliveryMode ? { deliveryMode, delivery_mode: deliveryMode } : {}),
+    ...(rawQueueMessageId ? { queueMessageId: rawQueueMessageId, queue_message_id: rawQueueMessageId } : {}),
     ...(mcpSessionId ? { mcpSessionId, mcp_session_id: mcpSessionId } : {}),
     ...(trustedThreadId ? { trustedThreadId, trusted_thread_id: trustedThreadId } : {}),
+    ...(predicate ? { predicate, predicate_type: predicate, predicateType: predicate } : {}),
+    ...(quorumCount !== undefined ? { quorumCount, quorum_count: quorumCount } : {}),
+    ...(requiredJobIds ? { requiredJobIds, required_job_ids: requiredJobIds } : {}),
+    ...(wakeOnException !== undefined ? { wakeOnException, wake_on_exception: wakeOnException } : {}),
+  } as ParkInput;
+}
+
+function serializeParkReceipt(receipt: ParkReceipt | Record<string, unknown>): Record<string, unknown> {
+  const r = receipt as Record<string, unknown>;
+  const rawDeliveryMode = r.deliveryMode ?? r.delivery_mode;
+  let deliveryMode: "queued" | "cli_resume" | "none" | undefined;
+  if (rawDeliveryMode === "queued" || rawDeliveryMode === "cli_resume" || rawDeliveryMode === "none") {
+    deliveryMode = rawDeliveryMode;
+  } else if (rawDeliveryMode === "in_turn") {
+    deliveryMode = Boolean(r.armed) ? "cli_resume" : "none";
+  }
+  const outboxObj = (r.outbox && typeof r.outbox === "object") ? (r.outbox as Record<string, unknown>) : undefined;
+  const outboxStatusObj = (r.outboxStatus && typeof r.outboxStatus === "object") ? (r.outboxStatus as Record<string, unknown>) : undefined;
+  const rawQueueMsgId = r.queueMessageId ??
+    r.queue_message_id ??
+    r.messageId ??
+    r.message_id ??
+    outboxObj?.queueMessageId ??
+    outboxObj?.queue_message_id ??
+    outboxObj?.messageId ??
+    outboxObj?.message_id ??
+    outboxStatusObj?.queueMessageId ??
+    outboxStatusObj?.queue_message_id ??
+    outboxStatusObj?.messageId ??
+    outboxStatusObj?.message_id;
+  const queueMessageId = typeof rawQueueMsgId === "string" && rawQueueMsgId.length > 0
+    ? rawQueueMsgId
+    : (rawQueueMsgId === null ? null : undefined);
+
+  const sanitized = { ...r };
+  if (sanitized.deliveryMode === "in_turn") delete sanitized.deliveryMode;
+  if (sanitized.delivery_mode === "in_turn") delete sanitized.delivery_mode;
+
+  return {
+    ...sanitized,
+    ...(deliveryMode !== undefined ? { deliveryMode, delivery_mode: deliveryMode } : {}),
+    ...(queueMessageId !== undefined ? { queueMessageId, queue_message_id: queueMessageId } : {}),
   };
 }
 

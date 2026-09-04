@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-server.js";
-import { ConflictError } from "./errors.js";
+import { ConflictError, InvalidRequestError } from "./errors.js";
 import { resolveCodexTaskProvenance, type TaskProvenance } from "./codex/cli-resolver.js";
 import { canRead, ensurePrivateDir, newId, redactSecrets } from "./security.js";
 import type { BridgeConfig } from "./types.js";
@@ -335,14 +335,101 @@ export function createMcpServer(
 
   const parkInputSchema = {
     job_ids: z.array(z.string().min(1)).optional(),
+    jobIds: z.array(z.string().min(1)).optional(),
     job_id: z.string().min(1).optional(),
+    jobId: z.string().min(1).optional(),
     park_id: z.string().min(1).optional(),
+    parkId: z.string().min(1).optional(),
     thread_id: z.string().optional(),
+    threadId: z.string().optional(),
     turn_id: z.string().optional(),
+    turnId: z.string().optional(),
     goal_id: z.string().optional(),
+    goalId: z.string().optional(),
     reason: z.string().max(500).optional(),
     wait: z.boolean().optional(),
+    delivery_mode: z.enum(["queued", "cli_resume", "in_turn", "none"]).optional(),
+    deliveryMode: z.enum(["queued", "cli_resume", "in_turn", "none"]).optional(),
+    predicate: z.enum(["ALL", "ANY", "QUORUM", "REQUIRED"]).optional(),
+    predicate_type: z.enum(["ALL", "ANY", "QUORUM", "REQUIRED"]).optional(),
+    predicateType: z.enum(["ALL", "ANY", "QUORUM", "REQUIRED"]).optional(),
+    quorum_count: z.number().int().min(1).optional(),
+    quorumCount: z.number().int().min(1).optional(),
+    required_job_ids: z.array(z.string().min(1)).optional(),
+    requiredJobIds: z.array(z.string().min(1)).optional(),
+    wake_on_exception: z.boolean().optional(),
+    wakeOnException: z.boolean().optional(),
+    queue_message_id: z.string().min(1).optional(),
+    queueMessageId: z.string().min(1).optional(),
+    message_id: z.string().min(1).optional(),
+    messageId: z.string().min(1).optional(),
   };
+
+  function normalizeParkArgs(args: Record<string, unknown>): Record<string, unknown> {
+    const result: Record<string, unknown> = { ...args };
+    const rawJobIds = args.job_ids ?? args.jobIds;
+    if (rawJobIds !== undefined) {
+      result.job_ids = rawJobIds;
+      result.jobIds = rawJobIds;
+    }
+    const rawJobId = args.job_id ?? args.jobId;
+    if (rawJobId !== undefined) {
+      result.job_id = rawJobId;
+      result.jobId = rawJobId;
+    }
+    const rawParkId = args.park_id ?? args.parkId;
+    if (rawParkId !== undefined) {
+      result.park_id = rawParkId;
+      result.parkId = rawParkId;
+    }
+    const rawThreadId = args.thread_id ?? args.threadId;
+    if (rawThreadId !== undefined) {
+      result.thread_id = rawThreadId;
+      result.threadId = rawThreadId;
+    }
+    const rawTurnId = args.turn_id ?? args.turnId;
+    if (rawTurnId !== undefined) {
+      result.turn_id = rawTurnId;
+      result.turnId = rawTurnId;
+    }
+    const rawGoalId = args.goal_id ?? args.goalId;
+    if (rawGoalId !== undefined) {
+      result.goal_id = rawGoalId;
+      result.goalId = rawGoalId;
+    }
+    const rawPred = args.predicate ?? args.predicate_type ?? args.predicateType;
+    if (rawPred !== undefined) {
+      result.predicate = rawPred;
+      result.predicate_type = rawPred;
+      result.predicateType = rawPred;
+    }
+    const rawQuorum = args.quorum_count ?? args.quorumCount;
+    if (rawQuorum !== undefined) {
+      result.quorum_count = rawQuorum;
+      result.quorumCount = rawQuorum;
+    }
+    const rawReq = args.required_job_ids ?? args.requiredJobIds;
+    if (rawReq !== undefined) {
+      result.required_job_ids = rawReq;
+      result.requiredJobIds = rawReq;
+    }
+    const rawWake = args.wake_on_exception ?? args.wakeOnException;
+    if (rawWake !== undefined) {
+      result.wake_on_exception = rawWake;
+      result.wakeOnException = rawWake;
+    }
+    const rawDeliveryMode = args.delivery_mode ?? args.deliveryMode;
+    if (rawDeliveryMode !== undefined) {
+      result.delivery_mode = rawDeliveryMode;
+      result.deliveryMode = rawDeliveryMode;
+    }
+    const rawQueueMessageId = args.queue_message_id ?? args.queueMessageId ?? args.message_id ?? args.messageId;
+    if (rawQueueMessageId !== undefined) {
+      result.queue_message_id = rawQueueMessageId;
+      result.queueMessageId = rawQueueMessageId;
+    }
+    return result;
+  }
 
   function validateCallerThread(callerThreadId?: string): void {
     if (callerThreadId) {
@@ -539,16 +626,27 @@ export function createMcpServer(
       reason: z.string().nullable().optional(),
       pendingCount: z.number(),
       readyCount: z.number(),
-      deliveryMode: z.enum(["in_turn", "cli_resume", "none"]).optional(),
+      deliveryMode: z.enum(["queued", "cli_resume", "none"]).optional(),
+      delivery_mode: z.enum(["queued", "cli_resume", "none"]).optional(),
       wakeState: z.enum(["waiting", "deferred_active_writer", "delivered", "failed"]).optional(),
       readyJobIds: z.array(z.string()).optional(),
+      predicateType: z.enum(["ALL", "ANY", "QUORUM", "REQUIRED"]).optional(),
+      quorumCount: z.number().nullable().optional(),
+      requiredJobIds: z.array(z.string()).nullable().optional(),
+      queueMessageId: z.string().nullable().optional(),
+      queue_message_id: z.string().nullable().optional(),
     },
   }, async (args, extra) => {
     try {
-      validateCallerThread(args.thread_id);
+      if (args.wait === true) {
+        throw new InvalidRequestError(
+          "In-turn waiting (wait=true) is no longer supported on park. Use subagents_follow for in-turn waiting, or omit wait for external background parking.",
+        );
+      }
+      validateCallerThread(args.thread_id ?? args.threadId);
       const payload = {
-        ...args,
-        wait: args.wait !== undefined ? args.wait : true,
+        ...normalizeParkArgs(args),
+        wait: false,
         mcp_session_id: mcpProcessSessionId,
         ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
@@ -752,17 +850,28 @@ export function createMcpServer(
       reason: z.string().nullable().optional(),
       pendingCount: z.number(),
       readyCount: z.number(),
-      deliveryMode: z.enum(["in_turn", "cli_resume", "none"]).optional(),
+      deliveryMode: z.enum(["queued", "cli_resume", "none"]).optional(),
+      delivery_mode: z.enum(["queued", "cli_resume", "none"]).optional(),
       wakeState: z.enum(["waiting", "deferred_active_writer", "delivered", "failed"]).optional(),
       readyJobIds: z.array(z.string()).optional(),
+      predicateType: z.enum(["ALL", "ANY", "QUORUM", "REQUIRED"]).optional(),
+      quorumCount: z.number().nullable().optional(),
+      requiredJobIds: z.array(z.string()).nullable().optional(),
+      queueMessageId: z.string().nullable().optional(),
+      queue_message_id: z.string().nullable().optional(),
     },
   }, async (args, extra) => {
     try {
-      validateCallerThread(args.thread_id);
+      if (args.wait === true) {
+        throw new InvalidRequestError(
+          "In-turn waiting (wait=true) is no longer supported on park. Use deepseek_follow for in-turn waiting, or omit wait for external background parking.",
+        );
+      }
+      validateCallerThread(args.thread_id ?? args.threadId);
       const payload = {
-        ...args,
+        ...normalizeParkArgs(args),
         is_alias: true,
-        wait: args.wait !== undefined ? args.wait : true,
+        wait: false,
         mcp_session_id: mcpProcessSessionId,
         ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
@@ -976,9 +1085,15 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
     reason: string | null;
     pendingCount: number;
     readyCount: number;
-    deliveryMode?: "in_turn" | "cli_resume" | "none";
+    deliveryMode?: "queued" | "cli_resume" | "none";
+    delivery_mode?: "queued" | "cli_resume" | "none";
     wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
     readyJobIds?: string[];
+    predicateType?: "ALL" | "ANY" | "QUORUM" | "REQUIRED";
+    quorumCount?: number | null;
+    requiredJobIds?: string[] | null;
+    queueMessageId?: string | null;
+    queue_message_id?: string | null;
   };
 } {
   const parkId = String(result.parkId ?? "");
@@ -986,14 +1101,39 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
   const targetIdentity = String(result.targetIdentity ?? "");
   const nextRequiredAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
   const displayName = isAlias ? LEGACY_DISPLAY_NAME : DISPLAY_NAME;
-  const deliveryMode = result.deliveryMode as ("in_turn" | "cli_resume" | "none") | undefined;
+  const rawDeliveryMode = result.deliveryMode ?? result.delivery_mode;
+  let deliveryMode: "queued" | "cli_resume" | "none" | undefined;
+  if (rawDeliveryMode === "queued" || rawDeliveryMode === "cli_resume" || rawDeliveryMode === "none") {
+    deliveryMode = rawDeliveryMode;
+  } else if (rawDeliveryMode === "in_turn") {
+    deliveryMode = armed ? "cli_resume" : "none";
+  }
   const wakeState = result.wakeState as ("waiting" | "deferred_active_writer" | "delivered" | "failed") | undefined;
   const readyJobIds = Array.isArray(result.readyJobIds) ? (result.readyJobIds as string[]) : undefined;
+  const predicateType = result.predicateType as ("ALL" | "ANY" | "QUORUM" | "REQUIRED") | undefined;
+  const quorumCount = result.quorumCount !== undefined ? (result.quorumCount as number | null) : undefined;
+  const requiredJobIds = Array.isArray(result.requiredJobIds) ? (result.requiredJobIds as string[]) : (result.requiredJobIds === null ? null : undefined);
+
+  const outboxObj = (result.outbox && typeof result.outbox === "object") ? (result.outbox as Record<string, unknown>) : undefined;
+  const outboxStatusObj = (result.outboxStatus && typeof result.outboxStatus === "object") ? (result.outboxStatus as Record<string, unknown>) : undefined;
+  const rawQueueMsgId = result.queueMessageId ??
+    result.queue_message_id ??
+    result.messageId ??
+    result.message_id ??
+    outboxObj?.queueMessageId ??
+    outboxObj?.queue_message_id ??
+    outboxObj?.messageId ??
+    outboxObj?.message_id ??
+    outboxStatusObj?.queueMessageId ??
+    outboxStatusObj?.queue_message_id ??
+    outboxStatusObj?.messageId ??
+    outboxStatusObj?.message_id;
+  const queueMessageId = typeof rawQueueMsgId === "string" && rawQueueMsgId.length > 0
+    ? rawQueueMsgId
+    : (rawQueueMsgId === null ? null : undefined);
 
   let text: string;
-  if (deliveryMode === "in_turn" && wakeState === "delivered") {
-    text = `${displayName} wake delivered for barrier ${parkId} (target: ${targetIdentity}). Ready jobs: ${readyJobIds && readyJobIds.length > 0 ? readyJobIds.join(", ") : "none"}. Jobs remain pending; consume them with ${nextRequiredAction}.`;
-  } else if (armed) {
+  if (armed) {
     text = `${displayName} parked turn on barrier ${parkId} (target: ${targetIdentity}). The turn will wake when ready jobs finish. Jobs remain pending; consume them with ${nextRequiredAction} upon wake.`;
   } else {
     text = `${displayName} park registered barrier ${parkId} (unarmed; authoritative attachment or bridge correlation not active). Consume pending jobs with ${nextRequiredAction}.`;
@@ -1012,9 +1152,13 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
       reason: result.reason !== undefined && result.reason !== null ? String(result.reason) : null,
       pendingCount: Number(result.pendingCount ?? 0),
       readyCount: Number(result.readyCount ?? 0),
-      ...(deliveryMode ? { deliveryMode } : {}),
+      ...(deliveryMode ? { deliveryMode, delivery_mode: deliveryMode } : {}),
       ...(wakeState ? { wakeState } : {}),
       ...(readyJobIds ? { readyJobIds } : {}),
+      ...(predicateType ? { predicateType } : {}),
+      ...(quorumCount !== undefined ? { quorumCount } : {}),
+      ...(requiredJobIds !== undefined ? { requiredJobIds } : {}),
+      ...(queueMessageId !== undefined ? { queueMessageId, queue_message_id: queueMessageId } : {}),
     },
   };
 }

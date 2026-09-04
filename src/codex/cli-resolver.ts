@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
 export interface CodexCliCandidate {
   executablePath: string;
@@ -534,6 +536,19 @@ export interface CodexCliExecutionResult {
   error?: string | null | undefined;
   executablePath?: string | undefined;
   version?: string | null | undefined;
+  deliveryMode?: "queued" | "cli_resume" | undefined;
+  messageId?: string | undefined;
+}
+
+export interface QueuedWakeReconciliationResult {
+  found: boolean;
+  messageId?: string | undefined;
+}
+
+export interface CodexCliCapabilities {
+  compatible: boolean;
+  version: string | null;
+  queueSupported?: boolean | undefined;
 }
 
 export interface CodexCliTransport {
@@ -541,7 +556,12 @@ export interface CodexCliTransport {
     threadId: string,
     marker: string,
   ): Promise<CodexCliExecutionResult>;
-  probeCapabilities(executable?: string): Promise<{ compatible: boolean; version: string | null }>;
+  probeCapabilities(executable?: string): Promise<CodexCliCapabilities>;
+  reconcileQueuedWake?(
+    threadId: string,
+    marker: string,
+    customDbPath?: string,
+  ): Promise<QueuedWakeReconciliationResult>;
 }
 
 export function isStoredSchemaIncompatible(output: string): boolean {
@@ -562,6 +582,69 @@ export function isActiveWriterConflict(output: string): boolean {
   return lower.includes("active writer") || lower.includes("thread-store conflict");
 }
 
+export function isDeterministicQueueFallthroughError(output: string): boolean {
+  const lower = output.toLowerCase();
+  return (
+    lower.includes("unloaded") ||
+    lower.includes("no active session") ||
+    lower.includes("no session") ||
+    lower.includes("no_session") ||
+    lower.includes("session not found") ||
+    lower.includes("thread not found") ||
+    lower.includes("session does not exist") ||
+    lower.includes("thread does not exist") ||
+    lower.includes("no rollout") ||
+    lower.includes("not rolled out") ||
+    lower.includes("feature not enabled") ||
+    lower.includes("not enabled") ||
+    lower.includes("not available") ||
+    lower.includes("not supported") ||
+    lower.includes("unknown subcommand") ||
+    lower.includes("unrecognized subcommand") ||
+    lower.includes("unknown command")
+  );
+}
+
+export function parseQueueMessageId(stdout: string, stderr: string): string | undefined {
+  try {
+    const fullObj = JSON.parse(stdout.trim());
+    if (fullObj && typeof fullObj === "object") {
+      const id =
+        (typeof fullObj.message_id === "string" && fullObj.message_id) ||
+        (typeof fullObj.messageId === "string" && fullObj.messageId) ||
+        (typeof fullObj.id === "string" && fullObj.id) ||
+        undefined;
+      if (id) return id;
+    }
+  } catch {}
+
+  const lines = (stdout + "\n" + stderr).split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj === "object") {
+          const id =
+            (typeof obj.message_id === "string" && obj.message_id) ||
+            (typeof obj.messageId === "string" && obj.messageId) ||
+            (typeof obj.id === "string" && obj.id) ||
+            undefined;
+          if (id) return id;
+        }
+      } catch {}
+    }
+  }
+
+  const combined = (stdout + " " + stderr).trim();
+  const textMatch = combined.match(/Queued message\s+(\S+)\s+for thread/i);
+  if (textMatch && textMatch[1]) {
+    return textMatch[1].replace(/^['"`]+|['"`.,]+$/g, "");
+  }
+
+  return undefined;
+}
+
 export function inspectJsonlTurnAcceptance(stdout: string, expectedThreadId?: string): boolean {
   const detector = new JsonlAcceptanceDetector(expectedThreadId);
   return detector.processText(stdout);
@@ -574,51 +657,217 @@ export function ensureLineTerminatedMarker(marker: string): string {
   return marker + "\n";
 }
 
+export interface CandidateCapabilities {
+  executablePath: string;
+  version: string | null;
+  compatible: boolean;
+  queueSupported: boolean;
+  hasExecResume: boolean;
+  semver: { major: number; minor: number; patch: number } | null;
+}
+
+export function rankCodexCliCandidates(candidates: CandidateCapabilities[]): CandidateCapabilities[] {
+  return [...candidates].sort((a, b) => {
+    // 1. Queue-capable AND compatible candidates rank highest
+    const aQueueCapable = a.compatible && a.queueSupported;
+    const bQueueCapable = b.compatible && b.queueSupported;
+    if (aQueueCapable && !bQueueCapable) return -1;
+    if (!aQueueCapable && bQueueCapable) return 1;
+
+    // 2. Compatible candidates rank above incompatible candidates
+    if (a.compatible && !b.compatible) return -1;
+    if (!a.compatible && b.compatible) return 1;
+
+    // 3. Among candidates in the same compatibility & queue tier, rank by compatible semver descending
+    if (a.semver && b.semver) {
+      if (b.semver.major !== a.semver.major) return b.semver.major - a.semver.major;
+      if (b.semver.minor !== a.semver.minor) return b.semver.minor - a.semver.minor;
+      if (b.semver.patch !== a.semver.patch) return b.semver.patch - a.semver.patch;
+    } else if (a.semver && !b.semver) {
+      return -1;
+    } else if (!a.semver && b.semver) {
+      return 1;
+    }
+
+    return 0;
+  });
+}
+
+export async function probeCandidateCapabilities(
+  executable: string,
+  runner: ProcessRunner = defaultProcessRunner,
+): Promise<CandidateCapabilities> {
+  const versionRes = await runner(executable, ["--version"], { timeoutMs: 5000 });
+  let version: string | null = null;
+  let semver: { major: number; minor: number; patch: number } | null = null;
+  if (versionRes.code === 0 || versionRes.stdout) {
+    semver = parseSemver(versionRes.stdout + " " + versionRes.stderr);
+    if (semver) {
+      version = `${semver.major}.${semver.minor}.${semver.patch}`;
+    }
+  }
+
+  const helpRes = await runner(executable, ["exec", "resume", "--help"], { timeoutMs: 5000 });
+  const helpOutput = (helpRes.stdout + " " + helpRes.stderr).toLowerCase();
+  const hasExecResume =
+    helpRes.code === 0 &&
+    (helpOutput.includes("exec resume") || helpOutput.includes("resume") || helpOutput.includes("session_id"));
+
+  const queueHelpRes = await runner(executable, ["queue", "--help"], { timeoutMs: 5000 });
+  const queueHelpOutput = (queueHelpRes.stdout + " " + queueHelpRes.stderr).toLowerCase();
+  const hasQueue =
+    queueHelpRes.code === 0 &&
+    (queueHelpOutput.includes("queue") || queueHelpOutput.includes("--thread") || queueHelpOutput.includes("--message")) &&
+    !queueHelpOutput.includes("exec resume");
+
+  const semverCompatible = version !== null && isCompatibleCodexCli(version);
+  const compatible = hasExecResume && semverCompatible;
+
+  return {
+    executablePath: executable,
+    version,
+    compatible,
+    queueSupported: hasQueue,
+    hasExecResume,
+    semver,
+  };
+}
+
+export function resolveQueueDbPath(options?: {
+  dbPath?: string | undefined;
+  codexHome?: string | undefined;
+  env?: Record<string, string | undefined> | undefined;
+}): string {
+  if (options?.dbPath && options.dbPath.trim().length > 0) {
+    return path.resolve(options.dbPath.trim());
+  }
+
+  const env = options?.env ?? process.env;
+  const explicitHome = options?.codexHome ?? env.CODEX_HOME;
+  if (explicitHome && explicitHome.trim().length > 0) {
+    return path.join(path.resolve(explicitHome.trim()), "queue_1.sqlite");
+  }
+
+  const userHome = os.homedir() || env.USERPROFILE || env.HOME || ".";
+  return path.join(path.resolve(userHome), ".codex", "queue_1.sqlite");
+}
+
+export async function reconcileQueuedWake(
+  threadId: string,
+  marker: string,
+  options?: {
+    dbPath?: string | undefined;
+    codexHome?: string | undefined;
+    env?: Record<string, string | undefined> | undefined;
+  },
+): Promise<QueuedWakeReconciliationResult> {
+  if (!threadId || !marker) {
+    return { found: false };
+  }
+
+  const dbPath = resolveQueueDbPath(options);
+  if (!existsSync(dbPath)) {
+    return { found: false };
+  }
+
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+
+    const tableCheck = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'queued_items'")
+      .get() as { name?: string } | undefined;
+    if (!tableCheck) {
+      return { found: false };
+    }
+
+    const trimmedThread = threadId.trim();
+    const trimmedMarker = marker.trim();
+
+    const row = db
+      .prepare(
+        "SELECT id FROM queued_items WHERE thread_id = ? AND (instr(payload_json, ?) > 0 OR instr(payload_json, ?) > 0) ORDER BY rowid DESC LIMIT 1",
+      )
+      .get(trimmedThread, marker, trimmedMarker) as { id?: unknown } | undefined;
+
+    if (row && typeof row.id === "string") {
+      return { found: true, messageId: row.id };
+    }
+    return { found: false };
+  } catch {
+    return { found: false };
+  } finally {
+    if (db) {
+      try {
+        db.close();
+      } catch {}
+    }
+  }
+}
+
 export interface DefaultCodexCliTransportOptions {
   config?: CodexCliResolverConfig | undefined;
   candidates?: string[] | undefined;
   runner?: ProcessRunner | undefined;
+  codexHome?: string | undefined;
+  queueDbPath?: string | undefined;
 }
 
 export class DefaultCodexCliTransport implements CodexCliTransport {
   private readonly config: CodexCliResolverConfig | undefined;
   private readonly candidateOverride: string[] | undefined;
   private readonly runner: ProcessRunner;
+  private readonly codexHome: string | undefined;
+  private readonly queueDbPath: string | undefined;
 
   constructor(options: DefaultCodexCliTransportOptions = {}) {
     this.config = options.config;
     this.candidateOverride = options.candidates;
     this.runner = options.runner ?? defaultProcessRunner;
+    this.codexHome = options.codexHome;
+    this.queueDbPath = options.queueDbPath;
   }
 
-  async probeCapabilities(executable?: string): Promise<{ compatible: boolean; version: string | null }> {
-    const candidatePaths = executable
-      ? [executable]
-      : (this.candidateOverride ?? (await discoverCodexCandidates(this.config)));
+  async reconcileQueuedWake(
+    threadId: string,
+    marker: string,
+    customDbPath?: string,
+  ): Promise<QueuedWakeReconciliationResult> {
+    return reconcileQueuedWake(threadId, marker, {
+      dbPath: customDbPath ?? this.queueDbPath,
+      codexHome: this.codexHome,
+    });
+  }
 
-    let lastVersion: string | null = null;
-    for (const candidate of candidatePaths) {
-      const versionRes = await this.runner(candidate, ["--version"], { timeoutMs: 5000 });
-      let version: string | null = null;
-      if (versionRes.code === 0 || versionRes.stdout) {
-        const semver = parseSemver(versionRes.stdout + " " + versionRes.stderr);
-        if (semver) version = `${semver.major}.${semver.minor}.${semver.patch}`;
-      }
-      if (version) lastVersion = version;
-
-      const helpRes = await this.runner(candidate, ["exec", "resume", "--help"], { timeoutMs: 5000 });
-      const helpOutput = (helpRes.stdout + " " + helpRes.stderr).toLowerCase();
-      const hasExecResume =
-        helpRes.code === 0 &&
-        (helpOutput.includes("exec resume") || helpOutput.includes("resume") || helpOutput.includes("session_id"));
-
-      const compatible = hasExecResume;
-      if (compatible) {
-        return { compatible: true, version: version ?? lastVersion };
-      }
+  async probeCapabilities(executable?: string): Promise<CodexCliCapabilities> {
+    if (executable) {
+      const single = await probeCandidateCapabilities(executable, this.runner);
+      return {
+        compatible: single.compatible,
+        version: single.version,
+        queueSupported: single.queueSupported,
+      };
     }
 
-    return { compatible: false, version: lastVersion };
+    const candidatePaths = this.candidateOverride ?? (await discoverCodexCandidates(this.config));
+    if (candidatePaths.length === 0) {
+      return { compatible: false, version: null, queueSupported: false };
+    }
+
+    const probed: CandidateCapabilities[] = [];
+    for (const candidate of candidatePaths) {
+      probed.push(await probeCandidateCapabilities(candidate, this.runner));
+    }
+
+    const ranked = rankCodexCliCandidates(probed);
+    const anyQueueSupported = ranked.some((c) => c.compatible && c.queueSupported);
+    const top = ranked[0]!;
+
+    return {
+      compatible: top.compatible,
+      version: top.version,
+      queueSupported: anyQueueSupported,
+    };
   }
 
   async deliverWake(threadId: string, marker: string): Promise<CodexCliExecutionResult> {
@@ -627,23 +876,89 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
       return { success: false, error: "No Codex CLI candidate executables found" };
     }
 
+    const markerPayload = ensureLineTerminatedMarker(marker);
+
+    const probed: CandidateCapabilities[] = [];
+    for (const candidate of candidatePaths) {
+      probed.push(await probeCandidateCapabilities(candidate, this.runner));
+    }
+
+    const rankedCandidates = rankCodexCliCandidates(probed);
+    const hasCompatibleCandidate = rankedCandidates.some((c) => c.compatible);
+
     let lastError: string | null = null;
     let lastExe: string | undefined = undefined;
     let lastVer: string | null = null;
 
-    const markerPayload = ensureLineTerminatedMarker(marker);
-
-    for (const candidate of candidatePaths) {
-      const { compatible, version } = await this.probeCapabilities(candidate);
+    for (const probe of rankedCandidates) {
+      const candidate = probe.executablePath;
+      const compatible = probe.compatible;
+      const version = probe.version;
+      const queueSupported = probe.queueSupported === true;
       lastExe = candidate;
       lastVer = version;
 
-      if (!compatible && this.candidateOverride === undefined) {
-        // Skip candidate if auto-discovered and not compatible
+      if (!compatible) {
+        lastError = `Incompatible Codex CLI candidate ${candidate} (version: ${version ?? "unknown"})`;
         continue;
       }
 
-      // Execute resume with stdin prompt ("-")
+      // For a queue-capable candidate, run queue first
+      if (queueSupported) {
+        const queueResult = await this.runner(
+          candidate,
+          ["queue", "--thread", threadId, "--message", marker],
+          { timeoutMs: 30_000, expectedThreadId: threadId, expectedMarker: marker },
+        );
+
+        // Exit 0 is accepted terminal queued delivery
+        if (queueResult.code === 0) {
+          const messageId = parseQueueMessageId(queueResult.stdout, queueResult.stderr);
+          return {
+            success: true,
+            accepted: true,
+            deliveryMode: "queued",
+            messageId,
+            executablePath: candidate,
+            version,
+          };
+        }
+
+        const queueCombined = (queueResult.stdout + " " + queueResult.stderr).trim();
+
+        // Timeout is unknownOutcome and must not resume blindly
+        if (queueResult.timedOut) {
+          return {
+            success: false,
+            unknownOutcome: true,
+            deliveryMode: "queued",
+            error: queueCombined || "CLI queue execution timed out",
+            executablePath: candidate,
+            version,
+          };
+        }
+
+        // Schema incompatibility on queue command -> continue to next candidate
+        if (isStoredSchemaIncompatible(queueCombined)) {
+          lastError = `Schema incompatibility on ${candidate}: ${queueCombined}`;
+          continue;
+        }
+
+        // Only deterministic unloaded/no-session/no-rollout errors fall through immediately to existing exec resume on same candidate
+        if (!isDeterministicQueueFallthroughError(queueCombined)) {
+          // Ambiguous output or non-deterministic error: unknownOutcome and must not resume blindly
+          return {
+            success: false,
+            unknownOutcome: true,
+            deliveryMode: "queued",
+            error: queueCombined || `CLI queue failed with exit code ${queueResult.code}`,
+            executablePath: candidate,
+            version,
+          };
+        }
+      }
+
+      // Execute resume with stdin prompt ("-") (used for old CLI or after deterministic queue fallthrough)
       const result = await this.runner(
         candidate,
         ["exec", "resume", "--json", "--skip-git-repo-check", threadId, "-"],
@@ -664,6 +979,7 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
         return {
           success: false,
           activeWriter: true,
+          deliveryMode: "cli_resume",
           error: (result.stderr || result.stdout).trim() || "Active writer conflict",
           executablePath: candidate,
           version,
@@ -676,6 +992,7 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
         return {
           success: true,
           accepted: true,
+          deliveryMode: "cli_resume",
           executablePath: candidate,
           version,
         };
@@ -685,6 +1002,8 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
       if (result.code === 0) {
         return {
           success: true,
+          accepted: true,
+          deliveryMode: "cli_resume",
           executablePath: candidate,
           version,
         };
@@ -696,6 +1015,7 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
         return {
           success: false,
           unknownOutcome: true,
+          deliveryMode: "cli_resume",
           error: (result.stderr || result.stdout).trim() || (result.timedOut ? "CLI execution timed out" : `Exit code ${result.code}`),
           executablePath: candidate,
           version,
@@ -707,6 +1027,7 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
 
     return {
       success: false,
+      candidateIncompatible: !hasCompatibleCandidate ? true : undefined,
       error: lastError || "All Codex CLI candidates failed",
       executablePath: lastExe,
       version: lastVer,

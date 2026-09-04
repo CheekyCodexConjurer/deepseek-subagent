@@ -527,6 +527,8 @@ export interface DoctorReport {
   completeDeliverySupported: boolean;
 }
 
+export type ParkPredicateType = "ALL" | "ANY" | "QUORUM" | "REQUIRED";
+
 export interface ParkInput {
   job_ids?: string[];
   jobIds?: string[];
@@ -542,12 +544,21 @@ export interface ParkInput {
   goalId?: string;
   reason?: string;
   wait?: boolean;
-  delivery_mode?: "in_turn" | "cli_resume" | "none";
-  deliveryMode?: "in_turn" | "cli_resume" | "none";
+  delivery_mode?: "in_turn" | "cli_resume" | "queued" | "none";
+  deliveryMode?: "in_turn" | "cli_resume" | "queued" | "none";
   mcp_session_id?: string;
   mcpSessionId?: string;
   trusted_thread_id?: string;
   trustedThreadId?: string;
+  predicate?: ParkPredicateType;
+  predicate_type?: ParkPredicateType;
+  predicateType?: ParkPredicateType;
+  quorum_count?: number;
+  quorumCount?: number;
+  required_job_ids?: string[];
+  requiredJobIds?: string[];
+  wake_on_exception?: boolean;
+  wakeOnException?: boolean;
 }
 
 export interface ParkReceipt {
@@ -555,7 +566,7 @@ export interface ParkReceipt {
   generation: number;
   armed: boolean;
   targetIdentity: string;
-  deliveryMode: "in_turn" | "cli_resume" | "none";
+  deliveryMode: "in_turn" | "cli_resume" | "queued" | "none";
   wakeState: "waiting" | "deferred_active_writer" | "delivered" | "failed";
   obligationState: "pending";
   nextAction: "subagents_follow" | "deepseek_follow";
@@ -567,6 +578,9 @@ export interface ParkReceipt {
   reason?: string | null;
   pendingCount: number;
   readyCount: number;
+  predicateType?: ParkPredicateType;
+  quorumCount?: number | null;
+  requiredJobIds?: string[] | null;
 }
 
 export interface ParkBarrierRecord {
@@ -575,12 +589,16 @@ export interface ParkBarrierRecord {
   turnId: string | null;
   generation: number;
   armed: boolean;
-  deliveryMode: "in_turn" | "cli_resume" | "none";
+  deliveryMode: "in_turn" | "cli_resume" | "queued" | "none";
   state: "armed" | "waking" | "woken" | "idle" | "cancelled";
   reason: string | null;
   goalId: string | null;
   pausedByBridge: boolean;
   mcpSessionId: string | null;
+  predicateType: ParkPredicateType;
+  quorumCount: number | null;
+  requiredJobIds: string[] | null;
+  wakeOnException: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -591,9 +609,9 @@ export interface WakeOutboxRecord {
   generation: number;
   threadId: string;
   turnId: string | null;
-  deliveryMode: "in_turn" | "cli_resume" | "none";
-  status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed";
-  wakeState: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+  deliveryMode: "in_turn" | "cli_resume" | "queued" | "none";
+  status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed" | "superseded";
+  wakeState: "waiting" | "deferred_active_writer" | "delivered" | "failed" | "superseded";
   wakeMarker: string;
   reason: string | null;
   payloadJson: string;
@@ -601,6 +619,7 @@ export interface WakeOutboxRecord {
   nextAttemptAt: string | null;
   selectedExecutable: string | null;
   executableVersion: string | null;
+  messageId?: string | null;
   createdAt: string;
   wokenAt: string | null;
   lastError: string | null;
