@@ -715,3 +715,64 @@ test("HTTP server handles degraded state after startup failure", async () => {
     await server.stop();
   }
 });
+
+test("HTTP handles /v1/jobs/park with ParkInput and validates required job IDs", async () => {
+  const calls: Array<{ input: unknown; isAlias: boolean }> = [];
+  const service = {
+    park: async (input: unknown, isAlias = false) => {
+      calls.push({ input, isAlias });
+      return {
+        parkId: "park_1",
+        generation: 1,
+        armed: true,
+        targetIdentity: "thread_1",
+        obligationState: "pending",
+        nextAction: isAlias ? "deepseek_follow" : "subagents_follow",
+        jobIds: ["job_1"],
+        reason: "test park",
+        pendingCount: 1,
+        readyCount: 0,
+      };
+    },
+  } as unknown as BridgeService;
+
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-park-token",
+    dataDir: "C:\\deepseek-http-park-data",
+    configPath: "C:\\deepseek-http-park-data\\config.json",
+  });
+
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const client = new BridgeHttpClient(config);
+
+    // Missing job_ids returns 400
+    const emptyResponse = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/park`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + config.daemonToken,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(emptyResponse.status, 400);
+
+    // Valid park via BridgeHttpClient
+    const receipt = await client.park({ job_ids: ["job_1"], reason: "test park" });
+    assert.equal(receipt.parkId, "park_1");
+    assert.equal(receipt.armed, true);
+    assert.equal(receipt.nextAction, "subagents_follow");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.isAlias, false);
+
+    // Valid park with alias via BridgeHttpClient
+    const aliasReceipt = await client.park({ job_ids: ["job_1"] }, true);
+    assert.equal(aliasReceipt.nextAction, "deepseek_follow");
+    assert.equal(calls[1]?.isAlias, true);
+  } finally {
+    await server.stop();
+  }
+});

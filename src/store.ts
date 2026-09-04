@@ -17,6 +17,8 @@ import type {
   JobKind,
   JobRecord,
   JobStatus,
+  ParkBarrierRecord,
+  WakeOutboxRecord,
   WorkspaceStrategy,
 } from "./types.js";
 
@@ -248,12 +250,117 @@ export class BridgeStore {
     if (!adaptiveMigration) {
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?)").run(new Date().toISOString());
     }
+    const parkMigration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 15").get() as Row | undefined;
+    if (!parkMigration) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS park_barriers (
+          id TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          turn_id TEXT,
+          generation INTEGER NOT NULL DEFAULT 1,
+          armed INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL CHECK (state IN ('armed','waking','woken','idle','cancelled')),
+          reason TEXT,
+          goal_id TEXT,
+          paused_by_bridge INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS park_jobs (
+          park_id TEXT NOT NULL REFERENCES park_barriers(id) ON DELETE CASCADE,
+          job_id TEXT NOT NULL REFERENCES jobs(id),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(park_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_park_jobs_job ON park_jobs(job_id);
+        CREATE TABLE IF NOT EXISTS wake_outbox (
+          id TEXT PRIMARY KEY,
+          park_id TEXT NOT NULL REFERENCES park_barriers(id),
+          generation INTEGER NOT NULL,
+          thread_id TEXT NOT NULL,
+          turn_id TEXT,
+          status TEXT NOT NULL CHECK (status IN ('pending','waking','delivered','failed')),
+          wake_marker TEXT NOT NULL,
+          reason TEXT,
+          payload_json TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          woken_at TEXT,
+          last_error TEXT,
+          UNIQUE(park_id, generation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wake_outbox_status ON wake_outbox(status);
+        CREATE TABLE IF NOT EXISTS bridge_goals (
+          goal_id TEXT PRIMARY KEY,
+          goal_hash TEXT NOT NULL,
+          paused_at TEXT NOT NULL,
+          invalidated_at TEXT
+        );
+      `);
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?)").run(new Date().toISOString());
+    }
+    const v16Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 16").get() as Row | undefined;
+    if (!v16Migration) {
+      const barrierCols = (this.db.prepare("PRAGMA table_info(park_barriers)").all() as Row[]).map((c) => stringValue(c, "name"));
+      if (!barrierCols.includes("delivery_mode")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'none';");
+      }
+      if (!barrierCols.includes("mcp_session_id")) {
+        this.db.exec("ALTER TABLE park_barriers ADD COLUMN mcp_session_id TEXT;");
+      }
+
+      const outboxTableSql = ((this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_outbox'").get() as Row | undefined)?.sql as string | undefined) ?? "";
+      const outboxCols = (this.db.prepare("PRAGMA table_info(wake_outbox)").all() as Row[]).map((c) => stringValue(c, "name"));
+      if (!outboxTableSql.includes("deferred_active_writer") || !outboxCols.includes("wake_state")) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS wake_outbox_v16 (
+            id TEXT PRIMARY KEY,
+            park_id TEXT NOT NULL REFERENCES park_barriers(id),
+            generation INTEGER NOT NULL,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT,
+            delivery_mode TEXT NOT NULL DEFAULT 'cli_resume',
+            status TEXT NOT NULL CHECK (status IN ('pending','waking','deferred_active_writer','delivered','failed')),
+            wake_state TEXT NOT NULL DEFAULT 'waiting' CHECK (wake_state IN ('waiting','deferred_active_writer','delivered','failed')),
+            wake_marker TEXT NOT NULL,
+            reason TEXT,
+            payload_json TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            selected_executable TEXT,
+            executable_version TEXT,
+            created_at TEXT NOT NULL,
+            woken_at TEXT,
+            last_error TEXT,
+            UNIQUE(park_id, generation)
+          );
+          INSERT OR IGNORE INTO wake_outbox_v16 (
+            id, park_id, generation, thread_id, turn_id, status, wake_marker, reason, payload_json, attempts, created_at, woken_at, last_error
+          ) SELECT id, park_id, generation, thread_id, turn_id, status, wake_marker, reason, payload_json, attempts, created_at, woken_at, last_error FROM wake_outbox;
+          DROP TABLE wake_outbox;
+          ALTER TABLE wake_outbox_v16 RENAME TO wake_outbox;
+          CREATE INDEX IF NOT EXISTS idx_wake_outbox_status ON wake_outbox(status);
+        `);
+      }
+
+      const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => stringValue(c, "name"));
+      if (!jobCols.includes("mcp_session_id")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN mcp_session_id TEXT;");
+      }
+      if (!jobCols.includes("trusted_thread_id")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN trusted_thread_id TEXT;");
+      }
+
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?)").run(new Date().toISOString());
+    }
   }
 
   /** True only when no business rows exist at all (fresh database). */
   isProvablyEmpty(): boolean {
+    const hasParks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='park_barriers'").get() !== undefined;
+    const parkCountSql = hasParks ? "(SELECT COUNT(*) FROM park_barriers)" : "0";
     const row = this.db.prepare(
-      "SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM agent_activity) + (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM codex_bindings) AS total",
+      `SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM agent_activity) + (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM codex_bindings) + ${parkCountSql} AS total`,
     ).get() as Row;
     return numberValue(row, "total") === 0;
   }
@@ -335,11 +442,19 @@ export class BridgeStore {
   }
 
 
-  createJob(input: { id: string; agentId: string; kind: JobKind; requestId: string; promptHash: string }): JobRecord {
+  createJob(input: {
+    id: string;
+    agentId: string;
+    kind: JobKind;
+    requestId: string;
+    promptHash: string;
+    mcpSessionId?: string | null;
+    trustedThreadId?: string | null;
+  }): JobRecord {
     const sequenceRow = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM jobs WHERE agent_id = ?").get(input.agentId) as Row;
     const sequence = numberValue(sequenceRow, "sequence");
     const now = new Date().toISOString();
-    this.db.prepare("INSERT INTO jobs(id,agent_id,sequence,kind,request_id,prompt_hash,status,created_at) VALUES(?,?,?,?,?,?,?,?)").run(
+    this.db.prepare("INSERT INTO jobs(id,agent_id,sequence,kind,request_id,prompt_hash,status,created_at,mcp_session_id,trusted_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?)").run(
       input.id,
       input.agentId,
       sequence,
@@ -348,6 +463,8 @@ export class BridgeStore {
       input.promptHash,
       "created",
       now,
+      input.mcpSessionId ?? null,
+      input.trustedThreadId ?? null,
     );
     const job = this.getJob(input.id);
     if (!job) throw new Error("Job was not persisted");
@@ -480,16 +597,26 @@ export class BridgeStore {
     return job;
   }
 
-  setCorrelationHint(id: string, input: { threadId?: string | null; turnId?: string | null; source: string }): JobRecord {
+  setCorrelationHint(id: string, input: {
+    threadId?: string | null;
+    turnId?: string | null;
+    source: string;
+    mcpSessionId?: string | null;
+    trustedThreadId?: string | null;
+  }): JobRecord {
     const current = this.getJob(id);
     if (!current) throw new Error("Unknown job: " + id);
     const threadId = input.threadId ?? current.hintThreadId;
     const turnId = input.turnId ?? current.hintTurnId;
     const source = threadId || turnId ? input.source : null;
-    this.db.prepare("UPDATE jobs SET hint_thread_id = ?, hint_turn_id = ?, hint_source = ? WHERE id = ?").run(
+    const mcpSessionId = input.mcpSessionId !== undefined ? input.mcpSessionId : current.mcpSessionId;
+    const trustedThreadId = input.trustedThreadId !== undefined ? input.trustedThreadId : current.trustedThreadId;
+    this.db.prepare("UPDATE jobs SET hint_thread_id = ?, hint_turn_id = ?, hint_source = ?, mcp_session_id = ?, trusted_thread_id = ? WHERE id = ?").run(
       threadId,
       turnId,
       source,
+      mcpSessionId ?? null,
+      trustedThreadId ?? null,
       id,
     );
     const job = this.getJob(id);
@@ -1060,6 +1187,8 @@ export class BridgeStore {
       earlyExitAt: nullableString(row, "early_exit_at"),
       earlyExitReason: nullableString(row, "early_exit_reason"),
       escalationProposal: nullableString(row, "escalation_proposal"),
+      mcpSessionId: nullableString(row, "mcp_session_id"),
+      trustedThreadId: nullableString(row, "trusted_thread_id"),
     };
   }
 
@@ -1073,6 +1202,277 @@ export class BridgeStore {
       activityType: stringValue(row, "activity_type") as ActivityType,
       summary: stringValue(row, "summary"),
       createdAt: stringValue(row, "created_at"),
+    };
+  }
+
+  createOrUpdateParkBarrier(input: {
+    id?: string;
+    threadId: string;
+    turnId?: string | null;
+    generation?: number;
+    armed: boolean;
+    deliveryMode?: "in_turn" | "cli_resume" | "none";
+    state: "armed" | "waking" | "woken" | "idle" | "cancelled";
+    reason?: string | null;
+    goalId?: string | null;
+    pausedByBridge?: boolean;
+    mcpSessionId?: string | null;
+  }): ParkBarrierRecord {
+    const id = input.id ?? newId("park");
+    const existing = this.getParkBarrier(id);
+    const now = new Date().toISOString();
+    const deliveryMode = input.deliveryMode ?? (existing ? existing.deliveryMode : "none");
+    const mcpSessionId = input.mcpSessionId !== undefined ? input.mcpSessionId : (existing ? existing.mcpSessionId : null);
+    if (existing) {
+      const generation = input.generation ?? (existing.generation + 1);
+      this.db.prepare(`
+        UPDATE park_barriers
+        SET thread_id = ?, turn_id = ?, generation = ?, armed = ?, delivery_mode = ?, state = ?, reason = ?, goal_id = ?, paused_by_bridge = ?, mcp_session_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        input.threadId,
+        input.turnId !== undefined ? input.turnId : existing.turnId,
+        generation,
+        input.armed ? 1 : 0,
+        deliveryMode,
+        input.state,
+        input.reason !== undefined ? input.reason : existing.reason,
+        input.goalId !== undefined ? input.goalId : existing.goalId,
+        input.pausedByBridge !== undefined ? (input.pausedByBridge ? 1 : 0) : (existing.pausedByBridge ? 1 : 0),
+        mcpSessionId,
+        now,
+        id,
+      );
+    } else {
+      this.db.prepare(`
+        INSERT INTO park_barriers (id, thread_id, turn_id, generation, armed, delivery_mode, state, reason, goal_id, paused_by_bridge, mcp_session_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        input.threadId,
+        input.turnId ?? null,
+        input.generation ?? 1,
+        input.armed ? 1 : 0,
+        deliveryMode,
+        input.state,
+        input.reason ?? null,
+        input.goalId ?? null,
+        input.pausedByBridge ? 1 : 0,
+        mcpSessionId,
+        now,
+        now,
+      );
+    }
+    const result = this.getParkBarrier(id);
+    if (!result) throw new Error("Park barrier was not persisted: " + id);
+    return result;
+  }
+
+  setParkJobs(parkId: string, jobIds: string[]): void {
+    this.db.prepare("DELETE FROM park_jobs WHERE park_id = ?").run(parkId);
+    const now = new Date().toISOString();
+    for (const jobId of jobIds) {
+      this.db.prepare("INSERT OR IGNORE INTO park_jobs(park_id, job_id, created_at) VALUES(?, ?, ?)").run(parkId, jobId, now);
+    }
+  }
+
+  getParkBarrier(id: string): ParkBarrierRecord | null {
+    const row = this.db.prepare("SELECT * FROM park_barriers WHERE id = ?").get(id) as Row | undefined;
+    return row ? this.toParkBarrier(row) : null;
+  }
+
+  getParkBarrierByThread(threadId: string): ParkBarrierRecord | null {
+    const row = this.db.prepare("SELECT * FROM park_barriers WHERE thread_id = ? ORDER BY updated_at DESC LIMIT 1").get(threadId) as Row | undefined;
+    return row ? this.toParkBarrier(row) : null;
+  }
+
+  getParkBarrierJobs(parkId: string): string[] {
+    const rows = this.db.prepare("SELECT job_id FROM park_jobs WHERE park_id = ?").all(parkId) as Row[];
+    return rows.map((r) => stringValue(r, "job_id"));
+  }
+
+  findArmedParksForJob(jobId: string): ParkBarrierRecord[] {
+    const rows = this.db.prepare(
+      "SELECT pb.* FROM park_barriers pb JOIN park_jobs pj ON pj.park_id = pb.id WHERE pj.job_id = ? AND pb.state = 'armed'",
+    ).all(jobId) as Row[];
+    return rows.map((r) => this.toParkBarrier(r));
+  }
+
+  claimParkWake(parkId: string, generation: number): boolean {
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      "UPDATE park_barriers SET state = 'waking', updated_at = ? WHERE id = ? AND generation = ? AND state = 'armed'",
+    ).run(now, parkId, generation);
+    return Number(info.changes) === 1;
+  }
+
+  setParkWoken(parkId: string, generation: number): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      "UPDATE park_barriers SET state = 'woken', armed = 0, updated_at = ? WHERE id = ? AND generation = ?",
+    ).run(now, parkId, generation);
+  }
+
+  createWakeOutbox(record: {
+    id: string;
+    parkId: string;
+    generation: number;
+    threadId: string;
+    turnId?: string | null;
+    deliveryMode?: "in_turn" | "cli_resume" | "none";
+    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed";
+    wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+    wakeMarker: string;
+    reason?: string | null;
+    payloadJson: string;
+    nextAttemptAt?: string | null;
+    selectedExecutable?: string | null;
+    executableVersion?: string | null;
+  }): WakeOutboxRecord {
+    const now = new Date().toISOString();
+    const deliveryMode = record.deliveryMode ?? "cli_resume";
+    const wakeState = record.wakeState ?? (record.status === "delivered" ? "delivered" : (record.status === "deferred_active_writer" ? "deferred_active_writer" : "waiting"));
+    this.db.prepare(`
+      INSERT INTO wake_outbox (id, park_id, generation, thread_id, turn_id, delivery_mode, status, wake_state, wake_marker, reason, payload_json, attempts, next_attempt_at, selected_executable, executable_version, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+      ON CONFLICT(park_id, generation) DO NOTHING
+    `).run(
+      record.id,
+      record.parkId,
+      record.generation,
+      record.threadId,
+      record.turnId ?? null,
+      deliveryMode,
+      record.status,
+      wakeState,
+      record.wakeMarker,
+      record.reason ?? null,
+      record.payloadJson,
+      record.nextAttemptAt ?? null,
+      record.selectedExecutable ?? null,
+      record.executableVersion ?? null,
+      now,
+    );
+    const result = this.getWakeOutbox(record.parkId, record.generation);
+    if (!result) throw new Error("Wake outbox entry was not persisted");
+    return result;
+  }
+
+  getWakeOutbox(parkId: string, generation: number): WakeOutboxRecord | null {
+    const row = this.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ? AND generation = ?").get(parkId, generation) as Row | undefined;
+    return row ? this.toWakeOutbox(row) : null;
+  }
+
+  getWakeOutboxById(id: string): WakeOutboxRecord | null {
+    const row = this.db.prepare("SELECT * FROM wake_outbox WHERE id = ?").get(id) as Row | undefined;
+    return row ? this.toWakeOutbox(row) : null;
+  }
+
+  updateWakeOutboxStatus(
+    id: string,
+    status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed",
+    error?: string | null,
+    extra?: {
+      wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+      nextAttemptAt?: string | null;
+      selectedExecutable?: string | null;
+      executableVersion?: string | null;
+    },
+  ): void {
+    const now = new Date().toISOString();
+    const wakeState = extra?.wakeState ?? (status === "delivered" ? "delivered" : (status === "deferred_active_writer" ? "deferred_active_writer" : (status === "failed" ? "failed" : "waiting")));
+    this.db.prepare(`
+      UPDATE wake_outbox
+      SET status = ?,
+          wake_state = ?,
+          attempts = CASE WHEN ? = 'waking' THEN attempts ELSE attempts + 1 END,
+          woken_at = CASE WHEN ? = 'delivered' THEN ? ELSE woken_at END,
+          last_error = ?,
+          next_attempt_at = CASE WHEN ? IS NOT NULL THEN ? ELSE next_attempt_at END,
+          selected_executable = CASE WHEN ? IS NOT NULL THEN ? ELSE selected_executable END,
+          executable_version = CASE WHEN ? IS NOT NULL THEN ? ELSE executable_version END
+      WHERE id = ?
+    `).run(
+      status,
+      wakeState,
+      status,
+      status,
+      now,
+      error ?? null,
+      extra?.nextAttemptAt ?? null,
+      extra?.nextAttemptAt ?? null,
+      extra?.selectedExecutable ?? null,
+      extra?.selectedExecutable ?? null,
+      extra?.executableVersion ?? null,
+      extra?.executableVersion ?? null,
+      id,
+    );
+  }
+
+  listPendingWakeOutbox(): WakeOutboxRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM wake_outbox WHERE status IN ('pending', 'waking', 'deferred_active_writer') ORDER BY created_at ASC",
+    ).all() as Row[];
+    return rows.map((r) => this.toWakeOutbox(r));
+  }
+
+  recordBridgeGoalPause(goalId: string, goalHash: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      "INSERT INTO bridge_goals (goal_id, goal_hash, paused_at, invalidated_at) VALUES (?, ?, ?, NULL) ON CONFLICT(goal_id) DO UPDATE SET goal_hash = excluded.goal_hash, paused_at = excluded.paused_at, invalidated_at = NULL",
+    ).run(goalId, goalHash, now);
+  }
+
+  validateBridgeGoalOwnership(goalId: string, currentHash: string): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 AS valid FROM bridge_goals WHERE goal_id = ? AND goal_hash = ? AND invalidated_at IS NULL",
+    ).get(goalId, currentHash) as Row | undefined;
+    return row !== undefined;
+  }
+
+  invalidateBridgeGoalOwnership(goalId: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare("UPDATE bridge_goals SET invalidated_at = ? WHERE goal_id = ?").run(now, goalId);
+  }
+
+  private toParkBarrier(row: Row): ParkBarrierRecord {
+    return {
+      id: stringValue(row, "id"),
+      threadId: stringValue(row, "thread_id"),
+      turnId: nullableString(row, "turn_id"),
+      generation: numberValue(row, "generation"),
+      armed: numberValue(row, "armed") === 1,
+      deliveryMode: (stringValue(row, "delivery_mode") as ParkBarrierRecord["deliveryMode"]) || "none",
+      state: stringValue(row, "state") as ParkBarrierRecord["state"],
+      reason: nullableString(row, "reason"),
+      goalId: nullableString(row, "goal_id"),
+      pausedByBridge: numberValue(row, "paused_by_bridge") === 1,
+      mcpSessionId: nullableString(row, "mcp_session_id"),
+      createdAt: stringValue(row, "created_at"),
+      updatedAt: stringValue(row, "updated_at"),
+    };
+  }
+
+  private toWakeOutbox(row: Row): WakeOutboxRecord {
+    return {
+      id: stringValue(row, "id"),
+      parkId: stringValue(row, "park_id"),
+      generation: numberValue(row, "generation"),
+      threadId: stringValue(row, "thread_id"),
+      turnId: nullableString(row, "turn_id"),
+      deliveryMode: (stringValue(row, "delivery_mode") as WakeOutboxRecord["deliveryMode"]) || "cli_resume",
+      status: stringValue(row, "status") as WakeOutboxRecord["status"],
+      wakeState: (stringValue(row, "wake_state") as WakeOutboxRecord["wakeState"]) || "waiting",
+      wakeMarker: stringValue(row, "wake_marker"),
+      reason: nullableString(row, "reason"),
+      payloadJson: stringValue(row, "payload_json"),
+      attempts: numberValue(row, "attempts"),
+      nextAttemptAt: nullableString(row, "next_attempt_at"),
+      selectedExecutable: nullableString(row, "selected_executable"),
+      executableVersion: nullableString(row, "executable_version"),
+      createdAt: stringValue(row, "created_at"),
+      wokenAt: nullableString(row, "woken_at"),
+      lastError: nullableString(row, "last_error"),
     };
   }
 

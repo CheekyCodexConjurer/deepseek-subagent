@@ -19,6 +19,7 @@ export class JsonRpcStdioClient {
   private process: ChildProcess | null = null;
   private closed = false;
   private readonly notificationListeners = new Set<(notification: JsonRpcNotification) => void>();
+  serverCapabilities?: Record<string, unknown>;
 
   async start(command: string, args: string[]): Promise<void> {
     if (this.process) throw new Error("JSON-RPC client already started");
@@ -41,10 +42,16 @@ export class JsonRpcStdioClient {
     if (!child.stdin || !child.stdout) throw new Error("Codex app-server stdio was not available");
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
-    await this.call("initialize", {
+    const initResult = await this.call("initialize", {
       clientInfo: { name: "codex-opencode-bridge", title: "DeepSeek Sub-Agent", version: "0.1.0" },
       capabilities: {},
     });
+    if (initResult && typeof initResult === "object" && "capabilities" in initResult) {
+      const caps = (initResult as { capabilities?: unknown }).capabilities;
+      if (caps && typeof caps === "object") {
+        this.serverCapabilities = caps as Record<string, unknown>;
+      }
+    }
     this.notify("initialized", {});
   }
 

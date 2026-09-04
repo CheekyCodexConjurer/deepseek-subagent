@@ -79,6 +79,8 @@ export interface SpawnInput {
   threadId?: string;
   turnId?: string;
   modelRoute?: string;
+  mcpSessionId?: string;
+  trustedThreadId?: string;
 }
 
 export interface ContinueInput {
@@ -92,6 +94,8 @@ export interface ContinueInput {
   permissionId?: string;
   permissionReply?: "once" | "always" | "reject";
   permissionMessage?: string;
+  mcpSessionId?: string;
+  trustedThreadId?: string;
   /**
    * Opt-in recovery for a closed agent: when true and the agent is closed
    * after a terminal job with a persisted result (and was NOT explicitly
@@ -178,6 +182,8 @@ export interface JobRecord {
   fallbackReason?: string | null;
   fallbackStatus?: string | null;
   fallbackCount?: number;
+  mcpSessionId?: string | null;
+  trustedThreadId?: string | null;
   leaseExpiresAt?: string | null;
   attempt?: string | null;
   fence?: number | null;
@@ -519,4 +525,104 @@ export interface DoctorReport {
   displayName: string;
   checks: DoctorCheck[];
   completeDeliverySupported: boolean;
+}
+
+export interface ParkInput {
+  job_ids?: string[];
+  jobIds?: string[];
+  job_id?: string;
+  jobId?: string;
+  park_id?: string;
+  parkId?: string;
+  thread_id?: string;
+  threadId?: string;
+  turn_id?: string;
+  turnId?: string;
+  goal_id?: string;
+  goalId?: string;
+  reason?: string;
+  wait?: boolean;
+  delivery_mode?: "in_turn" | "cli_resume" | "none";
+  deliveryMode?: "in_turn" | "cli_resume" | "none";
+  mcp_session_id?: string;
+  mcpSessionId?: string;
+  trusted_thread_id?: string;
+  trustedThreadId?: string;
+}
+
+export interface ParkReceipt {
+  parkId: string;
+  generation: number;
+  armed: boolean;
+  targetIdentity: string;
+  deliveryMode: "in_turn" | "cli_resume" | "none";
+  wakeState: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+  obligationState: "pending";
+  nextAction: "subagents_follow" | "deepseek_follow";
+  nextRequiredAction?: "subagents_follow" | "deepseek_follow";
+  jobIds: string[];
+  readyJobIds?: string[];
+  statuses?: Record<string, string>;
+  resultHashes?: Record<string, string>;
+  reason?: string | null;
+  pendingCount: number;
+  readyCount: number;
+}
+
+export interface ParkBarrierRecord {
+  id: string;
+  threadId: string;
+  turnId: string | null;
+  generation: number;
+  armed: boolean;
+  deliveryMode: "in_turn" | "cli_resume" | "none";
+  state: "armed" | "waking" | "woken" | "idle" | "cancelled";
+  reason: string | null;
+  goalId: string | null;
+  pausedByBridge: boolean;
+  mcpSessionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WakeOutboxRecord {
+  id: string;
+  parkId: string;
+  generation: number;
+  threadId: string;
+  turnId: string | null;
+  deliveryMode: "in_turn" | "cli_resume" | "none";
+  status: "pending" | "waking" | "deferred_active_writer" | "delivered" | "failed";
+  wakeState: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+  wakeMarker: string;
+  reason: string | null;
+  payloadJson: string;
+  attempts: number;
+  nextAttemptAt: string | null;
+  selectedExecutable: string | null;
+  executableVersion: string | null;
+  createdAt: string;
+  wokenAt: string | null;
+  lastError: string | null;
+}
+
+export interface WakeEnvelope {
+  parkId: string;
+  generation: number;
+  reason: string;
+  jobIds: string[];
+  readyJobIds: string[];
+  statuses: Record<string, string>;
+  resultHashes: Record<string, string>;
+  pendingCount: number;
+  instruction: string;
+  marker: string;
+}
+
+export interface CodexCapabilities {
+  supportsSteer: boolean;
+  supportsStartTurn: boolean;
+  supportsToolOutput: boolean;
+  authoritativeAttachment: boolean;
+  supportsGoalPauseResume: boolean;
 }

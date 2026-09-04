@@ -4,7 +4,7 @@ import { Agent, fetch, type Dispatcher } from "undici";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
 import { BridgeError, InvalidRequestError } from "./errors.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
-import type { AgentMode, ConsultInput, ContinueInput, FollowInput, SpawnInput, WorkspaceStrategy } from "./types.js";
+import type { AgentMode, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkReceipt, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
 
 // The follow endpoint holds the HTTP response open until the worker finishes.
@@ -68,6 +68,8 @@ export class BridgeHttpServer {
     const server = this.server;
     this.server = null;
     if (!server) return;
+    (server as any).closeIdleConnections?.();
+    (server as any).closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
@@ -160,6 +162,29 @@ export class BridgeHttpServer {
       }
       return;
     }
+    if (method === "POST" && url.pathname === "/v1/jobs/park") {
+      const cancellation = new AbortController();
+      const onClose = () => {
+        if (!response.writableEnded) cancellation.abort();
+      };
+      response.once("close", onClose);
+      request.once("close", onClose);
+      try {
+        const value = asRecord(body);
+        const isAlias = Boolean(value.is_alias ?? value.isAlias);
+        const result = await this.service.park(toParkInput(body), isAlias, cancellation.signal);
+        if (!response.writableEnded) writeJson(response, 200, result);
+      } catch (error) {
+        if (cancellation.signal.aborted || response.destroyed || response.writableEnded) {
+          return;
+        }
+        throw error;
+      } finally {
+        response.off("close", onClose);
+        request.off("close", onClose);
+      }
+      return;
+    }
     if (method === "POST" && url.pathname === "/v1/jobs/abort") {
       const value = asRecord(body);
       const result = await this.service.abort(requiredString(value.agentId ?? value.agent_id, "agentId"), optionalString(value.reason));
@@ -230,7 +255,7 @@ export class BridgeHttpClient {
     return parseResponse(response);
   }
 
-  async call<T>(pathname: string, body?: unknown): Promise<T> {
+  async call<T>(pathname: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     const response = await bridgeFetch(this.baseUrl + pathname, {
       method: "POST",
       headers: {
@@ -238,16 +263,26 @@ export class BridgeHttpClient {
         "content-type": "application/json",
       },
       body: JSON.stringify(body ?? {}),
+      ...(signal ? { signal } : {}),
     }, this.dispatcher);
     return parseResponse(response) as Promise<T>;
   }
 
-  async get<T>(pathname: string): Promise<T> {
+  async get<T>(pathname: string, signal?: AbortSignal): Promise<T> {
     const response = await bridgeFetch(this.baseUrl + pathname, {
       method: "GET",
       headers: { authorization: "Bearer " + this.config.daemonToken },
+      ...(signal ? { signal } : {}),
     }, this.dispatcher);
     return parseResponse(response) as Promise<T>;
+  }
+
+  async park(input: ParkInput, isAlias = false, signal?: AbortSignal): Promise<ParkReceipt> {
+    return this.call<ParkReceipt>("/v1/jobs/park", { ...input, is_alias: isAlias }, signal);
+  }
+
+  async close(): Promise<void> {
+    await this.dispatcher.destroy();
   }
 }
 
@@ -414,6 +449,8 @@ function toSpawnInput(body: unknown): SpawnInput {
   const threadId = optionalString(value.threadId ?? value.thread_id);
   const turnId = optionalString(value.turnId ?? value.turn_id);
   const modelRoute = optionalString(value.modelRoute ?? value.model_route);
+  const mcpSessionId = optionalString(value.mcpSessionId ?? value.mcp_session_id);
+  const trustedThreadId = optionalString(value.trustedThreadId ?? value.trusted_thread_id);
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     topic: requiredString(value.topic, "topic"),
@@ -426,6 +463,8 @@ function toSpawnInput(body: unknown): SpawnInput {
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
     ...(modelRoute ? { modelRoute } : {}),
+    ...(mcpSessionId ? { mcpSessionId } : {}),
+    ...(trustedThreadId ? { trustedThreadId } : {}),
   };
 }
 
@@ -441,6 +480,8 @@ function toContinueInput(body: unknown): ContinueInput {
   const permissionMessage = optionalString(value.permissionMessage ?? value.permission_message);
   const visualContext = optionalString(value.visualContext ?? value.visual_context);
   const allowRespawnValue = value.allowRespawn ?? value.allow_respawn;
+  const mcpSessionId = optionalString(value.mcpSessionId ?? value.mcp_session_id);
+  const trustedThreadId = optionalString(value.trustedThreadId ?? value.trusted_thread_id);
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
@@ -453,6 +494,8 @@ function toContinueInput(body: unknown): ContinueInput {
     ...(permissionReply ? { permissionReply } : {}),
     ...(permissionMessage ? { permissionMessage } : {}),
     ...(allowRespawnValue === undefined ? {} : { allowRespawn: booleanValue(allowRespawnValue, "allowRespawn") }),
+    ...(mcpSessionId ? { mcpSessionId } : {}),
+    ...(trustedThreadId ? { trustedThreadId } : {}),
   };
 }
 
@@ -477,6 +520,50 @@ function toFollowInput(body: unknown): FollowInput {
     ...(jobId ? { jobId } : {}),
     ...(waitValue === undefined ? {} : { waitMinutes: integerInRange(waitValue, 1, 60, "waitMinutes") }),
     ...(graceValue === undefined ? {} : { graceMinutes: integerInRange(graceValue, 1, 10, "graceMinutes") }),
+  };
+}
+
+function toParkInput(body: unknown): ParkInput {
+  const value = asRecord(body);
+  const rawJobIds = value.job_ids ?? value.jobIds;
+  let jobIds: string[] | undefined;
+  if (Array.isArray(rawJobIds)) {
+    jobIds = rawJobIds
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .map((s) => s.trim());
+  } else if (typeof rawJobIds === "string" && rawJobIds.trim().length > 0) {
+    jobIds = [rawJobIds.trim()];
+  }
+  const singleJobId = optionalString(value.job_id ?? value.jobId);
+  if (singleJobId) {
+    if (!jobIds) {
+      jobIds = [singleJobId];
+    } else if (!jobIds.includes(singleJobId)) {
+      jobIds.push(singleJobId);
+    }
+  }
+  if (!jobIds || jobIds.length === 0) {
+    throw new InvalidRequestError("job_ids is required and must contain at least one job ID");
+  }
+  const parkId = optionalString(value.park_id ?? value.parkId);
+  const threadId = optionalString(value.thread_id ?? value.threadId);
+  const turnId = optionalString(value.turn_id ?? value.turnId);
+  const goalId = optionalString(value.goal_id ?? value.goalId);
+  const reason = optionalString(value.reason);
+  const wait = value.wait !== undefined ? Boolean(value.wait) : undefined;
+  const mcpSessionId = optionalString(value.mcp_session_id ?? value.mcpSessionId);
+  const trustedThreadId = optionalString(value.trusted_thread_id ?? value.trustedThreadId);
+  return {
+    jobIds,
+    job_ids: jobIds,
+    ...(parkId ? { parkId, park_id: parkId } : {}),
+    ...(threadId ? { threadId, thread_id: threadId } : {}),
+    ...(turnId ? { turnId, turn_id: turnId } : {}),
+    ...(goalId ? { goalId, goal_id: goalId } : {}),
+    ...(reason ? { reason } : {}),
+    ...(wait !== undefined ? { wait } : {}),
+    ...(mcpSessionId ? { mcpSessionId, mcp_session_id: mcpSessionId } : {}),
+    ...(trustedThreadId ? { trustedThreadId, trusted_thread_id: trustedThreadId } : {}),
   };
 }
 

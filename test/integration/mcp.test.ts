@@ -40,7 +40,7 @@ function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<str
   };
 }
 
-test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and deepseek_* migration aliases", async () => {
+test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and deepseek_* migration aliases", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
     configPath: "C:\\\\deepseek-test-data\\\\config.json",
@@ -59,6 +59,7 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
       "subagents_continue",
       "subagents_status",
       "subagents_follow",
+      "subagents_park",
       "subagents_abort",
       "subagents_close",
       "subagents_recover_result",
@@ -66,6 +67,7 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
       "deepseek_continue",
       "deepseek_consult",
       "deepseek_follow",
+      "deepseek_park",
       "deepseek_abort",
       "deepseek_close",
       "deepseek_recover_result",
@@ -81,6 +83,7 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
     const continueTool = tools.find((tool) => tool.name === "subagents_continue");
     const statusTool = tools.find((tool) => tool.name === "subagents_status");
     const follow = tools.find((tool) => tool.name === "subagents_follow");
+    const park = tools.find((tool) => tool.name === "subagents_park");
     const abort = tools.find((tool) => tool.name === "subagents_abort");
     const close = tools.find((tool) => tool.name === "subagents_close");
     const recover = tools.find((tool) => tool.name === "subagents_recover_result");
@@ -89,6 +92,7 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
     assert.equal(continueTool?.title, "SubAgents MCP · Continue");
     assert.equal(statusTool?.title, "SubAgents MCP · Status");
     assert.equal(follow?.title, "SubAgents MCP · Follow");
+    assert.equal(park?.title, "SubAgents MCP · Park");
     assert.equal(abort?.title, "SubAgents MCP · Abort");
     assert.equal(close?.title, "SubAgents MCP · Close");
     assert.equal(recover?.title, "SubAgents MCP · Recover result");
@@ -98,6 +102,7 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
     assert.match(statusTool?.description ?? "", /observable/i);
     assert.match(statusTool?.description ?? "", /never exposes private reasoning/i);
     assert.match(follow?.description ?? "", /without polling/i);
+    assert.match(park?.description ?? "", /subagents_follow/i);
     const followProperties = (follow?.inputSchema as { properties?: Record<string, { default?: number }> } | undefined)?.properties ?? {};
     assert.equal(followProperties.wait_minutes?.default, undefined);
     assert.equal(followProperties.grace_minutes?.default, undefined);
@@ -106,9 +111,12 @@ test("MCP exposes SubAgents MCP canonical identity, seven canonical tools and de
     const legacySpawn = tools.find((tool) => tool.name === "deepseek_spawn");
     const legacyConsult = tools.find((tool) => tool.name === "deepseek_consult");
     const legacyFollow = tools.find((tool) => tool.name === "deepseek_follow");
+    const legacyPark = tools.find((tool) => tool.name === "deepseek_park");
     assert.equal(legacySpawn?.title, "DeepSeek Sub-Agent · Spawn");
     assert.equal(legacyConsult?.title, "DeepSeek Sub-Agent · Consult");
     assert.equal(legacyFollow?.title, "DeepSeek Sub-Agent · Follow");
+    assert.equal(legacyPark?.title, "DeepSeek Sub-Agent · Park");
+    assert.match(legacyPark?.description ?? "", /deepseek_follow/i);
   } finally {
     await client.close();
     await server.close();
@@ -171,7 +179,7 @@ test("MCP handshake and tool listing complete without waiting for daemon startup
   await client.connect(clientTransport);
   try {
     const result = await client.listTools();
-    assert.equal(result.tools.length, 14);
+    assert.equal(result.tools.length, 16);
     assert.equal(starts, 0, "tool listing must not bootstrap the daemon");
     const first = client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
     const second = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
@@ -1560,6 +1568,80 @@ test("MCP subagents_follow and deepseek_follow expose receipt, earlyExit, escala
     assert.equal(appStruct.nextRequiredAction, "subagents_continue");
     assert.deepEqual(appStruct.escalation, mockEscalation);
     assert.deepEqual(appStruct.semanticProgress, mockSemanticProgress);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP subagents_park and deepseek_park park turn, preserve pending obligation, and guide to follow", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+
+  const calls: Array<{ pathname: string; body: unknown }> = [];
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      calls.push({ pathname, body });
+      if (pathname === "/v1/jobs/park") {
+        const value = body as Record<string, unknown>;
+        const isAlias = Boolean(value.is_alias);
+        return {
+          parkId: "park_100",
+          generation: 1,
+          armed: true,
+          targetIdentity: "thread_authoritative",
+          obligationState: "pending",
+          nextAction: isAlias ? "deepseek_follow" : "subagents_follow",
+          jobIds: value.job_ids ?? ["job_100"],
+          reason: value.reason ?? null,
+          pendingCount: 1,
+          readyCount: 0,
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  try {
+    // 1. subagents_park
+    const subRes = await client.callTool({
+      name: "subagents_park",
+      arguments: { job_ids: ["job_100"], reason: "waiting for worker" },
+    });
+    assert.equal(subRes.isError, undefined);
+    const subText = (subRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(subText, /SubAgents MCP parked turn on barrier park_100/);
+    assert.match(subText, /subagents_follow/);
+
+    const subStruct = subRes.structuredContent as Record<string, unknown>;
+    assert.equal(subStruct.parkId, "park_100");
+    assert.equal(subStruct.armed, true);
+    assert.equal(subStruct.obligationState, "pending");
+    assert.equal(subStruct.nextRequiredAction, "subagents_follow");
+
+    // 2. deepseek_park (alias)
+    const dsRes = await client.callTool({
+      name: "deepseek_park",
+      arguments: { job_ids: ["job_100"] },
+    });
+    assert.equal(dsRes.isError, undefined);
+    const dsText = (dsRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(dsText, /DeepSeek Sub-Agent parked turn on barrier park_100/);
+    assert.match(dsText, /deepseek_follow/);
+
+    const dsStruct = dsRes.structuredContent as Record<string, unknown>;
+    assert.equal(dsStruct.parkId, "park_100");
+    assert.equal(dsStruct.armed, true);
+    assert.equal(dsStruct.obligationState, "pending");
+    assert.equal(dsStruct.nextRequiredAction, "deepseek_follow");
   } finally {
     await client.close();
     await server.close();

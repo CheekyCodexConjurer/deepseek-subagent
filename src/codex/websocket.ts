@@ -34,6 +34,7 @@ export class JsonRpcWebSocketClient {
   private nextId = 1;
   private socket: WebSocketLike | null = null;
   private closed = false;
+  serverCapabilities?: Record<string, unknown>;
 
   async start(endpoint: string, _args: string[]): Promise<void> {
     if (this.socket) throw new Error("JSON-RPC WebSocket client already started");
@@ -55,10 +56,16 @@ export class JsonRpcWebSocketClient {
     });
     try {
       await waitForOpen(socket);
-      await this.call("initialize", {
+      const initResult = await this.call("initialize", {
         clientInfo: { name: "codex-opencode-bridge", title: "DeepSeek Sub-Agent", version: "0.1.0" },
         capabilities: {},
       });
+      if (initResult && typeof initResult === "object" && "capabilities" in initResult) {
+        const caps = (initResult as { capabilities?: unknown }).capabilities;
+        if (caps && typeof caps === "object") {
+          this.serverCapabilities = caps as Record<string, unknown>;
+        }
+      }
       this.notify("initialized", {});
     } catch (error) {
       this.closed = true;

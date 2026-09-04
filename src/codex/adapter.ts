@@ -1,13 +1,15 @@
 import { JsonRpcStdioClient, type JsonRpcNotification } from "./jsonrpc.js";
 import { JsonRpcWebSocketClient } from "./websocket.js";
 import { redactSecrets } from "../security.js";
-import type { BridgeConfig, CodexBinding, JobRecord } from "../types.js";
+import { ConflictError } from "../errors.js";
+import type { BridgeConfig, CodexBinding, CodexCapabilities, JobRecord, WakeEnvelope } from "../types.js";
 
 export interface CodexRpcTransport {
   start(command: string, args: string[]): Promise<void>;
   onNotification(listener: (notification: JsonRpcNotification) => void): () => void;
   call(method: string, params: unknown): Promise<unknown>;
   close(): Promise<void>;
+  readonly serverCapabilities?: Record<string, unknown>;
 }
 
 export interface CodexCorrelation {
@@ -17,22 +19,46 @@ export interface CodexCorrelation {
   itemId: string;
 }
 
+export const DEFAULT_CODEX_CAPABILITIES: CodexCapabilities = {
+  supportsSteer: true,
+  supportsStartTurn: true,
+  supportsToolOutput: false,
+  authoritativeAttachment: false,
+  supportsGoalPauseResume: false,
+};
+
 export interface CodexDeliveryAdapter {
   readonly available: boolean;
   readonly reason: string | null;
+  readonly capabilities: CodexCapabilities;
   start(): Promise<void>;
   close(): Promise<void>;
   deliver(job: JobRecord, binding: CodexBinding, text: string): Promise<"codex-steer" | "codex-start">;
+  deliverWake(envelope: WakeEnvelope, binding: CodexBinding): Promise<"codex-steer" | "codex-start">;
+  reconcileSend(threadId: string, marker: string, clientUserMessageId?: string | null): Promise<boolean>;
   onCorrelation(listener: (correlation: CodexCorrelation) => void): () => void;
 }
 
 export class UnavailableCodexDeliveryAdapter implements CodexDeliveryAdapter {
   readonly available = false;
+  readonly capabilities: CodexCapabilities = {
+    supportsSteer: false,
+    supportsStartTurn: false,
+    supportsToolOutput: false,
+    authoritativeAttachment: false,
+    supportsGoalPauseResume: false,
+  };
   constructor(readonly reason = "No compatible Codex App Server connection is configured") {}
   async start(): Promise<void> {}
   async close(): Promise<void> {}
   async deliver(_job: JobRecord, _binding: CodexBinding, _text: string): Promise<"codex-steer" | "codex-start"> {
     throw new Error(this.reason);
+  }
+  async deliverWake(_envelope: WakeEnvelope, _binding: CodexBinding): Promise<"codex-steer" | "codex-start"> {
+    throw new Error(this.reason);
+  }
+  async reconcileSend(_threadId: string, _marker: string): Promise<boolean> {
+    return false;
   }
   onCorrelation(_listener: (correlation: CodexCorrelation) => void): () => void {
     return () => undefined;
@@ -50,6 +76,7 @@ export const ACCEPTED_SPAWN_TOOLS = new Set<string>([...CANONICAL_SPAWN_TOOLS, .
 export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
   readonly available = true;
   readonly reason = null;
+  readonly capabilities: CodexCapabilities = { ...DEFAULT_CODEX_CAPABILITIES };
   private readonly rpc: CodexRpcTransport;
   private readonly correlationListeners = new Set<(correlation: CodexCorrelation) => void>();
   private readonly correlations = new Map<string, CodexCorrelation>();
@@ -62,6 +89,9 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     this.rpc = rpc ?? (isWebSocketEndpoint(config.codexAppServerSocket)
       ? new JsonRpcWebSocketClient()
       : new JsonRpcStdioClient());
+    if (isWebSocketEndpoint(config.codexAppServerSocket)) {
+      this.capabilities.authoritativeAttachment = true;
+    }
   }
 
   async start(): Promise<void> {
@@ -75,6 +105,18 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
       const command = this.config.codexAppServerCommand ?? "codex";
       const args = this.config.codexAppServerArgs.length > 0 ? this.config.codexAppServerArgs : ["app-server"];
       await this.rpc.start(command, args);
+    }
+    const caps = this.rpc.serverCapabilities;
+    if (caps && typeof caps === "object") {
+      if (caps.toolOutput === true) {
+        this.capabilities.supportsToolOutput = true;
+      }
+      if (caps.authoritativeAttachment === true || caps.originatingThreadAuthority === true) {
+        this.capabilities.authoritativeAttachment = true;
+      }
+      if (caps.goalPauseResume === true) {
+        this.capabilities.supportsGoalPauseResume = true;
+      }
     }
     this.unsubscribe = this.rpc.onNotification((notification) => this.handleNotification(notification));
     this.started = true;
@@ -112,6 +154,112 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     }
     await this.rpc.call("turn/start", { threadId: binding.threadId, input });
     return "codex-start";
+  }
+
+  async deliverWake(envelope: WakeEnvelope, binding: CodexBinding): Promise<"codex-steer" | "codex-start"> {
+    if (!this.started) throw new Error("Codex App Server adapter is not started");
+
+    const textLines = [
+      envelope.marker,
+      `[SubAgent Bridge Wake Notice] Park ID: ${envelope.parkId} (generation ${envelope.generation})`,
+      `Reason: ${envelope.reason}`,
+      `Ready jobs: ${envelope.readyJobIds.join(", ")}`,
+      `Statuses: ${JSON.stringify(envelope.statuses)}`,
+      `Result hashes: ${JSON.stringify(envelope.resultHashes)}`,
+      `Pending count: ${envelope.pendingCount}`,
+      `Instruction: ${envelope.instruction}`,
+    ];
+    const text = textLines.join("\n");
+
+    const input: Array<Record<string, unknown>> = [{ type: "text", text }];
+    const turnStartPayload: Record<string, unknown> = {
+      threadId: binding.threadId,
+      input,
+    };
+
+    if (this.capabilities.supportsToolOutput) {
+      turnStartPayload.toolOutput = {
+        parkId: envelope.parkId,
+        generation: envelope.generation,
+        readyJobIds: envelope.readyJobIds,
+        statuses: envelope.statuses,
+      };
+    }
+
+    let currentActiveTurnId: string | null = null;
+    try {
+      const threadInfo = await this.rpc.call("thread/read", { threadId: binding.threadId }).catch(() => null) as { activeTurnId?: string | null } | null;
+      if (threadInfo && typeof threadInfo === "object" && typeof threadInfo.activeTurnId === "string") {
+        currentActiveTurnId = threadInfo.activeTurnId;
+      }
+    } catch {
+      // continue
+    }
+
+    if (currentActiveTurnId) {
+      if (binding.originatingTurnId && currentActiveTurnId === binding.originatingTurnId) {
+        await this.rpc.call("turn/steer", {
+          threadId: binding.threadId,
+          input,
+          expectedTurnId: binding.originatingTurnId,
+        });
+        return "codex-steer";
+      } else {
+        throw new ConflictError(
+          `Cannot deliver wake into thread ${binding.threadId}: a different active turn (${currentActiveTurnId}) is in progress. Deferring to remain durably pending.`,
+          "active_turn_conflict",
+        );
+      }
+    }
+
+    if (binding.originatingTurnId) {
+      try {
+        await this.rpc.call("turn/steer", {
+          threadId: binding.threadId,
+          input,
+          expectedTurnId: binding.originatingTurnId,
+        });
+        return "codex-steer";
+      } catch (error) {
+        if (isRecoverableTurnError(error)) {
+          // The originating turn is already completed; thread is idle, starting new turn is safe.
+        } else if (isNonSteerableTurnError(error)) {
+          await this.waitForTurnCompletion(binding.threadId, binding.originatingTurnId);
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    await this.rpc.call("turn/start", turnStartPayload);
+    return "codex-start";
+  }
+
+  async reconcileSend(threadId: string, marker: string, clientUserMessageId?: string | null): Promise<boolean> {
+    try {
+      const res = await this.rpc.call("thread/read", { threadId }) as { items?: Array<{ id?: string; type?: string; text?: string; content?: unknown }> } | null;
+      if (!res || !Array.isArray(res.items)) {
+        return false;
+      }
+      for (const item of res.items) {
+        if (clientUserMessageId && item.id === clientUserMessageId) {
+          return true;
+        }
+        if (typeof item.text === "string" && item.text.includes(marker)) {
+          return true;
+        }
+        if (Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (c && typeof c === "object" && typeof (c as { text?: unknown }).text === "string" && (c as { text: string }).text.includes(marker)) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 
   onCorrelation(listener: (correlation: CodexCorrelation) => void): () => void {

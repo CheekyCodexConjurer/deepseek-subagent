@@ -13,6 +13,7 @@ import {
   type CodexDeliveryAdapter,
   UnavailableCodexDeliveryAdapter,
 } from "./codex/adapter.js";
+import { DefaultCodexCliTransport, type CodexCliTransport } from "./codex/cli-resolver.js";
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
 import { OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
@@ -32,6 +33,7 @@ import type {
   AgentRecord,
   AuthoritativeLivenessStatus,
   BridgeConfig,
+  CodexBinding,
   ConsultInput,
   ContinueInput,
   EarlyExitSignal,
@@ -43,6 +45,9 @@ import type {
   OpenCodeClientLike,
   OpenCodeEvent,
   OpenCodeMessage,
+  ParkBarrierRecord,
+  ParkInput,
+  ParkReceipt,
   ProgressActivity,
   ProgressSnapshot,
   ResolvedRoute,
@@ -50,6 +55,8 @@ import type {
   RouteStatusInfo,
   SemanticProgress,
   SpawnInput,
+  WakeEnvelope,
+  WakeOutboxRecord,
 } from "./types.js";
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
@@ -69,6 +76,7 @@ export interface ServiceDependencies {
   store?: BridgeStore;
   manager?: OpenCodeManagerLike;
   codex?: CodexDeliveryAdapter;
+  cliTransport?: CodexCliTransport;
   inbox?: InboxDelivery;
   antigravity?: AntigravityProviderLike;
 }
@@ -241,6 +249,7 @@ export class BridgeService {
   private readonly manager: OpenCodeManagerLike;
   private readonly inbox: InboxDelivery;
   private readonly antigravity: AntigravityProviderLike;
+  private readonly cliTransport: CodexCliTransport;
   private codex: CodexDeliveryAdapter;
   private managed: ManagedOpenCodeLike | null = null;
   private client: OpenCodeClientLike | null = null;
@@ -263,11 +272,26 @@ export class BridgeService {
   private readonly antigravityAbortControllers = new Map<string, AbortController>();
   private readonly antigravityTasks = new Set<Promise<void>>();
   private readonly antigravityTasksByJob = new Map<string, Promise<void>>();
+  private readonly parkWaiters = new Map<string, {
+    parkId: string;
+    generation: number;
+    jobIds: Set<string>;
+    isAlias: boolean;
+    resolve: (receipt: ParkReceipt) => void;
+    reject: (err: unknown) => void;
+    signal?: AbortSignal | undefined;
+    cleanupSignal?: (() => void) | undefined;
+  }>();
+  private readonly wakeRetryTimers = new Map<string, NodeJS.Timeout>();
   private lastSseEventAt: number | null = null;
   private retentionTimer: NodeJS.Timeout | null = null;
   private retentionState: RetentionPolicyState | null = null;
   private lifecycleState: DaemonLifecycleState = "starting";
   private startupError: string | null = null;
+
+  hasParkWaiter(parkId: string): boolean {
+    return this.parkWaiters.has(parkId);
+  }
 
   constructor(private readonly config: BridgeConfig, dependencies: ServiceDependencies = {}) {
     this.store = dependencies.store ?? new BridgeStore(path.join(config.dataDir, "bridge.sqlite"));
@@ -281,6 +305,7 @@ export class BridgeService {
       )
       : new UnavailableCodexDeliveryAdapter("Same-chat push is experimental and disabled by default");
     this.inbox = dependencies.inbox ?? new InboxDelivery(config.dataDir);
+    this.cliTransport = dependencies.cliTransport ?? new DefaultCodexCliTransport({ config });
     this.antigravity = dependencies.antigravity ?? new AntigravityAdapter({
       ...(config.antigravityCommand ? { command: config.antigravityCommand } : {}),
       sandbox: config.antigravitySandbox,
@@ -356,6 +381,13 @@ export class BridgeService {
     this.correlationFallbackTimers.clear();
     for (const timer of this.eventRetryTimers.values()) clearTimeout(timer);
     this.eventRetryTimers.clear();
+    for (const timer of this.wakeRetryTimers.values()) clearTimeout(timer);
+    this.wakeRetryTimers.clear();
+    for (const waiter of this.parkWaiters.values()) {
+      waiter.cleanupSignal?.();
+      waiter.reject(new Error("Bridge daemon stopped while waiting for park wake"));
+    }
+    this.parkWaiters.clear();
     this.eventProcessing.clear();
     this.inboxFallbackJobs.clear();
     for (const lifecycle of this.followLifecycles.values()) {
@@ -521,6 +553,8 @@ export class BridgeService {
         kind: "spawn",
         requestId: input.requestId,
         promptHash: hashPrompt(prompt),
+        mcpSessionId: input.mcpSessionId ?? null,
+        trustedThreadId: input.trustedThreadId ?? null,
       });
       this.persistCorrelationHint(job, input.threadId, input.turnId);
       // MCP arguments are not proof of origin. A new binding is accepted only
@@ -564,6 +598,8 @@ export class BridgeService {
         kind: "continue",
         requestId: input.requestId,
         promptHash: hashPrompt(prompt),
+        mcpSessionId: input.mcpSessionId ?? null,
+        trustedThreadId: input.trustedThreadId ?? null,
       });
       this.persistCorrelationHint(job, input.threadId, input.turnId);
       if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
@@ -629,6 +665,8 @@ export class BridgeService {
       kind: "continue",
       requestId: input.requestId,
       promptHash: hashPrompt(prompt),
+      mcpSessionId: input.mcpSessionId ?? null,
+      trustedThreadId: input.trustedThreadId ?? null,
     });
     // Correlation: explicit MCP hints of this request win; otherwise derive
     // the parent's last-job hints so the same thread/turn provenance follows
@@ -772,6 +810,538 @@ export class BridgeService {
       verifiedAt: new Date().toISOString(),
       ...(!stopped ? { error: "OpenCode worker process (PID " + pid + ") did not reach quiescence within " + maxWaitMs + "ms" } : {}),
     };
+  }
+
+  async park(input: ParkInput, isAlias = false, signal?: AbortSignal): Promise<ParkReceipt> {
+    this.requireRunning();
+    const rawJobIds = input.job_ids ?? input.jobIds;
+    const jobIds = Array.isArray(rawJobIds)
+      ? rawJobIds.filter((j): j is string => typeof j === "string" && j.length > 0)
+      : (typeof input.job_id === "string" ? [input.job_id] : (typeof input.jobId === "string" ? [input.jobId] : []));
+
+    if (jobIds.length === 0) {
+      throw new InvalidRequestError("job_ids must contain at least one job id", "invalid_request");
+    }
+
+    const jobs: JobRecord[] = [];
+    for (const id of jobIds) {
+      const job = this.store.getJob(id);
+      if (!job) throw new UnknownJobError(id);
+      jobs.push(job);
+    }
+
+    let commonThreadId: string | null = null;
+    let commonTurnId: string | null = null;
+    let commonMcpSessionId: string | null = null;
+    let allCorrelated = true;
+
+    for (const job of jobs) {
+      if (job.mcpSessionId) {
+        if (commonMcpSessionId === null) {
+          commonMcpSessionId = job.mcpSessionId;
+        } else if (commonMcpSessionId !== job.mcpSessionId) {
+          throw new ConflictError(
+            `Mixed session correlation rejected: job ${job.id} belongs to session ${job.mcpSessionId}, but preceding jobs belong to session ${commonMcpSessionId}. All jobs in a park set must belong to the same caller session.`,
+            "mixed_session_conflict",
+          );
+        }
+      }
+
+      const binding = this.store.getBinding(job.id);
+      const threadId = binding?.threadId ?? job.trustedThreadId;
+      const turnId = binding?.originatingTurnId ?? null;
+      if (!threadId) {
+        allCorrelated = false;
+        continue;
+      }
+      if (commonThreadId === null) {
+        commonThreadId = threadId;
+        commonTurnId = turnId;
+      } else if (commonThreadId !== threadId) {
+        throw new ConflictError(
+          `Mixed thread correlation rejected: job ${job.id} belongs to thread ${threadId}, but preceding jobs belong to thread ${commonThreadId}. All jobs in a park set must belong to the same authoritative thread.`,
+          "mixed_thread_conflict",
+        );
+      }
+    }
+
+    const callerThread = input.thread_id ?? input.threadId;
+    if (callerThread && commonThreadId && callerThread !== commonThreadId) {
+      throw new ConflictError(
+        `Caller thread_id "${callerThread}" does not match trusted target identity "${commonThreadId}"`,
+        "identity_mismatch",
+      );
+    }
+    const trustedThreadInput = input.trusted_thread_id ?? input.trustedThreadId;
+    if (trustedThreadInput && commonThreadId && trustedThreadInput !== commonThreadId) {
+      throw new ConflictError(
+        `Caller trusted_thread_id "${trustedThreadInput}" does not match trusted target identity "${commonThreadId}"`,
+        "identity_mismatch",
+      );
+    }
+    const callerTurn = input.turn_id ?? input.turnId;
+    if (callerTurn && commonTurnId && callerTurn !== commonTurnId) {
+      throw new ConflictError(
+        `Caller turn_id "${callerTurn}" does not match trusted target identity "${commonTurnId}"`,
+        "identity_mismatch",
+      );
+    }
+    const callerMcpSession = (input.mcp_session_id ?? input.mcpSessionId)?.trim() || null;
+    if (callerMcpSession && commonMcpSessionId && callerMcpSession !== commonMcpSessionId) {
+      throw new ConflictError(
+        `Caller mcp_session_id "${callerMcpSession}" does not match trusted session identity "${commonMcpSessionId}"`,
+        "identity_mismatch",
+      );
+    }
+
+    const wait = Boolean(input.wait);
+
+    // In-turn arming: every selected job must have the same non-null MCP session id matching the current caller session.
+    // Missing session provenance must fail closed.
+    const hasValidSessionProvenance =
+      Boolean(callerMcpSession) &&
+      jobs.length > 0 &&
+      jobs.every((job) => Boolean(job.mcpSessionId && job.mcpSessionId === callerMcpSession));
+    const inTurnArmed = wait && hasValidSessionProvenance;
+
+    // External-wake arming: requires authoritative trusted thread id and compatible CLI capability (or authoritative App Server attachment).
+    // On wait: true in-turn park, do not probe real CLI candidates—keep the loaded path event-driven and fast, with external eligibility handled safely/lazily.
+    const hasAuthoritativeAttachment = this.codex.capabilities?.authoritativeAttachment === true;
+    let externalArmed = false;
+    if (!wait) {
+      let cliCompatible = false;
+      if (!hasAuthoritativeAttachment && allCorrelated && commonThreadId !== null && this.cliTransport) {
+        try {
+          const probe = await this.cliTransport.probeCapabilities(
+            this.config.codexAppServerCommand || undefined,
+          );
+          cliCompatible = probe.compatible;
+        } catch {
+          cliCompatible = false;
+        }
+      }
+      externalArmed = allCorrelated && commonThreadId !== null && (hasAuthoritativeAttachment || cliCompatible);
+    } else {
+      externalArmed = allCorrelated && commonThreadId !== null && hasAuthoritativeAttachment;
+    }
+
+    const armed = wait ? inTurnArmed : externalArmed;
+    const deliveryMode: "in_turn" | "cli_resume" | "none" = wait
+      ? (inTurnArmed ? "in_turn" : "none")
+      : (externalArmed ? "cli_resume" : "none");
+
+    let parkId = input.park_id ?? input.parkId;
+    let existingBarrier = parkId ? this.store.getParkBarrier(parkId) : null;
+    if (!existingBarrier && commonThreadId) {
+      existingBarrier = this.store.getParkBarrierByThread(commonThreadId);
+    }
+    if (existingBarrier) {
+      parkId = existingBarrier.id;
+    } else if (!parkId) {
+      parkId = newId("park");
+    }
+
+    const generation = existingBarrier ? existingBarrier.generation + 1 : 1;
+    const targetIdentity = commonThreadId ?? "unbound";
+
+    const barrier = this.store.createOrUpdateParkBarrier({
+      id: parkId,
+      threadId: targetIdentity,
+      turnId: commonTurnId,
+      generation,
+      armed,
+      deliveryMode,
+      state: armed ? "armed" : "idle",
+      reason: input.reason ?? null,
+      goalId: input.goal_id ?? input.goalId ?? null,
+      mcpSessionId: input.mcp_session_id ?? input.mcpSessionId ?? null,
+    });
+
+    this.store.setParkJobs(barrier.id, jobIds);
+
+    for (const job of jobs) {
+      if (["dispatching", "running", "following", "finalizing"].includes(job.status)) {
+        this.ensureFollowLifecycle(
+          job,
+          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
+          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
+          true,
+        );
+      }
+    }
+
+    const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
+    const readyJobIds = readyJobs.map((j) => j.id);
+    const readyCount = readyJobs.length;
+    const pendingCount = jobs.length - readyCount;
+    const nextAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
+
+    if (wait && inTurnArmed) {
+      if (readyCount > 0) {
+        this.store.claimParkWake(barrier.id, barrier.generation);
+        this.store.setParkWoken(barrier.id, barrier.generation);
+
+        const statuses: Record<string, string> = {};
+        const resultHashes: Record<string, string> = {};
+        for (const rj of readyJobs) {
+          statuses[rj.id] = rj.status;
+          if (rj.resultPath) {
+            try {
+              const content = await readFile(rj.resultPath, "utf8");
+              resultHashes[rj.id] = createHash("sha256").update(content).digest("hex").slice(0, 16);
+            } catch {
+              resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
+            }
+          } else {
+            resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+          }
+        }
+
+        return {
+          parkId: barrier.id,
+          generation: barrier.generation,
+          armed,
+          targetIdentity,
+          deliveryMode: "in_turn",
+          wakeState: "delivered",
+          obligationState: "pending",
+          nextAction,
+          nextRequiredAction: nextAction,
+          jobIds,
+          readyJobIds,
+          statuses,
+          resultHashes,
+          reason: input.reason ?? null,
+          pendingCount,
+          readyCount,
+        };
+      }
+
+      if (signal?.aborted) {
+        throw new Error("Park operation aborted by caller");
+      }
+
+      return new Promise<ParkReceipt>((resolve, reject) => {
+        let cleanupSignal: (() => void) | undefined;
+        if (signal) {
+          const onAbort = async () => {
+            this.parkWaiters.delete(barrier.id);
+            let canExternal = externalArmed;
+            if (!canExternal && allCorrelated && commonThreadId !== null && this.cliTransport) {
+              try {
+                const probe = await this.cliTransport.probeCapabilities(
+                  this.config.codexAppServerCommand || undefined,
+                );
+                canExternal = probe.compatible;
+              } catch {
+                canExternal = false;
+              }
+            }
+            if (!canExternal) {
+              this.store.setParkWoken(barrier.id, barrier.generation);
+            }
+            reject(new Error("Park operation aborted by caller"));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          cleanupSignal = () => signal.removeEventListener("abort", onAbort);
+        }
+        this.parkWaiters.set(barrier.id, {
+          parkId: barrier.id,
+          generation: barrier.generation,
+          jobIds: new Set(jobIds),
+          isAlias,
+          resolve,
+          reject,
+          ...(signal !== undefined ? { signal } : {}),
+          ...(cleanupSignal !== undefined ? { cleanupSignal } : {}),
+        });
+      });
+    }
+
+    if (armed && readyCount > 0) {
+      await this.evaluateParkWakesForBarrier(barrier).catch((err) => {
+        this.lastStreamError = redactSecrets(String(err));
+      });
+    }
+
+    return {
+      parkId: barrier.id,
+      generation: barrier.generation,
+      armed,
+      targetIdentity,
+      deliveryMode,
+      wakeState: "waiting",
+      obligationState: "pending",
+      nextAction,
+      nextRequiredAction: nextAction,
+      jobIds,
+      readyJobIds,
+      reason: input.reason ?? null,
+      pendingCount,
+      readyCount,
+    };
+  }
+
+  isJobWakeEligible(job: JobRecord): boolean {
+    if (job.status === "needs_approval") {
+      return true;
+    }
+    if (["completed", "completed_partial", "timed_out"].includes(job.status)) {
+      return job.resultPath !== null;
+    }
+    if (["failed", "aborted"].includes(job.status)) {
+      return true;
+    }
+    return false;
+  }
+
+  async evaluateParkWakes(jobId: string): Promise<void> {
+    const job = this.store.getJob(jobId);
+    if (!job || !this.isJobWakeEligible(job)) return;
+    const barriers = this.store.findArmedParksForJob(job.id);
+    for (const barrier of barriers) {
+      await this.evaluateParkWakesForBarrier(barrier);
+    }
+  }
+
+  private async evaluateParkWakesForBarrier(barrier: ParkBarrierRecord): Promise<void> {
+    const waiter = this.parkWaiters.get(barrier.id);
+    if (waiter && waiter.generation === barrier.generation) {
+      const claimed = this.store.claimParkWake(barrier.id, barrier.generation);
+      if (!claimed) return;
+
+      this.parkWaiters.delete(barrier.id);
+      waiter.cleanupSignal?.();
+      this.store.setParkWoken(barrier.id, barrier.generation);
+
+      const jobIds = this.store.getParkBarrierJobs(barrier.id);
+      const jobs = jobIds.map((id) => this.store.getJob(id)).filter((j): j is JobRecord => j !== null);
+      const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
+      const readyJobIds = readyJobs.map((j) => j.id);
+      const pendingCount = jobs.length - readyJobIds.length;
+
+      const statuses: Record<string, string> = {};
+      const resultHashes: Record<string, string> = {};
+      for (const rj of readyJobs) {
+        statuses[rj.id] = rj.status;
+        if (rj.resultPath) {
+          try {
+            const content = await readFile(rj.resultPath, "utf8");
+            resultHashes[rj.id] = createHash("sha256").update(content).digest("hex").slice(0, 16);
+          } catch {
+            resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
+          }
+        } else {
+          resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+        }
+      }
+
+      waiter.resolve({
+        parkId: barrier.id,
+        generation: barrier.generation,
+        armed: barrier.armed,
+        targetIdentity: barrier.threadId,
+        deliveryMode: "in_turn",
+        wakeState: "delivered",
+        obligationState: "pending",
+        nextAction: waiter.isAlias ? "deepseek_follow" : "subagents_follow",
+        nextRequiredAction: waiter.isAlias ? "deepseek_follow" : "subagents_follow",
+        jobIds,
+        readyJobIds,
+        statuses,
+        resultHashes,
+        reason: barrier.reason,
+        pendingCount,
+        readyCount: readyJobIds.length,
+      });
+      return;
+    }
+
+    const claimed = this.store.claimParkWake(barrier.id, barrier.generation);
+    if (!claimed) return;
+
+    const jobIds = this.store.getParkBarrierJobs(barrier.id);
+    const jobs = jobIds.map((id) => this.store.getJob(id)).filter((j): j is JobRecord => j !== null);
+
+    const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
+    const readyJobIds = readyJobs.map((j) => j.id);
+    const pendingCount = jobs.length - readyJobIds.length;
+
+    const statuses: Record<string, string> = {};
+    const resultHashes: Record<string, string> = {};
+
+    for (const rj of readyJobs) {
+      statuses[rj.id] = rj.status;
+      if (rj.resultPath) {
+        try {
+          const content = await readFile(rj.resultPath, "utf8");
+          resultHashes[rj.id] = createHash("sha256").update(content).digest("hex").slice(0, 16);
+        } catch {
+          resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
+        }
+      } else {
+        resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+      }
+    }
+
+    const marker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=${barrier.id}:gen=${barrier.generation}] -->`;
+    const envelope: WakeEnvelope = {
+      parkId: barrier.id,
+      generation: barrier.generation,
+      reason: barrier.reason || "subagents park wake",
+      jobIds,
+      readyJobIds,
+      statuses,
+      resultHashes,
+      pendingCount,
+      instruction: "Call subagents_follow to consume completed jobs. Do not interpret this message as worker output.",
+      marker,
+    };
+
+    const outbox = this.store.createWakeOutbox({
+      id: newId("wake"),
+      parkId: barrier.id,
+      generation: barrier.generation,
+      threadId: barrier.threadId,
+      turnId: barrier.turnId,
+      deliveryMode: "cli_resume",
+      status: "pending",
+      wakeState: "waiting",
+      wakeMarker: marker,
+      reason: barrier.reason,
+      payloadJson: JSON.stringify(envelope),
+    });
+
+    await this.dispatchWakeOutbox(outbox, envelope);
+  }
+
+  private async dispatchWakeOutbox(outbox: WakeOutboxRecord, envelope: WakeEnvelope): Promise<void> {
+    if (outbox.nextAttemptAt && Date.now() < new Date(outbox.nextAttemptAt).getTime()) {
+      return;
+    }
+
+    const binding: CodexBinding = {
+      jobId: envelope.jobIds[0] ?? "unbound",
+      threadId: outbox.threadId,
+      originatingTurnId: outbox.turnId,
+      originatingItemId: null,
+      boundAt: outbox.createdAt,
+    };
+
+    try {
+      this.store.updateWakeOutboxStatus(outbox.id, "waking");
+
+      if (this.codex.capabilities?.authoritativeAttachment === true) {
+        await this.codex.deliverWake(envelope, binding);
+        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
+        this.store.setParkWoken(outbox.parkId, outbox.generation);
+      } else {
+        const cliResult = await this.cliTransport.deliverWake(outbox.threadId, outbox.wakeMarker);
+        if (cliResult.success) {
+          this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, {
+            wakeState: "delivered",
+            selectedExecutable: cliResult.executablePath ?? null,
+            executableVersion: cliResult.version ?? null,
+          });
+          this.store.setParkWoken(outbox.parkId, outbox.generation);
+        } else if (cliResult.activeWriter) {
+          const attempts = outbox.attempts + 1;
+          const baseDelayMs = 2000;
+          const maxDelayMs = 300_000;
+          const backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempts - 1));
+          const jitterMs = Math.floor(Math.random() * 1000);
+          const totalDelay = backoffMs + jitterMs;
+          const nextAttemptAt = new Date(Date.now() + totalDelay).toISOString();
+
+          this.store.updateWakeOutboxStatus(outbox.id, "deferred_active_writer", cliResult.error ?? "Active writer conflict", {
+            wakeState: "deferred_active_writer",
+            nextAttemptAt,
+            selectedExecutable: cliResult.executablePath ?? null,
+            executableVersion: cliResult.version ?? null,
+          });
+          this.scheduleWakeRetry(outbox.id, totalDelay);
+        } else {
+          this.store.updateWakeOutboxStatus(outbox.id, "failed", cliResult.error ?? "CLI wake delivery failed", {
+            wakeState: "failed",
+            selectedExecutable: cliResult.executablePath ?? null,
+            executableVersion: cliResult.version ?? null,
+          });
+        }
+      }
+    } catch (error: any) {
+      const message = redactSecrets(String(error));
+      const isActiveWriter = error?.code === "active_writer" ||
+        message.toLowerCase().includes("active writer") ||
+        message.toLowerCase().includes("thread-store conflict");
+
+      if (isActiveWriter) {
+        const attempts = outbox.attempts + 1;
+        const baseDelayMs = 2000;
+        const maxDelayMs = 300_000;
+        const backoffMs = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempts - 1));
+        const jitterMs = Math.floor(Math.random() * 1000);
+        const totalDelay = backoffMs + jitterMs;
+        const nextAttemptAt = new Date(Date.now() + totalDelay).toISOString();
+
+        this.store.updateWakeOutboxStatus(outbox.id, "deferred_active_writer", message, {
+          wakeState: "deferred_active_writer",
+          nextAttemptAt,
+        });
+        this.scheduleWakeRetry(outbox.id, totalDelay);
+        return;
+      }
+
+      const reconciled = await this.codex.reconcileSend(outbox.threadId, outbox.wakeMarker).catch(() => false);
+      if (reconciled) {
+        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
+        this.store.setParkWoken(outbox.parkId, outbox.generation);
+      } else {
+        this.store.updateWakeOutboxStatus(outbox.id, "failed", message, { wakeState: "failed" });
+      }
+    }
+  }
+
+  private scheduleWakeRetry(outboxId: string, delayMs: number): void {
+    if (!this.running) return;
+    const existing = this.wakeRetryTimers.get(outboxId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(async () => {
+      this.wakeRetryTimers.delete(outboxId);
+      const outbox = this.store.getWakeOutboxById(outboxId);
+      if (!outbox || outbox.status !== "deferred_active_writer") return;
+      try {
+        const envelope = JSON.parse(outbox.payloadJson) as WakeEnvelope;
+        await this.dispatchWakeOutbox(outbox, envelope);
+      } catch {}
+    }, delayMs);
+    timer.unref?.();
+    this.wakeRetryTimers.set(outboxId, timer);
+  }
+
+  private async recoverWakeOutbox(): Promise<void> {
+    const pendingOutbox = this.store.listPendingWakeOutbox();
+    for (const outbox of pendingOutbox) {
+      let envelope: WakeEnvelope;
+      try {
+        envelope = JSON.parse(outbox.payloadJson) as WakeEnvelope;
+      } catch {
+        continue;
+      }
+      const reconciled = await this.codex.reconcileSend(outbox.threadId, outbox.wakeMarker).catch(() => false);
+      if (reconciled) {
+        this.store.updateWakeOutboxStatus(outbox.id, "delivered", null, { wakeState: "delivered" });
+        this.store.setParkWoken(outbox.parkId, outbox.generation);
+      } else {
+        if (outbox.status === "deferred_active_writer" && outbox.nextAttemptAt) {
+          const waitRemaining = new Date(outbox.nextAttemptAt).getTime() - Date.now();
+          if (waitRemaining > 0) {
+            this.scheduleWakeRetry(outbox.id, waitRemaining);
+            continue;
+          }
+        }
+        await this.dispatchWakeOutbox(outbox, envelope);
+      }
+    }
   }
 
   async follow(input: FollowInput, signal?: AbortSignal): Promise<FollowResult> {
@@ -2545,6 +3115,7 @@ export class BridgeService {
         await this.deliveryAdmission.withWrite(deliverWithCurrentBinding);
       }
     });
+    await this.evaluateParkWakes(job.id);
   }
 
   private async withDeliveryLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -2737,6 +3308,9 @@ export class BridgeService {
         });
       }
     }
+    await this.recoverWakeOutbox().catch((error) => {
+      this.lastStreamError = redactSecrets(String(error));
+    });
   }
 
   private async handleCorrelation(correlation: CodexCorrelation): Promise<void> {
@@ -2792,6 +3366,7 @@ export class BridgeService {
     if (this.followLifecycles.has(job.id)) {
       await this.resolveFollow(job.id, { status: "failed", error });
     }
+    await this.evaluateParkWakes(job.id);
   }
 
   private async markNeedsApproval(agent: AgentRecord, properties: Record<string, unknown> = {}): Promise<void> {
@@ -2833,6 +3408,7 @@ export class BridgeService {
       });
     }
     this.scheduleApprovalTimer(agent.id, job.id, approvalDeadline);
+    await this.evaluateParkWakes(job.id);
   }
 
   private clearApprovalTimer(agentId: string): void {

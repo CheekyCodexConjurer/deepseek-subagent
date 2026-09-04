@@ -7,6 +7,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-server.js";
+import { ConflictError } from "./errors.js";
+import { resolveCodexTaskProvenance, type TaskProvenance } from "./codex/cli-resolver.js";
 import { canRead, ensurePrivateDir, newId, redactSecrets } from "./security.js";
 import type { BridgeConfig } from "./types.js";
 
@@ -100,14 +102,14 @@ class LazyReadyClient {
         : undefined);
   }
 
-  async call<T>(pathname: string, body?: unknown): Promise<T> {
+  async call<T>(pathname: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     await this.ensureReady();
     try {
-      return await this.client.call<T>(pathname, body);
+      return await this.client.call<T>(pathname, body, signal);
     } catch (error) {
       if (error instanceof BridgeTransportError && this.recoverFn) {
         await this.recoverFn();
-        return await this.client.call<T>(pathname, body);
+        return await this.client.call<T>(pathname, body, signal);
       }
       throw error;
     }
@@ -258,12 +260,18 @@ async function startDetachedDaemon(config: BridgeConfig): Promise<void> {
 export interface McpServerOptions {
   ensureReady?: LazyDaemonBootstrap | (() => Promise<void>);
   name?: string;
+  env?: Record<string, string | undefined>;
+  provenanceResolver?: () => TaskProvenance;
 }
 
 export function createMcpServer(
   client: BridgeHttpClient,
   options: McpServerOptions = {},
 ): McpServer {
+  const mcpProcessSessionId = `mcp-proc-${process.pid}-${newId("sess")}`;
+  const taskProvenance = options.provenanceResolver
+    ? options.provenanceResolver()
+    : resolveCodexTaskProvenance(options.env ?? process.env);
   const server = new McpServer({
     name: options.name ?? CANONICAL_SERVER_NAME,
     title: DISPLAY_NAME,
@@ -325,6 +333,36 @@ export function createMcpServer(
     job_id: z.string().min(1),
   };
 
+  const parkInputSchema = {
+    job_ids: z.array(z.string().min(1)).optional(),
+    job_id: z.string().min(1).optional(),
+    park_id: z.string().min(1).optional(),
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+    goal_id: z.string().optional(),
+    reason: z.string().max(500).optional(),
+    wait: z.boolean().optional(),
+  };
+
+  function validateCallerThread(callerThreadId?: string): void {
+    if (callerThreadId) {
+      if (taskProvenance.error) {
+        throw new ConflictError(
+          `Caller thread_id "${callerThreadId}" cannot be verified: invalid Codex task provenance (${taskProvenance.error})`,
+          "identity_mismatch",
+        );
+      }
+      if (taskProvenance.threadId && callerThreadId !== taskProvenance.threadId) {
+        throw new ConflictError(
+          `Caller thread_id "${callerThreadId}" does not match trusted Codex task identity "${taskProvenance.threadId}"`,
+          "identity_mismatch",
+        );
+      }
+    }
+  }
+
+  const trustedThreadId = taskProvenance.threadId ?? undefined;
+
   // --- Canonical SubAgents MCP Surface ---
 
   server.registerTool("subagents_spawn", {
@@ -343,15 +381,19 @@ export function createMcpServer(
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("subagents_follow"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
+      validateCallerThread(args.thread_id);
       const payload = {
         ...args,
         request_id: args.request_id ?? newId("request"),
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload, extra?.signal);
       return acceptedResult(result, false);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -372,15 +414,19 @@ export function createMcpServer(
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("subagents_follow"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
+      validateCallerThread(args.thread_id);
       const payload = {
         ...args,
         request_id: args.request_id ?? newId("request"),
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload, extra?.signal);
       return acceptedResult(result, false);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -390,14 +436,15 @@ export function createMcpServer(
     description: "Get one immediate observable progress snapshot for an existing agent. Use only when the user asks for progress, a task is taking unusually long, or the snapshot materially changes the orchestrator's next decision. Do not use repeatedly to wait for completion. Never exposes private reasoning.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: consultInputSchema,
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Observable SubAgents MCP status snapshot returned." }],
         structuredContent: result,
       };
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -466,11 +513,49 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args, extra?.signal);
       return followResult(result, false);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_park", {
+    title: DISPLAY_NAME + " · Park",
+    description: "Park the current orchestration turn and wait for one or more running jobs to wake it when ready. Returns immediately with an armed receipt if bridge-observed authoritative correlation confirms the target thread, or armed: false if authoritative attachment is not supported or correlated. Parking never consumes a job: the obligation remains pending and you must follow the ready jobs with subagents_follow upon waking.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: parkInputSchema,
+    outputSchema: {
+      parkId: z.string(),
+      generation: z.number(),
+      armed: z.boolean(),
+      targetIdentity: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("subagents_follow"),
+      jobIds: z.array(z.string()),
+      reason: z.string().nullable().optional(),
+      pendingCount: z.number(),
+      readyCount: z.number(),
+      deliveryMode: z.enum(["in_turn", "cli_resume", "none"]).optional(),
+      wakeState: z.enum(["waiting", "deferred_active_writer", "delivered", "failed"]).optional(),
+      readyJobIds: z.array(z.string()).optional(),
+    },
+  }, async (args, extra) => {
+    try {
+      validateCallerThread(args.thread_id);
+      const payload = {
+        ...args,
+        wait: args.wait !== undefined ? args.wait : true,
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/park", payload, extra?.signal);
+      return parkResult(result, false);
+    } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -487,11 +572,12 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("closed"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args, extra?.signal);
       return technicalResult(result, "SubAgents MCP task stopped.");
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -507,11 +593,12 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("closed"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args, extra?.signal);
       return technicalResult(result, "SubAgents MCP agent closed.");
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -521,14 +608,15 @@ export function createMcpServer(
     description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: recoverInputSchema,
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<unknown>("/v1/jobs/recover", args);
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Persisted SubAgents MCP result recovered." }],
         structuredContent: { result },
       };
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -551,15 +639,19 @@ export function createMcpServer(
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("deepseek_follow"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
+      validateCallerThread(args.thread_id);
       const payload = {
         ...args,
         request_id: args.request_id ?? newId("request"),
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload, extra?.signal);
       return acceptedResult(result, true);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -580,15 +672,19 @@ export function createMcpServer(
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("deepseek_follow"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
+      validateCallerThread(args.thread_id);
       const payload = {
         ...args,
         request_id: args.request_id ?? newId("request"),
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
       };
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/continue", payload, extra?.signal);
       return acceptedResult(result, true);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -598,14 +694,15 @@ export function createMcpServer(
     description: "Get one immediate observable progress snapshot for an existing DeepSeek agent. Use only when the user asks for progress, a task is taking unusually long, or the snapshot materially changes the orchestrator's next decision. Do not use repeatedly to wait for completion. Never exposes private reasoning.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: consultInputSchema,
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Observable DeepSeek progress snapshot returned." }],
         structuredContent: result,
       };
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -629,11 +726,50 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args, extra?.signal);
       return followResult(result, true);
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("deepseek_park", {
+    title: LEGACY_DISPLAY_NAME + " · Park",
+    description: "Park the current orchestration turn and wait for one or more running DeepSeek jobs to wake it when ready. Returns immediately with an armed receipt if bridge-observed authoritative correlation confirms the target thread, or armed: false if authoritative attachment is not supported or correlated. Parking never consumes a job: the obligation remains pending and you must follow the ready jobs with deepseek_follow upon waking.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: parkInputSchema,
+    outputSchema: {
+      parkId: z.string(),
+      generation: z.number(),
+      armed: z.boolean(),
+      targetIdentity: z.string(),
+      obligationState: z.literal("pending"),
+      nextRequiredAction: z.literal("deepseek_follow"),
+      jobIds: z.array(z.string()),
+      reason: z.string().nullable().optional(),
+      pendingCount: z.number(),
+      readyCount: z.number(),
+      deliveryMode: z.enum(["in_turn", "cli_resume", "none"]).optional(),
+      wakeState: z.enum(["waiting", "deferred_active_writer", "delivered", "failed"]).optional(),
+      readyJobIds: z.array(z.string()).optional(),
+    },
+  }, async (args, extra) => {
+    try {
+      validateCallerThread(args.thread_id);
+      const payload = {
+        ...args,
+        is_alias: true,
+        wait: args.wait !== undefined ? args.wait : true,
+        mcp_session_id: mcpProcessSessionId,
+        ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/park", payload, extra?.signal);
+      return parkResult(result, true);
+    } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -650,11 +786,12 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("closed"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/abort", args, extra?.signal);
       return technicalResult(result, "DeepSeek task stopped.");
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -670,11 +807,12 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("closed"),
     },
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args);
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/close", args, extra?.signal);
       return technicalResult(result, "DeepSeek agent closed.");
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -684,14 +822,15 @@ export function createMcpServer(
     description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: recoverInputSchema,
-  }, async (args) => {
+  }, async (args, extra) => {
     try {
-      const result = await readyClient.call<unknown>("/v1/jobs/recover", args);
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Persisted DeepSeek result recovered." }],
         structuredContent: { result },
       };
     } catch (error) {
+      if (extra?.signal?.aborted) throw error;
       return errorResult(error);
     }
   });
@@ -820,6 +959,62 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
       ...(escalation ? { escalation } : {}),
       ...(semanticProgress ? { semanticProgress } : {}),
       obligationState: "closed",
+    },
+  };
+}
+
+function parkResult(result: Record<string, unknown>, isAlias = false): {
+  content: [{ type: "text"; text: string }];
+  structuredContent: {
+    parkId: string;
+    generation: number;
+    armed: boolean;
+    targetIdentity: string;
+    obligationState: "pending";
+    nextRequiredAction: "deepseek_follow" | "subagents_follow";
+    jobIds: string[];
+    reason: string | null;
+    pendingCount: number;
+    readyCount: number;
+    deliveryMode?: "in_turn" | "cli_resume" | "none";
+    wakeState?: "waiting" | "deferred_active_writer" | "delivered" | "failed";
+    readyJobIds?: string[];
+  };
+} {
+  const parkId = String(result.parkId ?? "");
+  const armed = Boolean(result.armed);
+  const targetIdentity = String(result.targetIdentity ?? "");
+  const nextRequiredAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
+  const displayName = isAlias ? LEGACY_DISPLAY_NAME : DISPLAY_NAME;
+  const deliveryMode = result.deliveryMode as ("in_turn" | "cli_resume" | "none") | undefined;
+  const wakeState = result.wakeState as ("waiting" | "deferred_active_writer" | "delivered" | "failed") | undefined;
+  const readyJobIds = Array.isArray(result.readyJobIds) ? (result.readyJobIds as string[]) : undefined;
+
+  let text: string;
+  if (deliveryMode === "in_turn" && wakeState === "delivered") {
+    text = `${displayName} wake delivered for barrier ${parkId} (target: ${targetIdentity}). Ready jobs: ${readyJobIds && readyJobIds.length > 0 ? readyJobIds.join(", ") : "none"}. Jobs remain pending; consume them with ${nextRequiredAction}.`;
+  } else if (armed) {
+    text = `${displayName} parked turn on barrier ${parkId} (target: ${targetIdentity}). The turn will wake when ready jobs finish. Jobs remain pending; consume them with ${nextRequiredAction} upon wake.`;
+  } else {
+    text = `${displayName} park registered barrier ${parkId} (unarmed; authoritative attachment or bridge correlation not active). Consume pending jobs with ${nextRequiredAction}.`;
+  }
+
+  return {
+    content: [{ type: "text" as const, text }],
+    structuredContent: {
+      parkId,
+      generation: Number(result.generation ?? 1),
+      armed,
+      targetIdentity,
+      obligationState: "pending" as const,
+      nextRequiredAction,
+      jobIds: Array.isArray(result.jobIds) ? (result.jobIds as string[]) : [],
+      reason: result.reason !== undefined && result.reason !== null ? String(result.reason) : null,
+      pendingCount: Number(result.pendingCount ?? 0),
+      readyCount: Number(result.readyCount ?? 0),
+      ...(deliveryMode ? { deliveryMode } : {}),
+      ...(wakeState ? { wakeState } : {}),
+      ...(readyJobIds ? { readyJobIds } : {}),
     },
   };
 }

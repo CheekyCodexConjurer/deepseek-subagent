@@ -16,6 +16,10 @@ export type BridgeErrorCode =
   | "not_continuable"
   | "not_followable"
   | "state_conflict"
+  | "mixed_thread_conflict"
+  | "mixed_session_conflict"
+  | "identity_mismatch"
+  | "active_turn_conflict"
   | "unauthorized"
   | "internal"
   | "service_unavailable";
