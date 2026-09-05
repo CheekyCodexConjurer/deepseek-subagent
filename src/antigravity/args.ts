@@ -6,13 +6,15 @@
  */
 export const AGY_COMMAND = process.platform === "win32" ? "agy.exe" : "agy";
 export const AGY_MODEL = "gemini-3.8-flash-high";
-export const AGY_PRINT_TIMEOUT = "15m";
+export const AGY_PRINT_TIMEOUT_UNLIMITED = "2562047h47m16s";
+export const AGY_PRINT_TIMEOUT_SENTINEL = AGY_PRINT_TIMEOUT_UNLIMITED;
+export const AGY_PRINT_TIMEOUT = AGY_PRINT_TIMEOUT_UNLIMITED;
 export const AGY_MAX_PROMPT_LENGTH = 30_000;
 
 export interface AntigravityCliOptions {
   model?: string;
-  printTimeout?: string;
-  timeoutMs?: number;
+  printTimeout?: string | null;
+  timeoutMs?: number | null;
   sandbox?: boolean;
   addDirs?: string[];
   dangerouslySkipPermissions?: boolean;
@@ -36,8 +38,13 @@ export function buildAgyArgs(prompt: string, options: AntigravityCliOptions = {}
   if (options.sandbox) args.push("--sandbox");
   for (const directory of options.addDirs ?? []) args.push("--add-dir", directory);
   if (options.dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
-  const printTimeout = options.printTimeout
-    ?? (options.timeoutMs !== undefined ? formatPrintTimeout(options.timeoutMs) : AGY_PRINT_TIMEOUT);
+
+  const printTimeout = (typeof options.printTimeout === "string" && options.printTimeout.length > 0)
+    ? options.printTimeout
+    : (typeof options.timeoutMs === "number" && options.timeoutMs > 0)
+      ? formatPrintTimeout(options.timeoutMs)
+      : AGY_PRINT_TIMEOUT_UNLIMITED;
+
   return [
     ...args,
     "-p",

@@ -16,7 +16,7 @@ import {
 import { DefaultCodexCliTransport, type CodexCliTransport } from "./codex/cli-resolver.js";
 import { TranscriptAttestor } from "./codex/transcript-attestor.js";
 import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
-import { OpenCodeTransportError } from "./opencode/client.js";
+import { OpenCodeHttpError, OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
 import { AntigravityProcessError, AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
@@ -29,10 +29,14 @@ import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
+  AcceptedBatchOperation,
   ActiveRouteSource,
   AgentActivity,
+  AgentMode,
   AgentRecord,
   AuthoritativeLivenessStatus,
+  BatchItemInput,
+  BatchItemReceipt,
   BridgeConfig,
   CodexBinding,
   ConsultInput,
@@ -56,9 +60,12 @@ import type {
   ResultEnvelope,
   RouteStatusInfo,
   SemanticProgress,
+  SpawnBatchInput,
   SpawnInput,
+  SwarmOperationalCounters,
   WakeEnvelope,
   WakeOutboxRecord,
+  WorkspaceStrategy,
 } from "./types.js";
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
@@ -108,6 +115,8 @@ export interface AcceptedOperation {
   state: "Starting";
   message: string;
   outcome?: "accepted" | "dispatch_unknown";
+  priority?: number;
+  exclusiveResources?: string[];
 }
 
 export class BridgeBusyError extends ConflictError {
@@ -117,6 +126,19 @@ export class BridgeBusyError extends ConflictError {
     super("Agent is busy with job " + jobId + ". Do not retry in a loop; wait for its asynchronous result or call deepseek_abort.", "busy");
     this.name = "BridgeBusyError";
   }
+}
+
+function isBackpressureError(error: unknown): boolean {
+  if (error instanceof BridgeBusyError) return true;
+  if (typeof error === "object" && error !== null) {
+    const status = (error as any).status ?? (error as any).statusCode;
+    if (status === 429 || status === 503) return true;
+    const code = String((error as any).code ?? "").toLowerCase();
+    if (code.includes("rate_limit") || code.includes("busy") || code.includes("overloaded") || code.includes("capacity")) return true;
+    const msg = String((error as any).message ?? "").toLowerCase();
+    if (msg.includes("429") || msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("overloaded") || msg.includes("capacity") || msg.includes("busy")) return true;
+  }
+  return false;
 }
 
 export type DaemonLifecycleState = "starting" | "recovering" | "ready" | "degraded";
@@ -138,6 +160,10 @@ export interface ServiceStatus {
   lastStreamError: string | null;
   activeRoute: ResolvedRoute | null;
   activeRouteSource: ActiveRouteSource;
+  capabilities?: Record<string, boolean>;
+  swarm?: SwarmOperationalCounters;
+  workerMaxExecutionMinutes?: number | null;
+  workerExecutionTimeout?: string;
   error?: string | null;
 }
 
@@ -153,7 +179,7 @@ export interface QuiescenceProof {
   error?: string;
 }
 
-const ACTIVE_JOB_STATUSES = new Set(["dispatching", "running", "following", "finalizing", "needs_approval"]);
+const ACTIVE_JOB_STATUSES = new Set(["queued", "dispatching", "running", "following", "finalizing", "needs_approval"]);
 const TERMINAL_JOB_STATUSES = new Set(["completed", "completed_partial", "timed_out", "failed", "aborted", "delivered"]);
 
 const DISPATCH_UNKNOWN_WARNING = "DeepSeek Sub-Agent accepted the task, but OpenCode dispatch acceptance is uncertain after a transport failure. Follow this job (deepseek_follow) or abort it (deepseek_abort) to settle the obligation.";
@@ -268,6 +294,12 @@ export class BridgeService {
   private readonly agentOperationLocks = new Map<string, Promise<void>>();
   private readonly requestLocks = new Map<string, Promise<void>>();
   private readonly deliveryAdmission = new DeliveryAdmission();
+  private readonly repoPreparationLocks = new Map<string, Promise<void>>();
+  private readonly activeExclusiveResources = new Map<string, string>();
+  private drainingQueue = false;
+  private drainPending = false;
+  private readonly pendingDispatches = new Map<string, { prompt: string; workerInput?: WorkerPromptInput; contextFiles?: string[] }>();
+  private readonly dispatchWaiters = new Map<string, { resolve: (op: AcceptedOperation) => void; reject: (err: unknown) => void }>();
   private readonly correlationFallbackTimers = new Map<string, NodeJS.Timeout>();
   private readonly inboxFallbackJobs = new Set<string>();
   private readonly approvalTimers = new Map<string, NodeJS.Timeout>();
@@ -293,12 +325,15 @@ export class BridgeService {
   private retentionState: RetentionPolicyState | null = null;
   private lifecycleState: DaemonLifecycleState = "starting";
   private startupError: string | null = null;
+  private targetCredits: number;
+  private readonly successfulJobIds = new Set<string>();
 
   hasParkWaiter(parkId: string): boolean {
     return this.parkWaiters.has(parkId);
   }
 
   constructor(private readonly config: BridgeConfig, dependencies: ServiceDependencies = {}) {
+    this.targetCredits = this.config.swarmCreditCeiling ?? 8;
     this.store = dependencies.store ?? new BridgeStore(path.join(config.dataDir, "bridge.sqlite"));
     this.ownedStore = !dependencies.store;
     this.manager = dependencies.manager ?? new OpenCodeManager(config);
@@ -320,6 +355,32 @@ export class BridgeService {
       timeoutMs: this.effectiveWorkerTimeoutMs(),
     });
     this.transcriptAttestor = dependencies.transcriptAttestor ?? new TranscriptAttestor({ sessionsDir: dependencies.sessionsDir });
+  }
+
+  getTargetCredits(): number {
+    return this.targetCredits;
+  }
+
+  recordBackpressure(reason?: string): void {
+    const floor = 1;
+    this.targetCredits = Math.max(floor, Math.floor(this.targetCredits / 2));
+    if (reason) {
+      this.lastStreamError = redactSecrets(`Swarm backpressure recorded (${reason}); targetCredits reduced to ${this.targetCredits}`);
+    }
+  }
+
+  recordSuccess(): void {
+    const ceiling = this.config.swarmCreditCeiling ?? 8;
+    if (this.targetCredits < ceiling) {
+      this.targetCredits += 1;
+    }
+  }
+
+  private recordTerminalSuccess(jobId: string): void {
+    if (!this.successfulJobIds.has(jobId)) {
+      this.successfulJobIds.add(jobId);
+      this.recordSuccess();
+    }
   }
 
   isReady(): boolean {
@@ -367,6 +428,7 @@ export class BridgeService {
       await this.recoverPendingJobs();
       this.lifecycleState = "ready";
       this.running = true;
+      this.scheduleDrain();
       this.scheduleRetentionPolicy();
     } catch (error) {
       this.lifecycleState = "degraded";
@@ -430,6 +492,10 @@ export class BridgeService {
     await this.manager.stop().catch(() => undefined);
     this.store.stopServers();
     if (this.ownedStore) this.store.close();
+    for (const waiter of this.dispatchWaiters.values()) {
+      waiter.reject(new Error("Bridge daemon stopped"));
+    }
+    this.dispatchWaiters.clear();
     this.client = null;
     this.managed = null;
   }
@@ -457,6 +523,21 @@ export class BridgeService {
       lastStreamError: this.lastStreamError,
       activeRoute: active,
       activeRouteSource: this.effectiveRouteSource(),
+      capabilities: {
+        batch_scheduler: true,
+      },
+      swarm: {
+        queueDepth: this.store.getQueueDepth(),
+        active: this.store.getActiveJobCount(),
+        targetCredits: this.targetCredits,
+        oldestWaitMs: this.store.getOldestWaitMs(),
+        resourceClaims: this.getActiveResourceClaimsList(),
+        capabilities: {
+          batch_scheduler: true,
+        },
+      },
+      workerMaxExecutionMinutes: this.config.workerMaxExecutionMinutes ?? null,
+      workerExecutionTimeout: this.config.workerMaxExecutionMinutes ? `${this.config.workerMaxExecutionMinutes}m` : "unlimited",
       ...(this.startupError ? { error: this.startupError } : {}),
     };
   }
@@ -480,8 +561,9 @@ export class BridgeService {
     this.requireRunning();
     if (!input.task.trim()) throw new InvalidRequestError("Task must not be empty");
     if (input.task.length > this.config.maxTaskLength) throw new InvalidRequestError("Task exceeds configured length limit");
-    return this.withRequestIdLock(input.requestId, async () => {
-      const existing = this.store.getJobByRequestId(input.requestId);
+    const requestId = input.requestId ?? newId("request");
+    const op = await this.withRequestIdLock(requestId, async () => {
+      const existing = input.requestId ? this.store.getJobByRequestId(input.requestId) : null;
       if (existing) return this.acceptedRequest(existing);
       const route = this.resolveRouteForSpawn(input.modelRoute);
       const repositoryRoot = path.resolve(input.cwd ?? defaultWorkspace());
@@ -489,16 +571,9 @@ export class BridgeService {
       const mode = input.mode ?? "analyze";
       const strategy = input.workspaceStrategy ?? (mode === "edit" ? "worktree" : "shared");
       const agentId = newId("agent");
-      // The worktree path is deterministic and requires no side effects:
-      // compute it now so context containment is fully validated against the
-      // effective workspace BEFORE any worktree/session/job is created. A
-      // rejected context can never orphan a worktree.
       const workspacePath = strategy === "shared"
         ? repositoryRoot
         : path.join(repositoryRoot, ".deepseek-worktrees", agentId);
-      // Strict existence/regular-file/size validation runs against the
-      // repository root (the worktree does not exist yet); the mapped paths
-      // below are then used by the worker inside the created worktree.
       const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
       const candidateContextFiles = await this.resolveCandidateContextFiles(
         input.task,
@@ -516,57 +591,800 @@ export class BridgeService {
         ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles, allowedExternalFiles)
         : validatedContextFiles;
       const isAntigravity = route.providerId === "antigravity";
-      const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
-      // Antigravity reads context files from the planned workspace instead of
-      // embedding their contents in argv. This makes the complete prompt
-      // check possible before a worktree/session/job is created.
-      const antigravityPrompt = isAntigravity
-        ? await buildWorkerPrompt({ ...input, contextFiles, mode, workspaceStrategy: strategy }, workspacePath, promptOptions)
-        : null;
-      const createdWorkspace = await prepareWorkspace(repositoryRoot, strategy, agentId);
-      const prompt = antigravityPrompt ?? await buildWorkerPrompt(
-        { ...input, contextFiles, mode, workspaceStrategy: strategy },
-        createdWorkspace,
-        promptOptions,
-      );
       const title = normalizeTitle(input.topic);
-      // The Antigravity provider runs the agy executable directly in the
-      // prepared workspace; it has no OpenCode session, so none is created.
-      const session = isAntigravity
-        ? null
-        : await this.clientOrThrow().createSession(createdWorkspace, title);
-      const agent = this.store.createAgent({
-        id: agentId,
-        title,
-        topic: input.topic.trim() || title,
-        repositoryRoot,
-        workspacePath: createdWorkspace,
-        workspaceStrategy: strategy,
+      const promptWorkerInput: WorkerPromptInput = {
+        ...input,
+        topic: input.topic?.trim() || title,
         mode,
-        opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown"),
-        opencodeSessionId: session?.id ?? "antigravity:" + agentId,
-        modelProviderId: route.providerId,
-        modelId: route.modelId,
-        modelVariant: route.variant,
-        modelRoute: route.name,
+        workspaceStrategy: strategy,
+        contextFiles,
+        ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+      };
+      const prompt = strategy === "worktree"
+        ? ""
+        : await buildWorkerPrompt(
+            promptWorkerInput,
+            workspacePath,
+            workerPromptOptions(this.config, isAntigravity, allowedExternalFiles),
+          );
+      const promptHash = hashPrompt(prompt);
+      const priority = typeof input.priority === "number" ? Math.max(1, Math.min(100, Math.floor(input.priority))) : 50;
+      const exclusiveResources = Array.isArray(input.exclusiveResources)
+        ? input.exclusiveResources.map((r) => r.trim()).filter((r) => r.length > 0)
+        : [];
+      const { agent, job } = this.store.admitUnary({
+        agent: {
+          id: agentId,
+          title,
+          topic: input.topic.trim() || title,
+          repositoryRoot,
+          workspacePath,
+          workspaceStrategy: strategy,
+          mode,
+          opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown"),
+          opencodeSessionId: isAntigravity ? "antigravity:" + agentId : "pending:" + agentId,
+          modelProviderId: route.providerId,
+          modelId: route.modelId,
+          modelVariant: route.variant,
+          modelRoute: route.name,
+        },
+        job: {
+          id: newId("job"),
+          agentId,
+          kind: "spawn",
+          status: "queued",
+          priority,
+          exclusiveResources,
+          requestId,
+          promptHash,
+          queuedAt: new Date().toISOString(),
+          mcpSessionId: input.mcpSessionId ?? null,
+          trustedThreadId: input.trustedThreadId ?? null,
+        },
+        correlationHint: {
+          threadId: input.threadId,
+          turnId: input.turnId,
+        },
+        dispatchEnvelope: {
+          prompt,
+          promptHash,
+          workerInput: promptWorkerInput,
+          contextFiles: contextFiles ?? [],
+        },
       });
       this.recordActivity(agent, null, "dispatch", isAntigravity
         ? "Created an Antigravity agent for the task (no OpenCode session)"
         : "Created OpenCode session for the DeepSeek task");
-      const job = this.store.createJob({
-        id: newId("job"),
-        agentId: agent.id,
-        kind: "spawn",
-        requestId: input.requestId,
-        promptHash: hashPrompt(prompt),
-        mcpSessionId: input.mcpSessionId ?? null,
-        trustedThreadId: input.trustedThreadId ?? null,
+      this.pendingDispatches.set(job.id, {
+        prompt,
+        workerInput: promptWorkerInput,
+        contextFiles,
       });
-      this.persistCorrelationHint(job, input.threadId, input.turnId);
-      // MCP arguments are not proof of origin. A new binding is accepted only
-      // after the configured App Server reports this job in item/completed.
-      return this.dispatch(agent, job, prompt, { ...input, mode, workspaceStrategy: strategy }, contextFiles);
+
+      let dispatchResult: AcceptedOperation | undefined;
+      let dispatchError: unknown;
+      this.dispatchWaiters.set(job.id, {
+        resolve: (op) => { dispatchResult = op; },
+        reject: (err) => { dispatchError = err; },
+      });
+
+      try {
+        await this.drainQueue();
+
+        if (dispatchError) {
+          throw dispatchError;
+        }
+        if (dispatchResult) {
+          return dispatchResult;
+        }
+        return this.accepted(this.store.getJob(job.id) ?? job);
+      } finally {
+        this.dispatchWaiters.delete(job.id);
+      }
     });
+    return op;
+  }
+
+  async spawnBatch(input: SpawnBatchInput): Promise<AcceptedBatchOperation> {
+    this.requireRunning();
+    if (!input || !Array.isArray(input.items) || input.items.length === 0) {
+      throw new InvalidRequestError("Batch items must be a non-empty array");
+    }
+    const batchRequestId = input.batchRequestId?.trim() || newId("batch_req");
+
+    const seenRequestIds = new Set<string>();
+    for (const item of input.items) {
+      if (!item || typeof item.task !== "string" || !item.task.trim()) {
+        throw new InvalidRequestError("Batch item task must not be empty");
+      }
+      if (item.task.length > this.config.maxTaskLength) {
+        throw new InvalidRequestError("Batch item task exceeds configured length limit");
+      }
+      if (item.priority !== undefined) {
+        if (typeof item.priority !== "number" || !Number.isFinite(item.priority) || item.priority < 1 || item.priority > 100) {
+          throw new InvalidRequestError("Batch item priority must be a number between 1 and 100");
+        }
+      }
+      if (item.exclusiveResources !== undefined) {
+        if (!Array.isArray(item.exclusiveResources) || item.exclusiveResources.some((r) => typeof r !== "string" || !r.trim())) {
+          throw new InvalidRequestError("Batch item exclusiveResources must be an array of non-empty strings");
+        }
+      }
+      if (item.requestId) {
+        if (seenRequestIds.has(item.requestId)) {
+          throw new InvalidRequestError("Duplicate requestId within batch: " + item.requestId);
+        }
+        seenRequestIds.add(item.requestId);
+      }
+    }
+
+    const batchHash = computeBatchHash(input.items);
+
+    return this.withRequestIdLock(batchRequestId, async () => {
+      const existingBatch = this.store.getBatchByRequestId(batchRequestId);
+      if (existingBatch) {
+        if (existingBatch.batchHash === batchHash) {
+          const existingJobs = this.store.listBatchJobs(existingBatch.id);
+          const items: BatchItemReceipt[] = existingJobs.map((j) => ({
+            jobId: j.id,
+            agentId: j.agentId,
+            requestId: j.requestId ?? undefined,
+            status: j.status === "queued" ? "queued" : "accepted",
+          }));
+          return {
+            accepted: true,
+            batchId: existingBatch.id,
+            batchRequestId: existingBatch.requestId,
+            items,
+          };
+        }
+        throw new ConflictError("Conflicting payload for existing batch request ID: " + batchRequestId);
+      }
+
+      for (const item of input.items) {
+        const raw = item as unknown as Record<string, unknown>;
+        const reqId = item.requestId ?? (typeof raw.request_id === "string" ? raw.request_id : undefined);
+        if (reqId) {
+          const existingJob = this.store.getJobByRequestId(reqId);
+          if (existingJob) {
+            throw new ConflictError("Job request ID already exists: " + reqId);
+          }
+        }
+      }
+
+      const preparedItems: Array<{
+        item: BatchItemInput;
+        agentId: string;
+        jobId: string;
+        title: string;
+        topic: string;
+        repositoryRoot: string;
+        workspacePath: string;
+        strategy: WorkspaceStrategy;
+        mode: AgentMode;
+        route: ResolvedRoute;
+        isAntigravity: boolean;
+        prompt: string;
+        promptWorkerInput: WorkerPromptInput;
+        contextFiles: string[];
+        priority: number;
+        exclusiveResources: string[];
+        requestId: string;
+        threadId?: string | undefined;
+        turnId?: string | undefined;
+        mcpSessionId?: string | undefined;
+        trustedThreadId?: string | undefined;
+        opencodeServerId: string;
+        opencodeSessionId: string;
+      }> = [];
+
+      for (const item of input.items) {
+        const raw = item as unknown as Record<string, unknown>;
+        const routeName = item.modelRoute ?? (typeof raw.model_route === "string" ? raw.model_route : undefined);
+        const route = this.resolveRouteForSpawn(routeName);
+        const cwd = item.cwd ?? (typeof raw.cwd === "string" ? raw.cwd : undefined);
+        const repositoryRoot = path.resolve(cwd ?? defaultWorkspace());
+        await ensureDirectory(repositoryRoot);
+        const mode = item.mode ?? (typeof raw.mode === "string" ? raw.mode as AgentMode : undefined) ?? "analyze";
+        const stratRaw = item.workspaceStrategy ?? (typeof raw.workspace_strategy === "string" ? raw.workspace_strategy as WorkspaceStrategy : undefined);
+        const strategy = stratRaw ?? (mode === "edit" ? "worktree" : "shared");
+        const agentId = newId("agent");
+        const jobId = newId("job");
+        const workspacePath = strategy === "shared"
+          ? repositoryRoot
+          : path.join(repositoryRoot, ".deepseek-worktrees", agentId);
+        const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
+        const inputFiles = item.contextFiles ?? (Array.isArray(raw.context_files) ? raw.context_files as string[] : []);
+        const topic = (item.topic ?? (typeof raw.topic === "string" ? raw.topic : "") ?? "").trim();
+        const candidateContextFiles = await this.resolveCandidateContextFiles(
+          item.task,
+          topic,
+          inputFiles,
+          this.config.globalGeminiContextPath,
+        );
+        const validatedContextFiles = await validateContextFilesStrict(
+          repositoryRoot,
+          candidateContextFiles,
+          this.config.maxContextFileBytes,
+          allowedExternalFiles,
+        );
+        const contextFiles = strategy === "worktree"
+          ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles, allowedExternalFiles)
+          : validatedContextFiles;
+        const isAntigravity = route.providerId === "antigravity";
+        const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
+        const visualContext = item.visualContext ?? (typeof raw.visual_context === "string" ? raw.visual_context : undefined);
+        const promptWorkerInput: WorkerPromptInput = {
+          topic,
+          task: item.task,
+          mode,
+          workspaceStrategy: strategy,
+          contextFiles,
+          ...(visualContext ? { visualContext } : {}),
+        };
+        const prompt = strategy === "worktree"
+          ? ""
+          : await buildWorkerPrompt(promptWorkerInput, workspacePath, promptOptions);
+        const title = normalizeTitle(topic);
+        const rawPriority = typeof item.priority === "number" ? item.priority : (typeof raw.priority === "number" ? raw.priority : 50);
+        const priority = Math.max(1, Math.min(100, Math.floor(rawPriority)));
+        const rawRes = item.exclusiveResources ?? (Array.isArray(raw.exclusive_resources) ? raw.exclusive_resources as string[] : []);
+        const exclusiveResources = Array.from(new Set(rawRes.map((r) => String(r).trim()).filter((r) => r.length > 0))).sort();
+        const requestId = item.requestId ?? (typeof raw.request_id === "string" ? raw.request_id : undefined) ?? newId("request");
+        const threadId = item.threadId ?? (typeof raw.thread_id === "string" ? raw.thread_id : undefined);
+        const turnId = item.turnId ?? (typeof raw.turn_id === "string" ? raw.turn_id : undefined);
+        const mcpSessionId = item.mcpSessionId ?? (typeof raw.mcp_session_id === "string" ? raw.mcp_session_id : undefined);
+        const trustedThreadId = item.trustedThreadId ?? (typeof raw.trusted_thread_id === "string" ? raw.trusted_thread_id : undefined);
+        const session = isAntigravity
+          ? null
+          : await this.clientOrThrow().createSession(workspacePath, title);
+        const opencodeSessionId = isAntigravity ? "antigravity:" + agentId : session!.id;
+        const opencodeServerId = isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown");
+
+        preparedItems.push({
+          item,
+          agentId,
+          jobId,
+          title,
+          topic: topic || title,
+          repositoryRoot,
+          workspacePath,
+          strategy,
+          mode,
+          route,
+          isAntigravity,
+          prompt,
+          promptWorkerInput,
+          contextFiles,
+          priority,
+          exclusiveResources,
+          requestId,
+          threadId,
+          turnId,
+          mcpSessionId,
+          trustedThreadId,
+          opencodeServerId,
+          opencodeSessionId,
+        });
+      }
+
+      const batchId = newId("batch");
+      this.store.admitBatch({
+        batch: {
+          id: batchId,
+          requestId: batchRequestId,
+          batchHash,
+          status: "queued",
+        },
+        items: preparedItems.map((prep, prepIndex) => ({
+          agent: {
+            id: prep.agentId,
+            title: prep.title,
+            topic: prep.topic,
+            repositoryRoot: prep.repositoryRoot,
+            workspacePath: prep.workspacePath,
+            workspaceStrategy: prep.strategy,
+            mode: prep.mode,
+            opencodeServerId: prep.opencodeServerId,
+            opencodeSessionId: prep.opencodeSessionId,
+            modelProviderId: prep.route.providerId,
+            modelId: prep.route.modelId,
+            modelVariant: prep.route.variant,
+            modelRoute: prep.route.name,
+          },
+          job: {
+            id: prep.jobId,
+            agentId: prep.agentId,
+            kind: "spawn",
+            status: "queued",
+            batchId,
+            priority: prep.priority,
+            exclusiveResources: prep.exclusiveResources,
+            requestId: prep.requestId,
+            promptHash: hashPrompt(prep.prompt),
+            queuedAt: new Date(Date.now() + prepIndex).toISOString(),
+            mcpSessionId: prep.mcpSessionId ?? null,
+            trustedThreadId: prep.trustedThreadId ?? null,
+          },
+          correlationHint: (prep.threadId || prep.turnId) ? {
+            threadId: prep.threadId,
+            turnId: prep.turnId,
+          } : undefined,
+          dispatchEnvelope: {
+            prompt: prep.prompt,
+            promptHash: hashPrompt(prep.prompt),
+            workerInput: prep.promptWorkerInput,
+            contextFiles: prep.contextFiles,
+          },
+        })),
+      });
+
+      for (const prep of preparedItems) {
+        this.pendingDispatches.set(prep.jobId, {
+          prompt: prep.prompt,
+          workerInput: prep.promptWorkerInput,
+          contextFiles: prep.contextFiles,
+        });
+      }
+
+      await this.drainQueue();
+
+      const receipts: BatchItemReceipt[] = preparedItems.map((prep) => {
+        const currentJob = this.store.getJob(prep.jobId);
+        const status = currentJob?.status === "queued" ? "queued" : "accepted";
+        return {
+          jobId: prep.jobId,
+          agentId: prep.agentId,
+          requestId: prep.requestId,
+          status,
+        };
+      });
+
+      return {
+        accepted: true,
+        batchId,
+        batchRequestId,
+        items: receipts,
+        capabilities: {
+          batch_scheduler: true,
+        },
+      };
+    });
+  }
+
+  private async withRepoPreparationLock<T>(repositoryRoot: string, fn: () => Promise<T>): Promise<T> {
+    const canonical = path.resolve(repositoryRoot).toLowerCase();
+    const prevLock = this.repoPreparationLocks.get(canonical) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const nextLock = new Promise<void>((r) => { releaseLock = r; });
+    this.repoPreparationLocks.set(canonical, nextLock);
+    try {
+      await prevLock;
+      return await fn();
+    } finally {
+      if (this.repoPreparationLocks.get(canonical) === nextLock) {
+        this.repoPreparationLocks.delete(canonical);
+      }
+      releaseLock();
+    }
+  }
+
+  private getActiveExclusiveResources(): Set<string> {
+    const claimed = new Set<string>();
+    for (const [res, jobId] of this.activeExclusiveResources.entries()) {
+      const job = this.store.getJob(jobId);
+      if (!job || !["dispatching", "running", "following", "finalizing", "needs_approval"].includes(job.status)) {
+        this.activeExclusiveResources.delete(res);
+      } else {
+        claimed.add(res);
+      }
+    }
+    const activeJobs = this.store.listActiveJobs();
+    for (const job of activeJobs) {
+      if (Array.isArray(job.exclusiveResources)) {
+        for (const res of job.exclusiveResources) {
+          claimed.add(res);
+          this.activeExclusiveResources.set(res, job.id);
+        }
+      }
+    }
+    return claimed;
+  }
+
+  private releaseExclusiveResources(jobId: string): void {
+    for (const [res, claimJobId] of this.activeExclusiveResources.entries()) {
+      if (claimJobId === jobId) {
+        this.activeExclusiveResources.delete(res);
+      }
+    }
+  }
+
+  private onJobSettled(jobId: string, batchId?: string | null): void {
+    this.releaseExclusiveResources(jobId);
+    this.syncBatchStatus(batchId);
+    this.scheduleDrain();
+  }
+
+  private getActiveResourceClaimsList(): Array<{ resource: string; jobId: string }> {
+    this.getActiveExclusiveResources();
+    const list: Array<{ resource: string; jobId: string }> = [];
+    for (const [resource, jobId] of this.activeExclusiveResources.entries()) {
+      list.push({ resource, jobId });
+    }
+    return list;
+  }
+
+  private syncBatchStatus(batchId: string | null | undefined): void {
+    if (!batchId) return;
+    const batch = this.store.getBatch(batchId);
+    if (!batch) return;
+    const jobs = this.store.listBatchJobs(batchId);
+    if (jobs.length === 0) return;
+    const allTerminal = jobs.every((j) => TERMINAL_JOB_STATUSES.has(j.status));
+    const anyRunning = jobs.some((j) => ["dispatching", "running", "following", "finalizing", "needs_approval"].includes(j.status));
+    if (allTerminal) {
+      const anyFailed = jobs.some((j) => ["failed", "aborted", "timed_out"].includes(j.status));
+      this.store.updateBatchStatus(batchId, anyFailed ? "failed" : "completed");
+    } else if (anyRunning) {
+      this.store.updateBatchStatus(batchId, "running");
+    }
+  }
+
+  private scheduleDrain(): void {
+    if (this.drainingQueue) {
+      this.drainPending = true;
+      return;
+    }
+    this.drainPending = false;
+    this.drainQueue().catch((err) => {
+      this.lastStreamError = redactSecrets(String(err));
+    });
+  }
+
+  private async drainQueue(): Promise<void> {
+    if (this.drainingQueue) {
+      this.drainPending = true;
+      return;
+    }
+    this.drainingQueue = true;
+    try {
+      while (this.lifecycleState === "ready" || this.lifecycleState === "recovering") {
+        const activeCount = this.store.getActiveJobCount();
+        const availableCredits = this.targetCredits - activeCount;
+        if (availableCredits <= 0) break;
+
+        const queuedJobs = this.store.listQueuedJobs();
+        if (queuedJobs.length === 0) break;
+
+        const claimedResources = this.getActiveExclusiveResources();
+        const now = Date.now();
+
+        const candidates = queuedJobs.map((job) => {
+          const waitMs = Math.max(0, now - (parseTimestamp(job.queuedAt ?? job.createdAt) ?? now));
+          const elapsedSec = Math.floor(waitMs / 1000);
+          const agingBonus = Math.min(50, Math.floor(elapsedSec / 5));
+          const basePriority = job.priority ?? 50;
+          const effectivePriority = basePriority + agingBonus;
+          return { job, effectivePriority, waitMs };
+        });
+
+        candidates.sort((a, b) => {
+          if (b.effectivePriority !== a.effectivePriority) {
+            return b.effectivePriority - a.effectivePriority;
+          }
+          if (b.waitMs !== a.waitMs) {
+            return b.waitMs - a.waitMs;
+          }
+          const timeA = parseTimestamp(a.job.queuedAt ?? a.job.createdAt) ?? 0;
+          const timeB = parseTimestamp(b.job.queuedAt ?? b.job.createdAt) ?? 0;
+          if (timeA !== timeB) {
+            return timeA - timeB;
+          }
+          const seqA = a.job.sequence ?? 0;
+          const seqB = b.job.sequence ?? 0;
+          if (seqA !== seqB) {
+            return seqA - seqB;
+          }
+          return a.job.id.localeCompare(b.job.id);
+        });
+
+        const activeJobs = this.store.listActiveJobs();
+        const activeAgents = new Set(activeJobs.map((j) => j.agentId));
+
+        let dispatchedAny = false;
+        for (const candidate of candidates) {
+          if (activeAgents.has(candidate.job.agentId)) continue;
+
+          const resources = candidate.job.exclusiveResources ?? [];
+          const hasConflict = resources.some((r) => claimedResources.has(r));
+          if (hasConflict) continue;
+
+          for (const r of resources) {
+            claimedResources.add(r);
+          }
+          activeAgents.add(candidate.job.agentId);
+
+          try {
+            await this.dispatchQueuedJob(candidate.job);
+            dispatchedAny = true;
+          } catch (err) {
+            this.lastStreamError = redactSecrets(String(err));
+            dispatchedAny = true;
+          }
+          break;
+        }
+
+        if (!dispatchedAny) {
+          break;
+        }
+      }
+    } finally {
+      this.drainingQueue = false;
+      if (this.drainPending) {
+        this.scheduleDrain();
+      }
+    }
+  }
+
+  private async dispatchQueuedJob(job: JobRecord): Promise<void> {
+    const waiter = this.dispatchWaiters.get(job.id);
+    this.dispatchWaiters.delete(job.id);
+
+    const claimedJob = this.store.claimQueuedJobForDispatch(job.id, job.fence);
+    if (!claimedJob) {
+      const current = this.store.getJob(job.id);
+      if (current?.status === "dispatching" || current?.status === "running") {
+        return;
+      }
+      this.store.deleteDispatchEnvelope(job.id);
+      this.pendingDispatches.delete(job.id);
+      this.onJobSettled(job.id, job.batchId);
+      const err = new Error(
+        current?.status === "aborted"
+          ? "Invalid job transition: aborted -> dispatching"
+          : `Failed to claim queued job ${job.id} for dispatch`
+      );
+      waiter?.reject(err);
+      if (current?.status === "aborted") {
+        throw err;
+      }
+      return;
+    }
+    job = claimedJob;
+
+    const agent = this.store.getAgent(job.agentId);
+    if (!agent || agent.status === "closed" || agent.status === "aborted") {
+      const err = new Error(
+        !agent
+          ? "Agent not found for queued job: " + job.agentId
+          : `Agent ${job.agentId} is in invalid state '${agent.status}' for dispatch`
+      );
+      this.store.updateJobStatus(job.id, "failed", err.message);
+      this.store.deleteDispatchEnvelope(job.id);
+      this.pendingDispatches.delete(job.id);
+      this.onJobSettled(job.id, job.batchId);
+      if (this.followLifecycles.has(job.id)) {
+        await this.resolveFollow(job.id, { status: "failed", error: err.message });
+      }
+      await this.evaluateParkWakes(job.id).catch((e: unknown) => {
+        this.lastStreamError = redactSecrets(String(e));
+      });
+      waiter?.reject(err);
+      return;
+    }
+
+    const envelope = this.store.getDispatchEnvelope(job.id);
+    const pending = this.pendingDispatches.get(job.id);
+    let prompt: string | undefined;
+    let workerInput: WorkerPromptInput | undefined;
+    let contextFiles: string[] | undefined;
+
+    if (envelope) {
+      if (envelope.prompt) {
+        const computedHash = hashPrompt(envelope.prompt);
+        if (computedHash !== job.promptHash || computedHash !== envelope.promptHash) {
+          const err = new Error(`Dispatch envelope integrity mismatch for job ${job.id}`);
+          this.store.updateJobStatus(job.id, "failed", err.message);
+          const currentAgent = this.store.getAgent(agent.id);
+          if (currentAgent && currentAgent.status !== "closed" && currentAgent.status !== "aborted") {
+            this.store.updateAgentStatus(agent.id, "failed", err.message);
+          }
+          this.store.deleteDispatchEnvelope(job.id);
+          this.pendingDispatches.delete(job.id);
+          this.onJobSettled(job.id, job.batchId);
+          if (this.followLifecycles.has(job.id)) {
+            await this.resolveFollow(job.id, { status: "failed", error: err.message });
+          }
+          await this.evaluateParkWakes(job.id).catch((e: unknown) => {
+            this.lastStreamError = redactSecrets(String(e));
+          });
+          waiter?.reject(err);
+          return;
+        }
+      }
+      prompt = envelope.prompt;
+      workerInput = envelope.workerInput as WorkerPromptInput;
+      contextFiles = envelope.contextFiles;
+    } else if (pending) {
+      prompt = pending.prompt;
+      workerInput = pending.workerInput;
+      contextFiles = pending.contextFiles;
+    }
+
+    try {
+      if (workerInput && (workerInput as any).permissionReply) {
+        const permInput = workerInput as any;
+        const currentAgent = this.store.getAgent(agent.id);
+        if (currentAgent && currentAgent.status !== "working") {
+          this.store.updateAgentStatus(agent.id, "working");
+        }
+        this.store.updateJobStatus(job.id, "running");
+        if (Array.isArray(job.exclusiveResources)) {
+          for (const res of job.exclusiveResources) {
+            this.activeExclusiveResources.set(res, job.id);
+          }
+        }
+        try {
+          await this.clientOrThrow().replyPermission(
+            agent.opencodeSessionId,
+            permInput.permissionId,
+            permInput.permissionReply,
+            permInput.permissionMessage,
+          );
+          const afterReply = this.store.getJob(job.id);
+          if (afterReply?.status === "running" && afterReply.permissionId === permInput.permissionId) {
+            this.store.setJobPermission(job.id, null);
+          }
+          this.store.deleteDispatchEnvelope(job.id);
+          this.pendingDispatches.delete(job.id);
+          waiter?.resolve(this.accepted(this.store.getJob(job.id) ?? job));
+          return;
+        } catch (error) {
+          const message = redactSecrets(String(error instanceof Error ? error.message : error));
+          this.store.updateJobStatus(job.id, "failed", message);
+          const curAgent = this.store.getAgent(agent.id);
+          if (curAgent && curAgent.status !== "closed" && curAgent.status !== "aborted") {
+            this.store.updateAgentStatus(agent.id, "failed", message);
+          }
+          this.store.deleteDispatchEnvelope(job.id);
+          this.pendingDispatches.delete(job.id);
+          this.onJobSettled(job.id, job.batchId);
+          waiter?.reject(error);
+          throw error;
+        }
+      }
+
+      if (agent.workspaceStrategy === "worktree") {
+        await this.withRepoPreparationLock(agent.repositoryRoot, async () => {
+          return prepareWorkspace(agent.repositoryRoot, "worktree", agent.id);
+        });
+      }
+
+      const isAntigravity = agent.modelProviderId === "antigravity";
+      if (!isAntigravity && agent.opencodeSessionId.startsWith("pending:")) {
+        const session = await this.clientOrThrow().createSession(agent.workspacePath, agent.title);
+        this.store.updateAgentSession(agent.id, this.managed?.serverId ?? "unknown", session.id);
+        agent.opencodeSessionId = session.id;
+        agent.opencodeServerId = this.managed?.serverId ?? "unknown";
+      }
+
+      if (!prompt || (agent.workspaceStrategy === "worktree" && job.kind !== "continue")) {
+        if (!workerInput) {
+          const err = new Error(`Dispatch envelope missing or prompt empty for job ${job.id}`);
+          this.store.updateJobStatus(job.id, "failed", err.message);
+          const currentAgent = this.store.getAgent(agent.id);
+          if (currentAgent && currentAgent.status !== "closed" && currentAgent.status !== "aborted") {
+            this.store.updateAgentStatus(agent.id, "failed", err.message);
+          }
+          this.store.deleteDispatchEnvelope(job.id);
+          this.pendingDispatches.delete(job.id);
+          this.onJobSettled(job.id, job.batchId);
+          if (this.followLifecycles.has(job.id)) {
+            await this.resolveFollow(job.id, { status: "failed", error: err.message });
+          }
+          await this.evaluateParkWakes(job.id).catch((e: unknown) => {
+            this.lastStreamError = redactSecrets(String(e));
+          });
+          waiter?.reject(err);
+          return;
+        }
+        const workerContextFiles = "contextFiles" in workerInput && Array.isArray(workerInput.contextFiles) ? workerInput.contextFiles : undefined;
+        const effectiveContextFiles = workerContextFiles ?? contextFiles ?? [];
+        const effectiveWorkerInput: WorkerPromptInput = {
+          ...workerInput,
+          contextFiles: effectiveContextFiles,
+        };
+        const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
+        const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
+        prompt = await buildWorkerPrompt(effectiveWorkerInput, agent.workspacePath, promptOptions);
+      }
+
+      if (!prompt) {
+        const err = new Error(`Dispatch envelope missing or prompt empty for job ${job.id}`);
+        this.store.updateJobStatus(job.id, "failed", err.message);
+        const currentAgent = this.store.getAgent(agent.id);
+        if (currentAgent && currentAgent.status !== "closed" && currentAgent.status !== "aborted") {
+          this.store.updateAgentStatus(agent.id, "failed", err.message);
+        }
+        this.store.deleteDispatchEnvelope(job.id);
+        this.pendingDispatches.delete(job.id);
+        this.onJobSettled(job.id, job.batchId);
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, { status: "failed", error: err.message });
+        }
+        await this.evaluateParkWakes(job.id).catch((e: unknown) => {
+          this.lastStreamError = redactSecrets(String(e));
+        });
+        waiter?.reject(err);
+        return;
+      }
+
+      this.store.updateJobStatus(job.id, "dispatching");
+
+      const currentFollow = this.followLifecycles.get(job.id);
+      if (currentFollow && !currentFollow.settled) {
+        const now = Date.now();
+        const startedAt = now;
+        const deadlineAt = startedAt + currentFollow.waitMinutes * 60_000;
+        this.store.setFollowWindow(job.id, {
+          startedAt: new Date(startedAt).toISOString(),
+          deadlineAt: new Date(deadlineAt).toISOString(),
+          graceMinutes: currentFollow.graceMinutes,
+          graceDeadlineAt: null,
+          gracefulFinalizeAttempted: false,
+        });
+        const timeoutMs = this.effectiveWorkerTimeoutMs(currentFollow.waitMinutes, currentFollow.graceMinutes);
+        const leaseExpiresAt = timeoutMs !== null ? new Date(startedAt + timeoutMs).toISOString() : null;
+        this.store.updateJobLiveness(job.id, { leaseExpiresAt });
+        if (this.config.workerMaxExecutionMinutes !== null) {
+          this.scheduleDeadlineTimer(currentFollow, deadlineAt);
+        }
+      }
+
+      if (Array.isArray(job.exclusiveResources)) {
+        for (const res of job.exclusiveResources) {
+          this.activeExclusiveResources.set(res, job.id);
+        }
+      }
+
+      if (job.batchId) {
+        this.store.updateBatchStatus(job.batchId, "running");
+      }
+
+      const op = await this.dispatch(agent, job, prompt, workerInput, contextFiles);
+      this.store.deleteDispatchEnvelope(job.id);
+      this.pendingDispatches.delete(job.id);
+      waiter?.resolve(op);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const current = this.store.getJob(job.id);
+      const currentAgent = this.store.getAgent(agent.id);
+      const preservesApproval = current?.status === "needs_approval" || currentAgent?.status === "needs_approval";
+      if (!preservesApproval) {
+        this.store.updateJobStatus(job.id, "failed", errorMessage);
+        if (currentAgent && currentAgent.status !== "closed" && currentAgent.status !== "aborted") {
+          this.store.updateAgentStatus(agent.id, "failed", errorMessage);
+        }
+        this.store.deleteDispatchEnvelope(job.id);
+        this.pendingDispatches.delete(job.id);
+        this.onJobSettled(job.id, job.batchId);
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, { status: "failed", error: errorMessage });
+        }
+        await this.evaluateParkWakes(job.id).catch((err: unknown) => {
+          this.lastStreamError = redactSecrets(String(err));
+        });
+      } else {
+        this.store.deleteDispatchEnvelope(job.id);
+        this.pendingDispatches.delete(job.id);
+      }
+      waiter?.reject(error);
+      if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
+        this.recordBackpressure("bridge_busy");
+        (error as any).backpressureRecorded = true;
+      }
+      throw error;
+    }
   }
 
   async continueJob(input: ContinueInput): Promise<AcceptedOperation> {
@@ -598,18 +1416,68 @@ export class BridgeService {
         }
         return this.resumeApproval(agent, active, prompt);
       }
-      const job = this.store.createJob({
-        id: newId("job"),
-        agentId: agent.id,
-        kind: "continue",
-        requestId: input.requestId,
-        promptHash: hashPrompt(prompt),
-        mcpSessionId: input.mcpSessionId ?? null,
-        trustedThreadId: input.trustedThreadId ?? null,
+      const priorJob = this.store.getLatestJobForAgent(agent.id);
+      const priority = priorJob?.priority ?? 50;
+      const exclusiveResources = priorJob?.exclusiveResources ?? [];
+      const jobId = newId("job");
+      const promptHash = hashPrompt(prompt);
+      const workerInput: WorkerPromptInput = {
+        task: input.task,
+        relation: input.relation,
+        ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+      };
+      const { job } = this.store.admitContinuation({
+        job: {
+          id: jobId,
+          agentId: agent.id,
+          kind: "continue",
+          status: "queued",
+          priority,
+          exclusiveResources,
+          requestId: input.requestId,
+          promptHash,
+          queuedAt: new Date().toISOString(),
+          mcpSessionId: input.mcpSessionId ?? null,
+          trustedThreadId: input.trustedThreadId ?? null,
+        },
+        correlationHint: (input.threadId || input.turnId) ? {
+          threadId: input.threadId,
+          turnId: input.turnId,
+          source: "mcp",
+        } : undefined,
+        dispatchEnvelope: {
+          prompt,
+          promptHash,
+          workerInput,
+          contextFiles: [],
+        },
       });
-      this.persistCorrelationHint(job, input.threadId, input.turnId);
-      if (agent.status !== "working") this.store.updateAgentStatus(agent.id, "working");
-      return this.dispatch(agent, job, prompt, input);
+      this.pendingDispatches.set(job.id, {
+        prompt,
+        workerInput,
+        contextFiles: [],
+      });
+
+      let dispatchResult: AcceptedOperation | undefined;
+      let dispatchError: unknown;
+      this.dispatchWaiters.set(job.id, {
+        resolve: (op) => { dispatchResult = op; },
+        reject: (err) => { dispatchError = err; },
+      });
+
+      try {
+        await this.drainQueue();
+
+        if (dispatchError) {
+          throw dispatchError;
+        }
+        if (dispatchResult) {
+          return dispatchResult;
+        }
+        return this.accepted(this.store.getJob(job.id) ?? job);
+      } finally {
+        this.dispatchWaiters.delete(job.id);
+      }
     });
   }
 
@@ -628,7 +1496,7 @@ export class BridgeService {
     if (input.permissionId || input.permissionReply || input.permissionMessage) {
       throw new InvalidRequestError("permission fields are not applicable when resuming a closed agent", "invalid_request");
     }
-    const lastJob = this.store.listJobs().find((job) => job.agentId === agent.id) ?? null;
+    const lastJob = this.store.getLatestJobForAgent(agent.id);
     if (!lastJob) throw new ConflictError("Agent has no completed job to resume from", "not_continuable");
     if (lastJob.status === "aborted") {
       throw new ConflictError("Agent was explicitly aborted; it cannot be resumed", "not_continuable");
@@ -646,48 +1514,101 @@ export class BridgeService {
       relation: input.relation ?? "followup",
       ...(input.visualContext ? { visualContext: input.visualContext } : {}),
     }, workspacePath, workerPromptOptions(this.config, isAntigravity));
-    const session = isAntigravity
-      ? null
-      : await this.clientOrThrow().createSession(workspacePath, title);
-    const child = this.store.createAgent({
-      id: childId,
-      title,
-      topic: agent.topic,
-      repositoryRoot: agent.repositoryRoot,
-      workspacePath,
-      workspaceStrategy: agent.workspaceStrategy,
-      mode: agent.mode ?? "analyze",
-      opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? agent.opencodeServerId),
-      opencodeSessionId: session?.id ?? "antigravity:" + childId,
-      modelProviderId: agent.modelProviderId,
-      modelId: agent.modelId,
-      modelVariant: agent.modelVariant,
-      modelRoute: agent.modelRoute,
-      parentAgentId: agent.id,
+
+    const opencodeServerId = isAntigravity ? "antigravity" : (this.managed?.serverId ?? agent.opencodeServerId);
+    const opencodeSessionId = isAntigravity ? "antigravity:" + childId : "pending:" + childId;
+
+    const correlationHint = (input.threadId || input.turnId)
+      ? {
+          threadId: input.threadId,
+          turnId: input.turnId,
+          source: "mcp",
+        }
+      : (lastJob.hintThreadId || lastJob.hintTurnId)
+      ? {
+          threadId: lastJob.hintThreadId,
+          turnId: lastJob.hintTurnId,
+          source: lastJob.hintSource ?? "inherited",
+        }
+      : undefined;
+
+    const workerInput: WorkerPromptInput = {
+      task: input.task,
+      relation: input.relation ?? "followup",
+      ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+    };
+
+    const jobId = newId("job");
+    const promptHash = hashPrompt(prompt);
+
+    const { agent: child, job } = this.store.admitContinuation({
+      agent: {
+        id: childId,
+        title,
+        topic: agent.topic,
+        repositoryRoot: agent.repositoryRoot,
+        workspacePath,
+        workspaceStrategy: agent.workspaceStrategy,
+        mode: agent.mode ?? "analyze",
+        opencodeServerId,
+        opencodeSessionId,
+        modelProviderId: agent.modelProviderId,
+        modelId: agent.modelId,
+        modelVariant: agent.modelVariant,
+        modelRoute: agent.modelRoute,
+        parentAgentId: agent.id,
+      },
+      job: {
+        id: jobId,
+        agentId: childId,
+        kind: "continue",
+        status: "queued",
+        priority: lastJob.priority ?? 50,
+        exclusiveResources: lastJob.exclusiveResources ?? [],
+        requestId: input.requestId,
+        promptHash,
+        queuedAt: new Date().toISOString(),
+        mcpSessionId: input.mcpSessionId ?? null,
+        trustedThreadId: input.trustedThreadId ?? null,
+      },
+      correlationHint,
+      dispatchEnvelope: {
+        prompt,
+        promptHash,
+        workerInput,
+        contextFiles: [],
+      },
     });
-    const job = this.store.createJob({
-      id: newId("job"),
-      agentId: child.id,
-      kind: "continue",
-      requestId: input.requestId,
-      promptHash: hashPrompt(prompt),
-      mcpSessionId: input.mcpSessionId ?? null,
-      trustedThreadId: input.trustedThreadId ?? null,
+
+    this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child!.id + " after job " + lastJob.id);
+    this.recordActivity(child!, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new " + (isAntigravity ? "Antigravity run (no OpenCode session)" : "OpenCode session"));
+
+    this.pendingDispatches.set(job.id, {
+      prompt,
+      workerInput,
+      contextFiles: [],
     });
-    // Correlation: explicit MCP hints of this request win; otherwise derive
-    // the parent's last-job hints so the same thread/turn provenance follows
-    // the lineage.
-    this.persistCorrelationHint(job, input.threadId, input.turnId);
-    if (!input.threadId && !input.turnId && (lastJob.hintThreadId || lastJob.hintTurnId)) {
-      this.store.setCorrelationHint(job.id, {
-        threadId: lastJob.hintThreadId,
-        turnId: lastJob.hintTurnId,
-        source: lastJob.hintSource ?? "inherited",
-      });
+
+    let dispatchResult: AcceptedOperation | undefined;
+    let dispatchError: unknown;
+    this.dispatchWaiters.set(job.id, {
+      resolve: (op) => { dispatchResult = op; },
+      reject: (err) => { dispatchError = err; },
+    });
+
+    try {
+      await this.drainQueue();
+
+      if (dispatchError) {
+        throw dispatchError;
+      }
+      if (dispatchResult) {
+        return dispatchResult;
+      }
+      return this.accepted(this.store.getJob(job.id) ?? job);
+    } finally {
+      this.dispatchWaiters.delete(job.id);
     }
-    this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child.id + " after job " + lastJob.id);
-    this.recordActivity(child, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new " + (session?.id ? "OpenCode session " + session.id : "Antigravity run (no OpenCode session)"));
-    return this.dispatch(child, job, prompt, input);
   }
 
   async consult(input: ConsultInput): Promise<ProgressSnapshot> {
@@ -1112,18 +2033,20 @@ export class BridgeService {
 
     let satisfied = hasException;
 
+    const allTerminal = jobs.length > 0 && jobs.every(isTerminal);
+
     const pred = barrier.predicateType ?? "ALL";
     if (!satisfied) {
       if (pred === "ALL") {
-        satisfied = successfulCount === jobs.length && jobs.length > 0;
+        satisfied = (successfulCount === jobs.length && jobs.length > 0) || allTerminal;
       } else if (pred === "ANY") {
-        satisfied = successfulCount >= 1;
+        satisfied = successfulCount >= 1 || allTerminal;
       } else if (pred === "QUORUM") {
         const quorum = barrier.quorumCount ?? jobs.length;
-        satisfied = successfulCount >= quorum;
+        satisfied = successfulCount >= quorum || allTerminal;
       } else if (pred === "REQUIRED") {
         const required = barrier.requiredJobIds ?? [];
-        satisfied = required.length > 0 && required.every((id) => successfulSet.has(id));
+        satisfied = (required.length > 0 && required.every((id) => successfulSet.has(id))) || allTerminal;
       }
     }
 
@@ -1301,8 +2224,10 @@ export class BridgeService {
           this.store.setParkArmed(currentOutbox.parkId, currentOutbox.generation);
           this.scheduleWakeRetry(currentOutbox.id, totalDelay);
         } else {
-          (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "failed", cliResult.error ?? "CLI wake delivery failed", {
-            wakeState: "failed",
+          const diagnostic = cliResult.error ?? "CLI wake delivery indeterminate";
+          this.lastStreamError = diagnostic;
+          (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "waking", diagnostic, {
+            wakeState: (currentOutbox as any).wakeState ?? "waiting",
             deliveryMode: (cliResult as any).deliveryMode ?? currentOutbox.deliveryMode,
             selectedExecutable: cliResult.executablePath ?? null,
             executableVersion: cliResult.version ?? null,
@@ -1338,6 +2263,12 @@ export class BridgeService {
       if (reconciled) {
         (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "delivered", null, { wakeState: "delivered" });
         this.store.setParkWoken(currentOutbox.parkId, currentOutbox.generation);
+      } else if (this.codex.capabilities?.authoritativeAttachment !== true) {
+        this.lastStreamError = message;
+        (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "waking", message, {
+          wakeState: (currentOutbox as any).wakeState ?? "waiting",
+          deliveryMode: currentOutbox.deliveryMode,
+        });
       } else {
         (this.store as any).updateWakeOutboxStatus(currentOutbox.id, "failed", message, { wakeState: "failed" });
       }
@@ -1531,13 +2462,33 @@ export class BridgeService {
     // reached yet). Aborting it must terminalize the job so the dispatch
     // guard never launches the provider for an aborted agent.
     const active = this.activeJob(agentId)
-      ?? this.store.listJobs().find((job) => job.agentId === agentId && job.status === "created")
+      ?? this.store.listJobs().find((job) => job.agentId === agentId && (job.status === "created" || job.status === "queued"))
       ?? null;
     if (!active) {
       // A stopped agent is non-continuable; auto-close it so the obligation
       // ends and the agent is not left in an open intermediate state.
       if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agentId, "closed", reason ?? null);
       return { agentId, jobId: null, status: "aborted", quiescent: true };
+    }
+    if (active.status === "queued") {
+      const localReason = reason ?? "Aborted by orchestrator";
+      this.store.updateJobStatus(active.id, "aborted", localReason);
+      if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agentId, "closed", localReason);
+      this.store.deleteDispatchEnvelope(active.id);
+      this.pendingDispatches.delete(active.id);
+      const waiter = this.dispatchWaiters.get(active.id);
+      if (waiter) {
+        this.dispatchWaiters.delete(active.id);
+        waiter.reject(new Error(localReason));
+      }
+      if (this.followLifecycles.has(active.id)) {
+        await this.resolveFollow(active.id, { status: "aborted", error: localReason, workerAborted: true });
+      }
+      this.onJobSettled(active.id, active.batchId);
+      await this.evaluateParkWakes(active.id).catch((error: unknown) => {
+        this.lastStreamError = redactSecrets(String(error));
+      });
+      return { agentId, jobId: active.id, status: "aborted", quiescent: true };
     }
     this.clearApprovalTimer(agentId);
     this.store.setApprovalDeadline(active.id, null);
@@ -1601,11 +2552,19 @@ export class BridgeService {
     // Aborted agents are non-continuable; auto-close them safely.
     if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", reason ?? null);
     this.recordActivity(agent, active, "abort", "Abort requested for the active DeepSeek task");
+    this.store.deleteDispatchEnvelope(active.id);
+    this.pendingDispatches.delete(active.id);
+    const waiter = this.dispatchWaiters.get(active.id);
+    if (waiter) {
+      this.dispatchWaiters.delete(active.id);
+      waiter.reject(new Error(localReason));
+    }
     await this.resolveFollow(active.id, {
       status: "aborted",
       error: localReason,
       workerAborted: true,
     });
+    this.onJobSettled(active.id, active.batchId);
     await this.evaluateParkWakes(active.id).catch((error: unknown) => {
       this.lastStreamError = redactSecrets(String(error));
     });
@@ -1951,11 +2910,13 @@ export class BridgeService {
     });
   }
 
-  private effectiveWorkerTimeoutMs(waitMinutes?: number, graceMinutes?: number): number {
+  private effectiveWorkerTimeoutMs(waitMinutes?: number, graceMinutes?: number): number | null {
+    if (this.config.workerMaxExecutionMinutes === null || this.config.workerMaxExecutionMinutes === undefined) {
+      return null;
+    }
     const wait = waitMinutes ?? this.config.followDefaultWaitMinutes;
     const grace = graceMinutes ?? this.config.followDefaultGraceMinutes;
-    const maxMinutes = this.config.workerMaxExecutionMinutes ?? FOLLOW_MAX_TOTAL_MINUTES;
-    return Math.min(wait + grace, maxMinutes) * 60_000;
+    return Math.min(wait + grace, this.config.workerMaxExecutionMinutes) * 60_000;
   }
 
   private ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number, autoArmed = false): FollowLifecycle {
@@ -1966,6 +2927,29 @@ export class BridgeService {
     }
     const now = Date.now();
     const current = this.store.getJob(job.id) ?? job;
+    if (current.status === "queued") {
+      let resolve!: (result: FollowResult) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<FollowResult>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      const lifecycle: FollowLifecycle = {
+        jobId: job.id,
+        waitMinutes,
+        graceMinutes,
+        autoArmed,
+        promise,
+        resolve,
+        reject,
+        deadlineTimer: null,
+        graceTimer: null,
+        waiters: new Set(),
+        settled: false,
+      };
+      this.followLifecycles.set(job.id, lifecycle);
+      return lifecycle;
+    }
     const startedAt = parseTimestamp(current.followStartedAt) ?? now;
     const isGracefulFinalization = current.status === "finalizing" || current.gracefulFinalizeAttempted;
     const requestedDeadlineAt = startedAt + waitMinutes * 60_000;
@@ -1992,12 +2976,14 @@ export class BridgeService {
       gracefulFinalizeAttempted: current.gracefulFinalizeAttempted,
     });
     const timeoutMs = this.effectiveWorkerTimeoutMs(waitMinutes, effectiveGraceMinutes);
-    const leaseExpiresAt = new Date(startedAt + timeoutMs).toISOString();
+    const leaseExpiresAt = timeoutMs !== null ? new Date(startedAt + timeoutMs).toISOString() : null;
     this.store.updateJobLiveness(job.id, { leaseExpiresAt });
-    const spool = new AntigravitySpool(this.config.dataDir);
-    void spool.writeDeadlineExtension(job.id, timeoutMs).catch(() => undefined);
-    if (typeof (this.antigravity as any)?.extendTimeout === "function") {
-      (this.antigravity as any).extendTimeout(job.id, timeoutMs);
+    if (timeoutMs !== null) {
+      const spool = new AntigravitySpool(this.config.dataDir);
+      void spool.writeDeadlineExtension(job.id, timeoutMs).catch(() => undefined);
+      if (typeof (this.antigravity as any)?.extendTimeout === "function") {
+        (this.antigravity as any).extendTimeout(job.id, timeoutMs);
+      }
     }
     let resolve!: (result: FollowResult) => void;
     let reject!: (error: unknown) => void;
@@ -2021,7 +3007,7 @@ export class BridgeService {
     this.followLifecycles.set(job.id, lifecycle);
     if (after.status === "finalizing" || after.gracefulFinalizeAttempted) {
       this.scheduleGraceTimer(lifecycle, parseTimestamp(after.graceDeadlineAt) ?? deadlineAt + effectiveGraceMinutes * 60_000);
-    } else {
+    } else if (this.config.workerMaxExecutionMinutes !== null && this.config.workerMaxExecutionMinutes !== undefined) {
       this.scheduleDeadlineTimer(lifecycle, deadlineAt);
     }
     return lifecycle;
@@ -2059,12 +3045,14 @@ export class BridgeService {
       gracefulFinalizeAttempted: job.gracefulFinalizeAttempted,
     });
     const timeoutMs = this.effectiveWorkerTimeoutMs(waitMinutes, extendedGrace);
-    const extendedLeaseExpiresAt = new Date(startedAt + timeoutMs).toISOString();
+    const extendedLeaseExpiresAt = timeoutMs !== null ? new Date(startedAt + timeoutMs).toISOString() : null;
     this.store.updateJobLiveness(jobId, { leaseExpiresAt: extendedLeaseExpiresAt });
-    const spool = new AntigravitySpool(this.config.dataDir);
-    void spool.writeDeadlineExtension(jobId, timeoutMs).catch(() => undefined);
-    if (typeof (this.antigravity as any).extendTimeout === "function") {
-      (this.antigravity as any).extendTimeout(jobId, timeoutMs);
+    if (timeoutMs !== null) {
+      const spool = new AntigravitySpool(this.config.dataDir);
+      void spool.writeDeadlineExtension(jobId, timeoutMs).catch(() => undefined);
+      if (typeof (this.antigravity as any)?.extendTimeout === "function") {
+        (this.antigravity as any).extendTimeout(jobId, timeoutMs);
+      }
     }
     lifecycle.graceMinutes = extendedGrace;
     if (finalizing) {
@@ -2076,7 +3064,9 @@ export class BridgeService {
     } else if (deadlineExtended && ["dispatching", "running", "following"].includes(job.status)) {
       if (lifecycle.deadlineTimer) clearTimeout(lifecycle.deadlineTimer);
       lifecycle.deadlineTimer = null;
-      this.scheduleDeadlineTimer(lifecycle, extendedDeadlineAt);
+      if (this.config.workerMaxExecutionMinutes !== null && this.config.workerMaxExecutionMinutes !== undefined) {
+        this.scheduleDeadlineTimer(lifecycle, extendedDeadlineAt);
+      }
     }
   }
 
@@ -2100,11 +3090,15 @@ export class BridgeService {
     const lifecycle = this.followLifecycles.get(jobId);
     const job = this.store.getJob(jobId);
     if (!lifecycle || !job || job.status !== "following" || job.gracefulFinalizeAttempted) return;
+    const agent = this.store.getAgent(job.agentId);
+    if (!agent) return;
+    const liveness = await this.getAuthoritativeStatus(agent.id, job.id);
+    if (liveness.isLive) {
+      return;
+    }
     const graceDeadlineAt = Date.now() + lifecycle.graceMinutes * 60_000;
     this.store.updateJobStatus(jobId, "finalizing");
     const marked = this.store.markGracefulFinalize(jobId, new Date(graceDeadlineAt).toISOString());
-    const agent = this.store.getAgent(marked.agentId);
-    if (!agent) return;
     this.recordActivity(agent, marked, "deadline", "Follow deadline reached; starting graceful finalization");
     this.scheduleGraceTimer(lifecycle, graceDeadlineAt);
     await this.requestGracefulFinalize(agent, marked);
@@ -2148,6 +3142,16 @@ export class BridgeService {
     const job = this.store.getJob(jobId);
     const agent = job ? this.store.getAgent(job.agentId) : null;
     if (!lifecycle || !job || !agent || job.status !== "finalizing") return;
+    const liveness = await this.getAuthoritativeStatus(agent.id, job.id);
+    if (liveness.isLive) {
+      return;
+    }
+    if (!liveness.pid && !liveness.attempt) {
+      if (agent.modelProviderId !== "antigravity") {
+        await this.reconcileJob(job).catch(() => undefined);
+      }
+      return;
+    }
     const reason = "Follow deadline and graceful-finalize grace period expired";
     this.store.updateJobStatus(job.id, "timed_out", reason);
     if (agent.status === "working") this.store.updateAgentStatus(agent.id, "timed_out", reason);
@@ -2319,9 +3323,10 @@ export class BridgeService {
     permissionId?: string | null;
     message?: string;
   } = {}): Promise<void> {
+    const job = this.store.getJob(jobId);
+    this.onJobSettled(jobId, job?.batchId);
     const lifecycle = this.followLifecycles.get(jobId);
     if (!lifecycle || lifecycle.settled) return;
-    const job = this.store.getJob(jobId);
     const agent = job ? this.store.getAgent(job.agentId) : null;
     if (!job || !agent) {
       lifecycle.settled = true;
@@ -2380,8 +3385,11 @@ export class BridgeService {
             isLive = supervisorAlive || agyAlive;
           }
           if (!leaseExpiresAt) {
-            const createdAtMs = parseTimestamp(latestAttempt.createdAt) ?? start;
-            leaseExpiresAt = new Date(createdAtMs + (latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs())).toISOString();
+            const effectiveTimeout = latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs();
+            if (effectiveTimeout !== null) {
+              const createdAtMs = parseTimestamp(latestAttempt.createdAt) ?? start;
+              leaseExpiresAt = new Date(createdAtMs + effectiveTimeout).toISOString();
+            }
           }
         }
       } else {
@@ -2493,10 +3501,15 @@ export class BridgeService {
     if (agent.modelProviderId === "antigravity") {
       return this.dispatchAntigravity(agent, job, prompt, workerInput, contextFiles);
     }
+    const currentJob = this.store.getJob(job.id);
+    const currentAgent = this.store.getAgent(agent.id);
+    if (currentJob?.status === "aborted" || currentAgent?.status === "closed" || currentAgent?.status === "aborted") {
+      throw new Error("Invalid job transition: aborted -> dispatching");
+    }
     this.store.updateAgentStatus(agent.id, "working");
     this.store.updateJobStatus(job.id, "dispatching");
     const timeoutMs = this.effectiveWorkerTimeoutMs();
-    const leaseExpiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const leaseExpiresAt = timeoutMs !== null ? new Date(Date.now() + timeoutMs).toISOString() : null;
     const workerPid = null;
     this.store.updateJobLiveness(job.id, {
       leaseExpiresAt,
@@ -2516,7 +3529,7 @@ export class BridgeService {
       this.recordActivity(agent, job, "dispatch", "Dispatched task to the OpenCode session");
       return this.accepted(this.store.getJob(job.id) ?? job);
     } catch (error) {
-      const message = redactSecrets(String(error));
+      const message = redactSecrets(String(error instanceof Error ? error.message : error));
       if (isUnknownDispatchOutcome(error)) {
         // The prompt may still have been accepted server-side. Do not mark the
         // job or agent failed and do not throw: resolve normally as an
@@ -2540,15 +3553,29 @@ export class BridgeService {
         return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
       }
       const current = this.store.getJob(job.id);
-      const preservesApproval = current?.status === "needs_approval";
-      if (current && current.status !== "failed" && !preservesApproval) this.store.updateJobStatus(job.id, "failed", message);
       const currentAgent = this.store.getAgent(agent.id);
+      const preservesApproval = current?.status === "needs_approval" || currentAgent?.status === "needs_approval";
+      if (current && current.status !== "failed" && !preservesApproval) this.store.updateJobStatus(job.id, "failed", message);
       if (currentAgent && currentAgent.status !== "closed" && !preservesApproval) this.store.updateAgentStatus(agent.id, "failed", message);
       this.recordActivity(agent, job, "error", "OpenCode rejected the task dispatch");
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, { status: "failed", error: message });
+      if (!preservesApproval) {
+        this.onJobSettled(job.id, job.batchId);
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, { status: "failed", error: message });
+        }
+        await this.evaluateParkWakes(job.id).catch((err: unknown) => {
+          this.lastStreamError = redactSecrets(String(err));
+        });
       }
-      throw new Error(message);
+      const backpressure = isBackpressureError(error);
+      if (backpressure && !(error as any)?.backpressureRecorded) {
+        this.recordBackpressure("bridge_busy");
+      }
+      const propagatedError = error instanceof Error ? error : new Error(message);
+      if (backpressure) {
+        (propagatedError as any).backpressureRecorded = true;
+      }
+      throw propagatedError;
     }
   }
 
@@ -2584,10 +3611,10 @@ export class BridgeService {
       return this.accepted(currentJob ?? job);
     }
     const adapterTimeout = (this.antigravity as any)?.timeoutMs;
-    const timeoutMs = (typeof adapterTimeout === "number" && adapterTimeout !== AGY_DEFAULT_TIMEOUT_MS)
+    const timeoutMs: number | null = (typeof adapterTimeout === "number" && adapterTimeout !== AGY_DEFAULT_TIMEOUT_MS)
       ? adapterTimeout
       : this.effectiveWorkerTimeoutMs();
-    const leaseExpiresAt = new Date(Date.now() + timeoutMs).toISOString();
+    const leaseExpiresAt = timeoutMs !== null ? new Date(Date.now() + timeoutMs).toISOString() : null;
     const capturedFence = job.fence ?? 1;
     this.store.updateJobLiveness(job.id, {
       leaseExpiresAt,
@@ -2674,6 +3701,8 @@ export class BridgeService {
         const completedAgent = this.store.getAgent(agent.id) ?? agent;
         if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
         this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+        this.recordTerminalSuccess(job.id);
+        this.onJobSettled(job.id, job.batchId);
         if (this.followLifecycles.has(job.id)) {
           await this.resolveFollow(job.id, {
             status: "completed",
@@ -2723,9 +3752,17 @@ export class BridgeService {
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
       this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
+      if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
+        this.recordBackpressure("bridge_busy");
+        (error as any).backpressureRecorded = true;
+      }
+      this.onJobSettled(job.id, job.batchId);
       if (this.followLifecycles.has(job.id)) {
         await this.resolveFollow(job.id, { status: "failed", error: message });
       }
+      await this.evaluateParkWakes(job.id).catch((err: unknown) => {
+        this.lastStreamError = redactSecrets(String(err));
+      });
     } finally {
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
@@ -2741,7 +3778,7 @@ export class BridgeService {
     job: JobRecord,
     prompt: string,
     controller: AbortController,
-    timeoutMs?: number,
+    timeoutMs?: number | null,
     workerInput?: WorkerPromptInput,
     contextFiles?: string[],
     fence?: number,
@@ -2749,7 +3786,7 @@ export class BridgeService {
     const capturedFence = fence ?? job.fence ?? 1;
     try {
       const adapterTimeout = (this.antigravity as any)?.timeoutMs;
-      const effectiveTimeoutMs = timeoutMs ?? (
+      const effectiveTimeoutMs: number | null = timeoutMs ?? (
         (typeof adapterTimeout === "number" && adapterTimeout !== AGY_DEFAULT_TIMEOUT_MS)
           ? adapterTimeout
           : this.effectiveWorkerTimeoutMs()
@@ -2805,6 +3842,8 @@ export class BridgeService {
         const completedAgent = this.store.getAgent(agent.id) ?? agent;
         if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, "completed");
         this.recordActivity(agent, this.store.getJob(job.id), "result", "Antigravity run completed and the result was persisted");
+        this.recordTerminalSuccess(job.id);
+        this.onJobSettled(job.id, job.batchId);
         if (this.followLifecycles.has(job.id)) {
           await this.resolveFollow(job.id, {
             status: "completed",
@@ -2864,28 +3903,24 @@ export class BridgeService {
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
       this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
+      if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
+        this.recordBackpressure("bridge_busy");
+        (error as any).backpressureRecorded = true;
+      }
+      this.onJobSettled(job.id, job.batchId);
       if (this.followLifecycles.has(job.id)) {
         await this.resolveFollow(job.id, { status: "failed", error: message });
       }
+      await this.evaluateParkWakes(job.id).catch((err: unknown) => {
+        this.lastStreamError = redactSecrets(String(err));
+      });
     } finally {
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
   }
 
-  private isEligibleForTimeoutFallback(agent: AgentRecord, job: JobRecord, error: unknown): boolean {
-    if (!(error instanceof AntigravityProcessError) || error.kind !== "timeout") return false;
-    if (!this.config.antigravityTimeoutFallbackRoute) return false;
-    const mode = agent.mode ?? "analyze";
-    if (mode !== "analyze") return false;
-    if ((job.fallbackCount ?? 0) > 0 || Boolean(job.fallbackStatus)) return false;
-    if (job.status === "aborted" || agent.status === "aborted" || agent.status === "closed") return false;
-    try {
-      const target = this.resolveRouteByName(this.config.antigravityTimeoutFallbackRoute);
-      if (target.providerId !== "opencode-go") return false;
-    } catch {
-      return false;
-    }
-    return true;
+  private isEligibleForTimeoutFallback(_agent: AgentRecord, _job: JobRecord, _error: unknown): boolean {
+    return false;
   }
 
 
@@ -2996,6 +4031,30 @@ export class BridgeService {
     this.clearApprovalTimer(agent.id);
     this.store.setApprovalDeadline(job.id, null);
     this.store.setJobPermission(job.id, null);
+
+    const activeCount = this.store.getActiveJobCount();
+    const availableCredits = this.targetCredits - activeCount;
+    const claimedResources = this.getActiveExclusiveResources();
+    const hasResourceConflict = (job.exclusiveResources ?? []).some((r) => claimedResources.has(r));
+
+    if (availableCredits <= 0 || hasResourceConflict) {
+      this.store.updateJobStatus(job.id, "queued");
+      const queuedAt = new Date().toISOString();
+      this.store.db.prepare("UPDATE jobs SET queued_at = ?, prompt_hash = ? WHERE id = ?").run(queuedAt, hashPrompt(prompt), job.id);
+      this.store.saveDispatchEnvelope(job.id, {
+        prompt,
+        promptHash: hashPrompt(prompt),
+        workerInput: { task: prompt },
+        contextFiles: [],
+      });
+      this.pendingDispatches.set(job.id, {
+        prompt,
+        workerInput: { task: prompt } as any,
+        contextFiles: [],
+      });
+      return this.accepted(this.store.getJob(job.id) ?? job);
+    }
+
     this.store.updateJobStatus(job.id, "running");
     if (agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "working");
     try {
@@ -3049,6 +4108,35 @@ export class BridgeService {
     }
     this.clearApprovalTimer(agent.id);
     this.store.setApprovalDeadline(job.id, null);
+
+    const activeCount = this.store.getActiveJobCount();
+    const availableCredits = this.targetCredits - activeCount;
+    const claimedResources = this.getActiveExclusiveResources();
+    const hasResourceConflict = (job.exclusiveResources ?? []).some((r) => claimedResources.has(r));
+
+    if (availableCredits <= 0 || hasResourceConflict) {
+      this.store.updateJobStatus(job.id, "queued");
+      const queuedAt = new Date().toISOString();
+      this.store.db.prepare("UPDATE jobs SET queued_at = ? WHERE id = ?").run(queuedAt, job.id);
+      const workerInput = {
+        permissionId,
+        permissionReply: reply,
+        permissionMessage: message,
+      };
+      this.store.saveDispatchEnvelope(job.id, {
+        prompt: "",
+        promptHash: hashPrompt(""),
+        workerInput,
+        contextFiles: [],
+      });
+      this.pendingDispatches.set(job.id, {
+        prompt: "",
+        workerInput: workerInput as any,
+        contextFiles: [],
+      });
+      return this.accepted(this.store.getJob(job.id) ?? job);
+    }
+
     this.store.updateJobStatus(job.id, "running");
     if (agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "working");
     try {
@@ -3172,6 +4260,22 @@ export class BridgeService {
     const diff = await client.getDiff(agent.opencodeSessionId);
     const currentAgent = this.store.getAgent(agent.id) ?? agent;
     const currentJob = this.store.getJob(job.id) ?? job;
+    const assistants = messages.filter((message) => message.info?.role === "assistant");
+    const baselineAssistantId = currentJob.lastAssistantMessageId ?? null;
+    const baselineIndex = baselineAssistantId
+      ? assistants.findIndex((message) => message.info?.id === baselineAssistantId)
+      : -1;
+    const relevantAssistants = baselineAssistantId === null
+      ? assistants
+      : baselineIndex < 0
+        ? []
+        : assistants.slice(baselineIndex + 1);
+    const assistantWithError = relevantAssistants.find((m) => m.info?.error != null);
+    if (assistantWithError) {
+      const errorDetail = formatAssistantError(assistantWithError.info!.error);
+      await this.failJob(currentJob, agent, errorDetail);
+      return;
+    }
     const latestAssistantId = latestAssistantMessageId(messages);
     if (currentJob.lastAssistantMessageId && (!latestAssistantId || latestAssistantId === currentJob.lastAssistantMessageId)) return;
     if (!assistantTextAfterBaseline(messages, currentJob.lastAssistantMessageId).hasText) {
@@ -3218,6 +4322,8 @@ export class BridgeService {
       const completedAgent = this.store.getAgent(agent.id) ?? agent;
       if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
       this.recordActivity(agent, this.store.getJob(job.id), "result", partial ? "Graceful finalization produced a partial result" : "OpenCode session became idle and the result was persisted");
+      this.recordTerminalSuccess(job.id);
+      this.onJobSettled(job.id, job.batchId);
       if (this.followLifecycles.has(job.id)) {
         await this.resolveFollow(job.id, {
           status: partial ? "completed_partial" : "completed",
@@ -3365,35 +4471,142 @@ export class BridgeService {
     }
   }
 
-  private async reconcileJob(job: JobRecord): Promise<void> {
-    const agent = this.store.getAgent(job.agentId);
-    if (!agent || !this.client) return;
-    if (agent.modelProviderId === "antigravity") return;
-    const messages = await this.client.listMessages(agent.opencodeSessionId);
-    const assistants = messages.filter((message) => message.info?.role === "assistant");
-    if (assistants.length === 0 || messages.at(-1)?.info?.role !== "assistant") return;
-    const latestAssistantId = latestAssistantMessageId(messages);
-    if (job.lastAssistantMessageId && (!latestAssistantId || latestAssistantId === job.lastAssistantMessageId)) return;
-    if (!assistantTextAfterBaseline(messages, job.lastAssistantMessageId).hasText) return;
-    const diff = await this.client.getDiff(agent.opencodeSessionId);
-    const currentAgent = this.store.getAgent(agent.id) ?? agent;
-    const stored = await persistResult(this.config.dataDir, currentAgent, job, messages, diff, this.config.maxResultLength);
-    this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
-    this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-    const current = this.store.getJob(job.id);
-    if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-    const running = this.store.getJob(job.id);
-    if (running?.status === "running") this.store.updateJobStatus(job.id, "completed");
-    const currentAgentStatus = this.store.getAgent(agent.id);
-    if (currentAgentStatus?.status === "working") this.store.updateAgentStatus(agent.id, "completed");
-    const completed = this.store.getJob(job.id);
-    if (completed?.status === "completed") this.store.updateJobStatus(job.id, "delivery_pending");
-    const pending = this.store.getJob(job.id);
-    if (pending) await this.deliverEnvelope(stored.envelope, pending);
+  private async reconcileJob(job: JobRecord, options: { fromRecovery?: boolean } = {}): Promise<void> {
+    return this.withAgentOperationLock("reconcile:" + job.id, async () => {
+      const currentJob = this.store.getJob(job.id) ?? job;
+      if (currentJob.resultPath || TERMINAL_JOB_STATUSES.has(currentJob.status) || currentJob.status === "delivery_pending") {
+        return;
+      }
+      const agent = this.store.getAgent(currentJob.agentId);
+      if (!agent || !this.client) return;
+      if (agent.modelProviderId === "antigravity") return;
+
+      let messages: OpenCodeMessage[];
+      try {
+        messages = await this.client.listMessages(agent.opencodeSessionId);
+      } catch (error) {
+        if (isSessionAbsentError(error)) {
+          await this.failJob(currentJob, agent, "OpenCode session absent (404): " + redactSecrets(String(error)));
+          return;
+        }
+        this.lastStreamError = redactSecrets(String(error));
+        this.store.markDispatchUnknown(currentJob.id);
+        this.recordActivity(agent, currentJob, "error", "Reconciliation error: " + redactSecrets(String(error)));
+        return;
+      }
+
+      const assistants = messages.filter((message) => message.info?.role === "assistant");
+      const baselineAssistantId = currentJob.lastAssistantMessageId ?? null;
+      const baselineIndex = baselineAssistantId
+        ? assistants.findIndex((message) => message.info?.id === baselineAssistantId)
+        : -1;
+      const relevantAssistants = baselineAssistantId === null
+        ? assistants
+        : baselineIndex < 0
+          ? []
+          : assistants.slice(baselineIndex + 1);
+
+      // Contract 2: info.error on the relevant assistant message is authoritative failure
+      const assistantWithError = relevantAssistants.find((m) => m.info?.error != null);
+      if (assistantWithError) {
+        const errorDetail = formatAssistantError(assistantWithError.info!.error);
+        await this.failJob(currentJob, agent, errorDetail);
+        return;
+      }
+
+      // Contract 1: OpenCode assistant text is streaming unless the newest relevant assistant message has a non-empty terminal info.finish value
+      const newestAssistant = relevantAssistants.at(-1);
+      const finish = newestAssistant?.info?.finish;
+      const hasTerminalFinish = typeof finish === "string" && finish.trim().length > 0;
+
+      if (relevantAssistants.length === 0 || !hasTerminalFinish) {
+        if (options.fromRecovery) {
+          this.store.markDispatchUnknown(currentJob.id);
+          this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "event", "Startup recovery retained active job with streaming assistant message");
+        }
+        return;
+      }
+
+      // Contract 1 & 3: terminal finish value completes exactly once
+      const textOutput = assistantTextAfterBaseline(messages, baselineAssistantId);
+      if (!textOutput.hasText) {
+        if (currentJob.status === "dispatching") this.store.updateJobStatus(currentJob.id, "running");
+        this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "event", "OpenCode session finished without non-empty assistant output; the job remains active");
+        return;
+      }
+
+      const diff = await this.client.getDiff(agent.opencodeSessionId).catch(() => "");
+      const currentAgent = this.store.getAgent(agent.id) ?? agent;
+      const partial = currentJob.status === "finalizing" || currentJob.gracefulFinalizeAttempted;
+      if (currentJob.status === "dispatching") this.store.updateJobStatus(currentJob.id, "running");
+      if (currentJob.fallbackTo) {
+        this.store.updateJobFallbackStatus(currentJob.id, "succeeded");
+      }
+      const jobToPersist = this.store.getJob(currentJob.id) ?? currentJob;
+      const stored = await persistResult(this.config.dataDir, currentAgent, jobToPersist, messages, diff, this.config.maxResultLength, {
+        ...(partial ? {
+          statusOverride: "completed_partial",
+          deadlineReached: true,
+          gracefulFinalize: true,
+          partial: true,
+        } : {}),
+      });
+
+      const capturedFence = currentJob.fence ?? job.fence ?? 1;
+      try {
+        this.store.setJobMessages(currentJob.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
+        this.store.setJobResult(currentJob.id, stored.resultPath, stored.envelope.summary, capturedFence);
+        if (stored.envelope.earlyExit?.triggered) {
+          this.store.setJobEarlyExit(currentJob.id, {
+            earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
+            reason: stored.envelope.earlyExit.reason,
+          }, capturedFence);
+        }
+        if (stored.envelope.escalation) {
+          this.store.setJobEscalation(currentJob.id, JSON.stringify(stored.envelope.escalation), capturedFence);
+        }
+        const completedJob = this.store.getJob(currentJob.id) ?? currentJob;
+        if (["running", "following", "finalizing"].includes(completedJob.status)) {
+          this.store.updateJobStatus(currentJob.id, partial ? "completed_partial" : "completed", null, capturedFence);
+        }
+        const completedAgent = this.store.getAgent(agent.id) ?? agent;
+        if (completedAgent.status === "working") {
+          this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
+        }
+        this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "result", partial ? "Graceful finalization produced a partial result" : "Reconciled terminal assistant completion");
+        this.recordTerminalSuccess(currentJob.id);
+        this.onJobSettled(currentJob.id, currentJob.batchId);
+        if (this.followLifecycles.has(currentJob.id)) {
+          await this.resolveFollow(currentJob.id, {
+            status: partial ? "completed_partial" : "completed",
+            deadlineReached: partial,
+            gracefulFinalize: partial,
+            partial,
+            resultAvailable: true,
+            envelope: stored.envelope,
+          });
+        }
+        const deliveryJob = this.store.getJob(currentJob.id) ?? currentJob;
+        if (deliveryJob && ["completed", "completed_partial"].includes(deliveryJob.status)) {
+          this.store.updateJobStatus(currentJob.id, "delivery_pending", null, capturedFence);
+        }
+        const pending = this.store.getJob(currentJob.id);
+        if (pending) await this.deliverEnvelope(stored.envelope, pending);
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "error", "Stale session completion rejected by fence check: " + err.message);
+          return;
+        }
+        throw err;
+      }
+    });
   }
 
   private async recoverPendingJobs(): Promise<void> {
     for (const job of this.store.recoverPendingJobs()) {
+      if (job.status === "queued") {
+        continue;
+      }
       const agent = this.store.getAgent(job.agentId);
       if (job.resultPath) {
         if (job.status === "dispatching" || job.status === "needs_approval") {
@@ -3416,7 +4629,7 @@ export class BridgeService {
       }
       if (agent?.modelProviderId === "antigravity" && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
         if (agent.opencodeSessionId && !agent.opencodeSessionId.startsWith("antigravity:")) {
-          await this.reconcileJob(job).catch((error) => {
+          await this.reconcileJob(job, { fromRecovery: true }).catch((error) => {
             this.lastStreamError = redactSecrets(String(error));
           });
           continue;
@@ -3427,9 +4640,22 @@ export class BridgeService {
         continue;
       }
       if (["dispatching", "running"].includes(job.status)) {
-        await this.reconcileJob(job).catch((error) => {
-          this.lastStreamError = redactSecrets(String(error));
-        });
+        try {
+          await this.reconcileJob(job, { fromRecovery: true });
+        } catch (error) {
+          const message = redactSecrets(String(error));
+          this.lastStreamError = message;
+          if (isSessionAbsentError(error)) {
+            if (agent) {
+              await this.failJob(job, agent, "OpenCode session absent (404): " + message).catch(() => undefined);
+            }
+          } else {
+            this.store.markDispatchUnknown(job.id);
+            if (agent) {
+              this.recordActivity(agent, job, "error", "Recovery unknown reconciliation outcome: " + message);
+            }
+          }
+        }
       } else if (["following", "finalizing"].includes(job.status)) {
         this.ensureFollowLifecycle(
           job,
@@ -3466,6 +4692,7 @@ export class BridgeService {
     await this.recoverWakeOutbox().catch((error) => {
       this.lastStreamError = redactSecrets(String(error));
     });
+    this.scheduleDrain();
   }
 
   private async handleCorrelation(correlation: CodexCorrelation): Promise<void> {
@@ -3510,18 +4737,30 @@ export class BridgeService {
     this.correlationFallbackTimers.set(jobId, timer);
   }
 
+  private async failJob(job: JobRecord, agent: AgentRecord, error: string): Promise<void> {
+    const currentJob = this.store.getJob(job.id) ?? job;
+    if (TERMINAL_JOB_STATUSES.has(currentJob.status)) return;
+    this.clearApprovalTimer(agent.id);
+    this.store.setApprovalDeadline(currentJob.id, null);
+    this.store.updateJobStatus(currentJob.id, "failed", error);
+    const currentAgent = this.store.getAgent(agent.id);
+    if (currentAgent && currentAgent.status !== "closed") {
+      this.store.updateAgentStatus(agent.id, "failed", error);
+    }
+    this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "error", "OpenCode reported a terminal error: " + error);
+    this.onJobSettled(currentJob.id, currentJob.batchId);
+    if (this.followLifecycles.has(currentJob.id)) {
+      await this.resolveFollow(currentJob.id, { status: "failed", error });
+    }
+    await this.evaluateParkWakes(currentJob.id).catch((err: unknown) => {
+      this.lastStreamError = redactSecrets(String(err));
+    });
+  }
+
   private async failActive(agent: AgentRecord, error: string): Promise<void> {
     const job = this.activeJob(agent.id);
     if (!job) return;
-    this.store.setApprovalDeadline(job.id, null);
-    if (job.status !== "failed") this.store.updateJobStatus(job.id, "failed", error);
-    const currentAgent = this.store.getAgent(agent.id);
-    if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", error);
-    this.recordActivity(agent, job, "error", "OpenCode reported a terminal error");
-    if (this.followLifecycles.has(job.id)) {
-      await this.resolveFollow(job.id, { status: "failed", error });
-    }
-    await this.evaluateParkWakes(job.id);
+    await this.failJob(job, agent, error);
   }
 
   private async markNeedsApproval(agent: AgentRecord, properties: Record<string, unknown> = {}): Promise<void> {
@@ -3624,6 +4863,13 @@ export class BridgeService {
     const agent = this.store.getAgent(agentId);
     if (agent && agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "failed", failure);
     if (agent) this.recordActivity(agent, current, "error", abortError ? "Approval expired and OpenCode abort failed" : "Approval expired and the active worker was aborted");
+    this.onJobSettled(current.id, current.batchId);
+    if (this.followLifecycles.has(current.id)) {
+      await this.resolveFollow(current.id, { status: "failed", error: failure });
+    }
+    await this.evaluateParkWakes(current.id).catch((error: unknown) => {
+      this.lastStreamError = redactSecrets(String(error));
+    });
     await this.inbox.writeNotice({
       kind: "approval_timeout",
       agentId,
@@ -3657,6 +4903,8 @@ export class BridgeService {
       state: "Starting",
       message: extra.warning ?? "DeepSeek Sub-Agent accepted the task and will report asynchronously.",
       ...(extra.outcome ? { outcome: extra.outcome } : {}),
+      ...(job.priority !== undefined && job.priority !== null ? { priority: job.priority } : {}),
+      ...(job.exclusiveResources !== undefined && job.exclusiveResources !== null ? { exclusiveResources: job.exclusiveResources } : {}),
     };
   }
 
@@ -3685,6 +4933,10 @@ export class BridgeService {
       this.store.updateJobStatus(job.id, "failed", reason);
       const currentAgent = this.store.getAgent(agent.id);
       if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, "failed", reason);
+      this.onJobSettled(job.id, job.batchId);
+      await this.evaluateParkWakes(job.id).catch((error: unknown) => {
+        this.lastStreamError = redactSecrets(String(error));
+      });
       return;
     }
 
@@ -3716,6 +4968,8 @@ export class BridgeService {
           const currentAgent = this.store.getAgent(agent.id) ?? agent;
           if (currentAgent.status === "working") this.store.updateAgentStatus(agent.id, terminalStatus.status);
           this.recordActivity(agent, this.store.getJob(job.id), "result", "Recovered completed Antigravity result from durable spool");
+          this.recordTerminalSuccess(job.id);
+          this.onJobSettled(job.id, job.batchId);
           this.store.updateJobStatus(job.id, "delivery_pending", null, attemptFence);
           const deliveryJob = this.store.getJob(job.id) ?? job;
           await this.deliverEnvelope(stored.envelope, deliveryJob).catch((error) => {
@@ -3737,6 +4991,10 @@ export class BridgeService {
         const currentAgent = this.store.getAgent(agent.id);
         if (currentAgent && currentAgent.status === "working") this.store.updateAgentStatus(agent.id, finalStatus, reason);
         this.recordActivity(agent, job, "error", "Recovered terminal " + finalStatus + " Antigravity status from durable spool");
+        this.onJobSettled(job.id, job.batchId);
+        await this.evaluateParkWakes(job.id).catch((error: unknown) => {
+          this.lastStreamError = redactSecrets(String(error));
+        });
         await spool.cleanupPrompt(latestAttempt.attemptId, job.id);
         return;
       }
@@ -3751,7 +5009,8 @@ export class BridgeService {
     const startTime = heartbeat?.updatedAt
       ? Math.min(parseTimestamp(latestAttempt.createdAt) ?? heartbeat.updatedAt, heartbeat.updatedAt)
       : (parseTimestamp(latestAttempt.createdAt) ?? 0);
-    const fallbackLeaseMs = startTime + (latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs());
+    const effectiveTimeout = latestAttempt.timeoutMs ?? this.effectiveWorkerTimeoutMs();
+    const fallbackLeaseMs = effectiveTimeout !== null ? startTime + effectiveTimeout : null;
     const leaseExpiresAt = job.leaseExpiresAt ? parseTimestamp(job.leaseExpiresAt) : fallbackLeaseMs;
     const leaseActive = leaseExpiresAt !== null && Date.now() < leaseExpiresAt;
 
@@ -3866,7 +5125,7 @@ export class BridgeService {
       attempt: replacement.attemptId,
       fence: nextFence,
       heartbeatAt: new Date().toISOString(),
-      leaseExpiresAt: new Date(Date.now() + replacement.timeoutMs).toISOString(),
+      leaseExpiresAt: replacement.timeoutMs !== null ? new Date(Date.now() + replacement.timeoutMs).toISOString() : null,
     });
 
     this.recordActivity(
@@ -4036,6 +5295,50 @@ function staticModelDisplayName(modelId: string, variant: string | null): string
   return variant === "max" ? base + " · Max" : base;
 }
 
+export function computeBatchHash(items: BatchItemInput[]): string {
+  const normalized = items.map((it) => {
+    const raw = it as unknown as Record<string, unknown>;
+    const requestId = (it.requestId ?? (typeof raw.request_id === "string" ? raw.request_id : "") ?? "").trim();
+    const topic = (it.topic ?? (typeof raw.topic === "string" ? raw.topic : "") ?? "").trim();
+    const task = (it.task ?? (typeof raw.task === "string" ? raw.task : "") ?? "").trim();
+    const cwd = (it.cwd ?? (typeof raw.cwd === "string" ? raw.cwd : "") ?? "").trim();
+    const mode = (it.mode ?? (typeof raw.mode === "string" ? raw.mode : "analyze") ?? "analyze");
+    const workspaceStrategy = (it.workspaceStrategy ?? (typeof raw.workspace_strategy === "string" ? raw.workspace_strategy : "shared") ?? "shared");
+    const visualContext = (it.visualContext ?? (typeof raw.visual_context === "string" ? raw.visual_context : "") ?? "").trim();
+    const modelRoute = (it.modelRoute ?? (typeof raw.model_route === "string" ? raw.model_route : "") ?? "").trim();
+    const threadId = (it.threadId ?? (typeof raw.thread_id === "string" ? raw.thread_id : "") ?? "").trim();
+    const turnId = (it.turnId ?? (typeof raw.turn_id === "string" ? raw.turn_id : "") ?? "").trim();
+    const mcpSessionId = (it.mcpSessionId ?? (typeof raw.mcp_session_id === "string" ? raw.mcp_session_id : "") ?? "").trim();
+    const trustedThreadId = (it.trustedThreadId ?? (typeof raw.trusted_thread_id === "string" ? raw.trusted_thread_id : "") ?? "").trim();
+    const priority = typeof it.priority === "number" ? Math.max(1, Math.min(100, Math.floor(it.priority))) : 50;
+
+    const rawResources = (it.exclusiveResources ?? (Array.isArray(raw.exclusive_resources) ? raw.exclusive_resources : [])) as string[];
+    const exclusiveResources = Array.from(new Set(rawResources.map((r) => String(r).trim()).filter((r) => r.length > 0))).sort();
+
+    const rawFiles = (it.contextFiles ?? (Array.isArray(raw.context_files) ? raw.context_files : [])) as string[];
+    const contextFiles = Array.from(new Set(rawFiles.map((f) => String(f).trim()).filter((f) => f.length > 0))).sort();
+
+    return {
+      requestId,
+      topic,
+      task,
+      cwd,
+      mode,
+      workspaceStrategy,
+      visualContext,
+      modelRoute,
+      threadId,
+      turnId,
+      mcpSessionId,
+      trustedThreadId,
+      priority,
+      exclusiveResources,
+      contextFiles,
+    };
+  });
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
 function hashPrompt(prompt: string): string {
   return createHash("sha256").update(prompt, "utf8").digest("hex");
 }
@@ -4158,6 +5461,36 @@ function isUnknownDispatchOutcome(error: unknown): boolean {
   return error instanceof OpenCodeTransportError;
 }
 
+function formatAssistantError(error: unknown): string {
+  if (typeof error === "string") return redactSecrets(error);
+  if (error && typeof error === "object") {
+    const obj = error as Record<string, unknown>;
+    const code = typeof obj.code === "string" ? obj.code : null;
+    const message = typeof obj.message === "string" ? obj.message : typeof obj.error === "string" ? obj.error : null;
+    if (code && message) return redactSecrets(`[${code}] ${message}`);
+    if (message) return redactSecrets(message);
+    if (code) return redactSecrets(code);
+    try {
+      return redactSecrets(JSON.stringify(error));
+    } catch {
+      return redactSecrets(String(error));
+    }
+  }
+  return redactSecrets(String(error));
+}
+
+function isSessionAbsentError(error: unknown): boolean {
+  if (error instanceof OpenCodeHttpError && error.status === 404) return true;
+  const status = typeof (error as any)?.status === "number"
+    ? (error as any).status
+    : typeof (error as any)?.statusCode === "number"
+      ? (error as any).statusCode
+      : undefined;
+  if (status === 404) return true;
+  const message = redactSecrets(String(error)).toLowerCase();
+  return message.includes("404") || message.includes("session not found") || message.includes("unknown session") || message.includes("session absent");
+}
+
 function activityTypeForEvent(event: OpenCodeEvent): Parameters<BridgeStore["recordActivity"]>[0]["activityType"] {
   if (isApprovalRequestEvent(event.type, event.properties)) return "approval";
   if (event.type.includes("error")) return "error";
@@ -4244,8 +5577,9 @@ async function ensureDirectory(directory: string): Promise<void> {
 
 async function prepareWorkspace(repositoryRoot: string, strategy: "shared" | "worktree", agentId: string): Promise<string> {
   if (strategy === "shared") return repositoryRoot;
-  await assertCleanGitRepository(repositoryRoot);
   const workspacePath = path.join(repositoryRoot, ".deepseek-worktrees", agentId);
+  if (existsSync(workspacePath)) return workspacePath;
+  await assertCleanGitRepository(repositoryRoot);
   const relative = path.relative(repositoryRoot, workspacePath);
   if (relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw new Error("Invalid worktree path");
   const result = await runGit(repositoryRoot, ["worktree", "add", "--detach", workspacePath, "HEAD"]);
@@ -4266,7 +5600,13 @@ async function assertCleanGitRepository(repositoryRoot: string): Promise<void> {
   if (status.code !== 0) {
     throw new Error("Unable to inspect Git worktree status");
   }
-  if (status.stdout.trim().length > 0) {
+  const dirtyLines = status.stdout.split("\n").filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    const entry = trimmed.slice(2).trim();
+    return !entry.startsWith(".deepseek-worktrees");
+  });
+  if (dirtyLines.length > 0) {
     throw new Error("Repository has uncommitted changes; worktree from HEAD cannot represent them. Use shared explicitly or preserve the changes outside the bridge first.");
   }
 }

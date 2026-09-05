@@ -10,6 +10,7 @@ import type {
   AgentMode,
   AgentRecord,
   AgentStatus,
+  BatchRecord,
   CodexBinding,
   DeliveryMethod,
   DeliveryRecord,
@@ -409,14 +410,63 @@ export class BridgeStore {
       }
       this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(18, ?)").run(new Date().toISOString());
     }
+    const v19Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 19").get() as Row | undefined;
+    if (!v19Migration) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS batches (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL UNIQUE,
+          batch_hash TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => stringValue(c, "name"));
+      if (!jobCols.includes("batch_id")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN batch_id TEXT REFERENCES batches(id);");
+      }
+      if (!jobCols.includes("priority")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 50;");
+      }
+      if (!jobCols.includes("exclusive_resources")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN exclusive_resources TEXT;");
+      }
+      if (!jobCols.includes("queued_at")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN queued_at TEXT;");
+      }
+      if (!jobCols.includes("dispatched_at")) {
+        this.db.exec("ALTER TABLE jobs ADD COLUMN dispatched_at TEXT;");
+      }
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id);");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_queued ON jobs(status, priority DESC, queued_at ASC);");
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(19, ?)").run(new Date().toISOString());
+    }
+    const v20Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 20").get() as Row | undefined;
+    if (!v20Migration) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS dispatch_envelopes (
+          job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+          prompt TEXT NOT NULL,
+          prompt_hash TEXT NOT NULL,
+          worker_input_json TEXT NOT NULL,
+          context_files_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dispatch_envelopes_job ON dispatch_envelopes(job_id);
+      `);
+      this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(20, ?)").run(new Date().toISOString());
+    }
   }
 
   /** True only when no business rows exist at all (fresh database). */
   isProvablyEmpty(): boolean {
     const hasParks = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='park_barriers'").get() !== undefined;
     const parkCountSql = hasParks ? "(SELECT COUNT(*) FROM park_barriers)" : "0";
+    const hasBatches = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='batches'").get() !== undefined;
+    const batchCountSql = hasBatches ? "(SELECT COUNT(*) FROM batches)" : "0";
     const row = this.db.prepare(
-      `SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM agent_activity) + (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM codex_bindings) + ${parkCountSql} AS total`,
+      `SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM jobs) + (SELECT COUNT(*) FROM events) + (SELECT COUNT(*) FROM agent_activity) + (SELECT COUNT(*) FROM deliveries) + (SELECT COUNT(*) FROM codex_bindings) + ${parkCountSql} + ${batchCountSql} AS total`,
     ).get() as Row;
     return numberValue(row, "total") === 0;
   }
@@ -497,6 +547,300 @@ export class BridgeStore {
     return agent;
   }
 
+  createBatch(input: {
+    id: string;
+    requestId: string;
+    batchHash: string;
+    status?: string;
+  }): BatchRecord {
+    const now = new Date().toISOString();
+    this.db.prepare("INSERT INTO batches (id, request_id, batch_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+      input.id,
+      input.requestId,
+      input.batchHash,
+      input.status ?? "queued",
+      now,
+      now,
+    );
+    const batch = this.getBatch(input.id);
+    if (!batch) throw new Error("Batch was not persisted");
+    return batch;
+  }
+
+  getBatch(id: string): BatchRecord | null {
+    const row = this.db.prepare("SELECT * FROM batches WHERE id = ?").get(id) as Row | undefined;
+    return row ? this.toBatch(row) : null;
+  }
+
+  getBatchByRequestId(requestId?: string | null): BatchRecord | null {
+    if (!requestId) return null;
+    const row = this.db.prepare("SELECT * FROM batches WHERE request_id = ?").get(requestId) as Row | undefined;
+    return row ? this.toBatch(row) : null;
+  }
+
+  listBatchJobs(batchId: string): JobRecord[] {
+    const rows = this.db.prepare("SELECT * FROM jobs WHERE batch_id = ? ORDER BY sequence ASC").all(batchId) as Row[];
+    return rows.map((r) => this.toJob(r));
+  }
+
+  updateBatchStatus(id: string, status: string): void {
+    this.db.prepare("UPDATE batches SET status = ?, updated_at = ? WHERE id = ?").run(status, new Date().toISOString(), id);
+  }
+
+  transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT;");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK;");
+      throw error;
+    }
+  }
+
+  saveDispatchEnvelope(jobId: string, envelope: {
+    prompt: string;
+    promptHash: string;
+    workerInput: unknown;
+    contextFiles: string[];
+  }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      "INSERT INTO dispatch_envelopes(job_id, prompt, prompt_hash, worker_input_json, context_files_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET prompt = excluded.prompt, prompt_hash = excluded.prompt_hash, worker_input_json = excluded.worker_input_json, context_files_json = excluded.context_files_json, created_at = excluded.created_at",
+    ).run(
+      jobId,
+      envelope.prompt,
+      envelope.promptHash,
+      JSON.stringify(envelope.workerInput),
+      JSON.stringify(envelope.contextFiles),
+      now,
+    );
+  }
+
+  getDispatchEnvelope(jobId: string): {
+    jobId: string;
+    prompt: string;
+    promptHash: string;
+    workerInput: Record<string, unknown>;
+    contextFiles: string[];
+    createdAt: string;
+  } | null {
+    const row = this.db.prepare("SELECT * FROM dispatch_envelopes WHERE job_id = ?").get(jobId) as Row | undefined;
+    if (!row) return null;
+    return {
+      jobId: stringValue(row, "job_id"),
+      prompt: stringValue(row, "prompt"),
+      promptHash: stringValue(row, "prompt_hash"),
+      workerInput: JSON.parse(stringValue(row, "worker_input_json")),
+      contextFiles: JSON.parse(stringValue(row, "context_files_json")),
+      createdAt: stringValue(row, "created_at"),
+    };
+  }
+
+  deleteDispatchEnvelope(jobId: string): void {
+    this.db.prepare("DELETE FROM dispatch_envelopes WHERE job_id = ?").run(jobId);
+  }
+
+  admitBatch(admission: {
+    batch: {
+      id: string;
+      requestId: string;
+      batchHash: string;
+      status?: string;
+    };
+    items: Array<{
+      agent: {
+        id: string;
+        title: string;
+        topic: string;
+        repositoryRoot: string;
+        workspacePath: string;
+        workspaceStrategy: WorkspaceStrategy;
+        mode: AgentMode;
+        opencodeServerId: string;
+        opencodeSessionId: string;
+        modelProviderId: string;
+        modelId: string;
+        modelVariant: string | null;
+        modelRoute: string;
+      };
+      job: {
+        id: string;
+        agentId: string;
+        kind: JobKind;
+        status?: JobStatus;
+        batchId?: string | null;
+        priority?: number;
+        exclusiveResources?: string[] | null;
+        requestId: string;
+        promptHash: string;
+        queuedAt?: string | null;
+        mcpSessionId?: string | null;
+        trustedThreadId?: string | null;
+      };
+      correlationHint?: {
+        threadId?: string | null | undefined;
+        turnId?: string | null | undefined;
+      } | undefined;
+      dispatchEnvelope?: {
+        prompt: string;
+        promptHash: string;
+        workerInput: unknown;
+        contextFiles: string[];
+      } | undefined;
+    }>;
+  }): void {
+    this.transaction(() => {
+      this.createBatch(admission.batch);
+      for (const entry of admission.items) {
+        this.createAgent(entry.agent);
+        this.createJob(entry.job);
+        if (entry.correlationHint?.threadId || entry.correlationHint?.turnId) {
+          this.setCorrelationHint(entry.job.id, {
+            threadId: entry.correlationHint.threadId ?? null,
+            turnId: entry.correlationHint.turnId ?? null,
+            source: "mcp",
+          });
+        }
+        if (entry.dispatchEnvelope) {
+          this.saveDispatchEnvelope(entry.job.id, entry.dispatchEnvelope);
+        }
+      }
+    });
+  }
+
+  admitUnary(admission: {
+    agent: {
+      id: string;
+      title: string;
+      topic: string;
+      repositoryRoot: string;
+      workspacePath: string;
+      workspaceStrategy: WorkspaceStrategy;
+      mode: AgentMode;
+      opencodeServerId: string;
+      opencodeSessionId: string;
+      modelProviderId: string;
+      modelId: string;
+      modelVariant: string | null;
+      modelRoute: string;
+    };
+    job: {
+      id: string;
+      agentId: string;
+      kind: JobKind;
+      status?: JobStatus;
+      batchId?: string | null;
+      priority?: number;
+      exclusiveResources?: string[] | null;
+      requestId: string;
+      promptHash: string;
+      queuedAt?: string | null;
+      mcpSessionId?: string | null;
+      trustedThreadId?: string | null;
+    };
+    correlationHint?: {
+      threadId?: string | null | undefined;
+      turnId?: string | null | undefined;
+    } | undefined;
+    dispatchEnvelope?: {
+      prompt: string;
+      promptHash: string;
+      workerInput: unknown;
+      contextFiles: string[];
+    } | undefined;
+  }): { agent: AgentRecord; job: JobRecord } {
+    return this.transaction(() => {
+      const agent = this.createAgent(admission.agent);
+      const job = this.createJob(admission.job);
+      if (admission.correlationHint?.threadId || admission.correlationHint?.turnId) {
+        this.setCorrelationHint(job.id, {
+          threadId: admission.correlationHint.threadId ?? null,
+          turnId: admission.correlationHint.turnId ?? null,
+          source: "mcp",
+        });
+      }
+      if (admission.dispatchEnvelope) {
+        this.saveDispatchEnvelope(job.id, admission.dispatchEnvelope);
+      }
+      return { agent, job };
+    });
+  }
+
+  admitContinuation(admission: {
+    agent?: {
+      id: string;
+      title: string;
+      topic: string;
+      repositoryRoot: string;
+      workspacePath: string;
+      workspaceStrategy: WorkspaceStrategy;
+      mode?: AgentMode;
+      opencodeServerId: string;
+      opencodeSessionId: string;
+      modelProviderId: string;
+      modelId: string;
+      modelVariant: string | null;
+      modelRoute?: string | null;
+      parentAgentId?: string | null;
+    } | undefined;
+    job: {
+      id: string;
+      agentId: string;
+      kind: JobKind;
+      status?: JobStatus;
+      batchId?: string | null;
+      priority?: number;
+      exclusiveResources?: string[] | null;
+      requestId: string;
+      promptHash: string;
+      queuedAt?: string | null;
+      mcpSessionId?: string | null;
+      trustedThreadId?: string | null;
+    };
+    correlationHint?: {
+      threadId?: string | null | undefined;
+      turnId?: string | null | undefined;
+      source?: string | undefined;
+    } | undefined;
+    dispatchEnvelope?: {
+      prompt: string;
+      promptHash: string;
+      workerInput: unknown;
+      contextFiles: string[];
+    } | undefined;
+  }): { agent?: AgentRecord | null; job: JobRecord } {
+    return this.transaction(() => {
+      let agent: AgentRecord | null = null;
+      if (admission.agent) {
+        agent = this.createAgent(admission.agent);
+      }
+      const job = this.createJob(admission.job);
+      if (admission.correlationHint?.threadId || admission.correlationHint?.turnId) {
+        this.setCorrelationHint(job.id, {
+          threadId: admission.correlationHint.threadId ?? null,
+          turnId: admission.correlationHint.turnId ?? null,
+          source: admission.correlationHint.source ?? "mcp",
+        });
+      }
+      if (admission.dispatchEnvelope) {
+        this.saveDispatchEnvelope(job.id, admission.dispatchEnvelope);
+      }
+      return { agent, job: this.getJob(job.id) ?? job };
+    });
+  }
+
+  private toBatch(row: Row): BatchRecord {
+    return {
+      id: stringValue(row, "id"),
+      requestId: stringValue(row, "request_id"),
+      batchHash: stringValue(row, "batch_hash"),
+      status: stringValue(row, "status"),
+      createdAt: stringValue(row, "created_at"),
+      updatedAt: stringValue(row, "updated_at"),
+    };
+  }
 
   createJob(input: {
     id: string;
@@ -506,21 +850,35 @@ export class BridgeStore {
     promptHash: string;
     mcpSessionId?: string | null;
     trustedThreadId?: string | null;
+    status?: JobStatus;
+    batchId?: string | null;
+    priority?: number;
+    exclusiveResources?: string[] | null;
+    queuedAt?: string | null;
   }): JobRecord {
     const sequenceRow = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM jobs WHERE agent_id = ?").get(input.agentId) as Row;
     const sequence = numberValue(sequenceRow, "sequence");
     const now = new Date().toISOString();
-    this.db.prepare("INSERT INTO jobs(id,agent_id,sequence,kind,request_id,prompt_hash,status,created_at,mcp_session_id,trusted_thread_id) VALUES(?,?,?,?,?,?,?,?,?,?)").run(
+    const status = input.status ?? "created";
+    const queuedAt = status === "queued" ? (input.queuedAt ?? now) : (input.queuedAt ?? null);
+    const exclusiveResources = input.exclusiveResources ? JSON.stringify(input.exclusiveResources) : null;
+    const priority = input.priority ?? 50;
+
+    this.db.prepare("INSERT INTO jobs(id,agent_id,sequence,kind,request_id,prompt_hash,status,created_at,mcp_session_id,trusted_thread_id,batch_id,priority,exclusive_resources,queued_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
       input.id,
       input.agentId,
       sequence,
       input.kind,
-      input.requestId,
+      input.requestId ?? null,
       input.promptHash,
-      "created",
+      status,
       now,
       input.mcpSessionId ?? null,
       input.trustedThreadId ?? null,
+      input.batchId ?? null,
+      priority,
+      exclusiveResources,
+      queuedAt,
     );
     const job = this.getJob(input.id);
     if (!job) throw new Error("Job was not persisted");
@@ -547,8 +905,14 @@ export class BridgeStore {
     return row ? this.toJob(row) : null;
   }
 
-  getJobByRequestId(requestId: string): JobRecord | null {
+  getJobByRequestId(requestId?: string | null): JobRecord | null {
+    if (!requestId) return null;
     const row = this.db.prepare("SELECT * FROM jobs WHERE request_id = ?").get(requestId) as Row | undefined;
+    return row ? this.toJob(row) : null;
+  }
+
+  getLatestJobForAgent(agentId: string): JobRecord | null {
+    const row = this.db.prepare("SELECT * FROM jobs WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1").get(agentId) as Row | undefined;
     return row ? this.toJob(row) : null;
   }
 
@@ -569,9 +933,10 @@ export class BridgeStore {
     const now = new Date().toISOString();
     const startedAt = status === "running" && current.startedAt === null ? now : current.startedAt;
     const completedAt = ["completed", "completed_partial", "timed_out", "failed", "aborted"].includes(status) ? now : current.completedAt;
+    const dispatchedAt = ["dispatching", "running"].includes(status) && (current.dispatchedAt === null || current.dispatchedAt === undefined) ? now : (current.dispatchedAt ?? null);
 
-    let sql = "UPDATE jobs SET status = ?, started_at = ?, completed_at = ?, error = ? WHERE id = ?";
-    const params: (string | number | null)[] = [status, startedAt, completedAt, error, id];
+    let sql = "UPDATE jobs SET status = ?, started_at = ?, completed_at = ?, dispatched_at = ?, error = ? WHERE id = ?";
+    const params: (string | number | null)[] = [status, startedAt, completedAt, dispatchedAt, error, id];
     if (expectedFence !== undefined && expectedFence !== null) {
       sql += " AND (fence IS NULL OR fence <= ?)";
       params.push(expectedFence);
@@ -588,6 +953,26 @@ export class BridgeStore {
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
+  }
+
+  claimQueuedJobForDispatch(id: string, expectedFence?: number | null): JobRecord | null {
+    const current = this.getJob(id);
+    if (!current || current.status !== "queued") return null;
+    if (expectedFence !== undefined && expectedFence !== null && current.fence !== null && current.fence !== undefined && expectedFence < current.fence) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    let sql = "UPDATE jobs SET status = 'dispatching', dispatched_at = ? WHERE id = ? AND status = 'queued'";
+    const params: (string | number)[] = [now, id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (Number(info.changes) !== 1) {
+      return null;
+    }
+    return this.getJob(id);
   }
 
   setJobMessages(id: string, userMessageId: string | null, assistantMessageId: string | null): void {
@@ -908,9 +1293,38 @@ export class BridgeStore {
 
   countOpenObligations(): number {
     const row = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('dispatching','running','following','finalizing','needs_approval')",
+      "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued','dispatching','running','following','finalizing','needs_approval')",
     ).get() as Row;
     return numberValue(row, "count");
+  }
+
+  getQueueDepth(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").get() as Row;
+    return numberValue(row, "count");
+  }
+
+  getActiveJobCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('dispatching','running','following','finalizing')").get() as Row;
+    return numberValue(row, "count");
+  }
+
+  getOldestWaitMs(now = Date.now()): number | null {
+    const row = this.db.prepare("SELECT queued_at FROM jobs WHERE status = 'queued' AND queued_at IS NOT NULL ORDER BY queued_at ASC LIMIT 1").get() as Row | undefined;
+    if (!row || !row.queued_at) return null;
+    const queuedTime = new Date(stringValue(row, "queued_at")).getTime();
+    return Math.max(0, now - queuedTime);
+  }
+
+  listQueuedJobs(): JobRecord[] {
+    const rows = this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY priority DESC, queued_at ASC").all() as Row[];
+    return rows.map((r) => this.toJob(r));
+  }
+
+  listActiveJobs(): JobRecord[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM jobs WHERE status IN ('dispatching','running','following','finalizing','needs_approval')",
+    ).all() as Row[];
+    return rows.map((r) => this.toJob(r));
   }
 
   /**
@@ -930,7 +1344,7 @@ export class BridgeStore {
    *  terminal jobs with an unconsumed or undelivered result. */
   protectedJobIds(): Set<string> {
     const rows = this.db.prepare(
-      "SELECT id FROM jobs WHERE status IN ('dispatching','running','following','finalizing','needs_approval','delivery_pending') OR (result_path IS NOT NULL AND result_consumed_at IS NULL)",
+      "SELECT id FROM jobs WHERE status IN ('queued','dispatching','running','following','finalizing','needs_approval','delivery_pending') OR (result_path IS NOT NULL AND result_consumed_at IS NULL)",
     ).all() as Row[];
     return new Set(rows.map((row) => stringValue(row, "id")));
   }
@@ -1145,6 +1559,7 @@ export class BridgeStore {
 
   recoverPendingJobs(): JobRecord[] {
     const statuses = [
+      "queued",
       "dispatching",
       "running",
       "following",
@@ -1245,6 +1660,11 @@ export class BridgeStore {
       escalationProposal: nullableString(row, "escalation_proposal"),
       mcpSessionId: nullableString(row, "mcp_session_id"),
       trustedThreadId: nullableString(row, "trusted_thread_id"),
+      batchId: nullableString(row, "batch_id"),
+      priority: typeof row.priority === "number" || typeof row.priority === "bigint" ? Number(row.priority) : 50,
+      exclusiveResources: row.exclusive_resources ? JSON.parse(stringValue(row, "exclusive_resources")) : null,
+      queuedAt: nullableString(row, "queued_at"),
+      dispatchedAt: nullableString(row, "dispatched_at"),
     };
   }
 
@@ -1427,7 +1847,7 @@ export class BridgeStore {
   claimParkWake(parkId: string, generation: number): boolean {
     const now = new Date().toISOString();
     const info = this.db.prepare(
-      "UPDATE park_barriers SET state = 'waking', updated_at = ? WHERE id = ? AND generation = ? AND state = 'armed'",
+      "UPDATE park_barriers SET state = 'waking', armed = 0, updated_at = ? WHERE id = ? AND generation = ? AND state = 'armed'",
     ).run(now, parkId, generation);
     return Number(info.changes) === 1;
   }

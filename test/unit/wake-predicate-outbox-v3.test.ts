@@ -37,8 +37,11 @@ class FakeCodexDelivery implements CodexDeliveryAdapter {
     this.deliveredWakes.push({ envelope, binding });
     return "codex-start";
   }
+  reconcileSendCalls: Array<{ threadId: string; marker: string }> = [];
+  reconcileSendResult = false;
   async reconcileSend(threadId: string, marker: string): Promise<boolean> {
-    return false;
+    this.reconcileSendCalls.push({ threadId, marker });
+    return this.reconcileSendResult;
   }
   onCorrelation(_listener: (correlation: CodexCorrelation) => void): () => void {
     return () => undefined;
@@ -49,6 +52,8 @@ class FakeCliTransport implements CodexCliTransport {
   calls: Array<{ threadId: string; marker: string }> = [];
   nextResult: CodexCliExecutionResult = { success: true, accepted: true, executablePath: "codex.exe", version: "0.150.0" };
   compatible = true;
+  reconcileQueuedWakeCalls: Array<{ threadId: string; marker: string }> = [];
+  queuedWakeHandler: ((threadId: string, marker: string) => Promise<{ found: boolean; messageId?: string | null; deliveryMode?: string } | boolean | null>) | null = null;
 
   async probeCapabilities(executable?: string): Promise<{ compatible: boolean; version: string | null }> {
     return { compatible: this.compatible, version: "0.150.0" };
@@ -57,6 +62,14 @@ class FakeCliTransport implements CodexCliTransport {
   async deliverWake(threadId: string, marker: string): Promise<CodexCliExecutionResult> {
     this.calls.push({ threadId, marker });
     return this.nextResult;
+  }
+
+  async reconcileQueuedWake(threadId: string, marker: string): Promise<{ found: boolean; messageId?: string | null; deliveryMode?: string } | boolean | null> {
+    this.reconcileQueuedWakeCalls.push({ threadId, marker });
+    if (this.queuedWakeHandler) {
+      return this.queuedWakeHandler(threadId, marker);
+    }
+    return { found: false };
   }
 }
 
@@ -1192,9 +1205,10 @@ test("WAKE-V3: abort() terminal transition without result triggers evaluateParkW
 });
 
 // ---------------------------------------------------------------------------
-// 16. timeoutFollow() terminal transition without result wakes live barrier
+// 16. timeoutFollow() does not kill healthy job without authoritative proof;
+//     explicit terminal event triggers evaluateParkWakes and wakes live barrier exactly once
 // ---------------------------------------------------------------------------
-test("WAKE-V3: timeoutFollow() terminal transition without result triggers evaluateParkWakes and wakes live barrier", async () => {
+test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative proof; explicit terminal event triggers evaluateParkWakes and wakes live barrier exactly once", async () => {
   const { tmp, config, store } = await createTestEnv();
   const fakeCodex = new FakeCodexDelivery();
   const fakeCli = new FakeCliTransport();
@@ -1234,7 +1248,7 @@ test("WAKE-V3: timeoutFollow() terminal transition without result triggers evalu
     const receipt = await service.park({ job_ids: [job.id] });
     assert.equal(receipt.armed, true);
 
-    // Setup lifecycle map entry
+    // Setup lifecycle map entry with elapsed follow and grace deadlines
     (service as any).followLifecycles.set(job.id, {
       jobId: job.id,
       deadlineAt: Date.now() - 1000,
@@ -1249,16 +1263,33 @@ test("WAKE-V3: timeoutFollow() terminal transition without result triggers evalu
       settled: false,
     });
 
-    // Execute timeoutFollow
+    // 1. Follow window/grace expiry alone must NOT kill a healthy job
+    // Absence of PID/attempt does not prove death: job stays finalizing, barrier remains armed, no outbox
+    await (service as any).timeoutFollow(job.id);
+
+    const jobAfterClockExpiry = store.getJob(job.id)!;
+    assert.equal(jobAfterClockExpiry.status, "finalizing", "Healthy job must not be killed by clock/grace expiry when PID/attempt is absent");
+    assert.equal(jobAfterClockExpiry.resultPath, null);
+
+    let barrier = store.getParkBarrier(receipt.parkId)!;
+    assert.equal(barrier.state, "armed", "Barrier must remain armed when follow window expires without authoritative death proof");
+    assert.equal(barrier.armed, true);
+    assert.equal(store.getWakeOutbox(receipt.parkId, receipt.generation), null, "Outbox must not materialize without an explicit terminal event");
+    assert.equal(fakeCli.calls.length, 0, "CLI wake delivery must not occur while barrier is still armed");
+
+    // 2. Authoritative proof of dead worker process enables explicit terminal timed_out transition
+    store.updateJobLiveness(job.id, { workerPid: 999999 });
+
+    // Now timeoutFollow has authoritative proof that the worker process is dead
     await (service as any).timeoutFollow(job.id);
 
     const timedOutJob = store.getJob(job.id)!;
-    assert.equal(timedOutJob.status, "timed_out");
+    assert.equal(timedOutJob.status, "timed_out", "Job must transition to timed_out once dead process is authoritatively proven");
     assert.equal(timedOutJob.resultPath, null, "Job must have no resultPath");
 
-    // Barrier must have been woken by timeoutFollow()
-    const barrier = store.getParkBarrier(receipt.parkId)!;
-    assert.equal(barrier.state, "woken", "timeoutFollow() without result must wake the barrier");
+    // Barrier must have been woken by the authoritative terminal event via evaluateParkWakes
+    barrier = store.getParkBarrier(receipt.parkId)!;
+    assert.equal(barrier.state, "woken", "Explicit terminal event must wake the barrier");
     assert.equal(barrier.armed, false);
 
     const outbox = store.getWakeOutbox(receipt.parkId, receipt.generation)!;
@@ -1268,6 +1299,67 @@ test("WAKE-V3: timeoutFollow() terminal transition without result triggers evalu
     assert.deepEqual(envelope.readyJobIds, [job.id]);
     assert.equal(envelope.statuses[job.id], "timed_out");
     assert.equal(fakeCli.calls.length, 1);
+
+    // 3. Subsequent/duplicate evaluation must materialize outbox exactly once
+    await service.evaluateParkWakes(job.id);
+    assert.equal(fakeCli.calls.length, 1, "CLI wake delivery must be invoked exactly once");
+    const outboxRows = store.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ? AND generation = ?").all(receipt.parkId, receipt.generation);
+    assert.equal(outboxRows.length, 1, "Exactly one outbox row must exist for this park and generation");
+
+    // 4. Also verify explicit abort terminal event on a healthy job whose follow window expired
+    const agent2 = setupAgent(store, tmp, "agent_timeout_abort");
+    const job2 = store.createJob({ id: "job_to2", agentId: agent2.id, kind: "spawn", requestId: "rto2", promptHash: "hto2" });
+    store.bindJob({ jobId: job2.id, threadId: "thread_to2", originatingTurnId: "tto2", originatingItemId: "ito2" });
+
+    store.updateJobStatus(job2.id, "dispatching");
+    store.updateJobStatus(job2.id, "running");
+    store.updateJobStatus(job2.id, "following");
+    store.updateJobStatus(job2.id, "finalizing");
+
+    const receipt2 = await service.park({ job_ids: [job2.id] });
+    assert.equal(receipt2.armed, true);
+
+    (service as any).followLifecycles.set(job2.id, {
+      jobId: job2.id,
+      deadlineAt: Date.now() - 1000,
+      graceDeadlineAt: Date.now() - 100,
+      autoArmed: false,
+      promise: Promise.resolve(),
+      resolve: () => {},
+      reject: () => {},
+      deadlineTimer: null,
+      graceTimer: null,
+      waiters: new Set(),
+      settled: false,
+    });
+
+    // Clock expiry alone does not kill job2 or wake receipt2
+    await (service as any).timeoutFollow(job2.id);
+    assert.equal(store.getJob(job2.id)!.status, "finalizing");
+    assert.equal(store.getParkBarrier(receipt2.parkId)!.state, "armed");
+    assert.equal(store.getWakeOutbox(receipt2.parkId, receipt2.generation), null);
+
+    // Explicit abort terminalizes job2, calls evaluateParkWakes, and materializes outbox exactly once
+    const abortResult = await service.abort(agent2.id, "Explicit abort after follow window");
+    assert.equal(abortResult.status, "aborted");
+    assert.equal(store.getJob(job2.id)!.status, "aborted");
+
+    const barrier2 = store.getParkBarrier(receipt2.parkId)!;
+    assert.equal(barrier2.state, "woken");
+    assert.equal(barrier2.armed, false);
+
+    const outbox2 = store.getWakeOutbox(receipt2.parkId, receipt2.generation)!;
+    assert.ok(outbox2);
+    assert.equal(outbox2.status, "delivered");
+    const envelope2 = JSON.parse(outbox2.payloadJson) as WakeEnvelope;
+    assert.deepEqual(envelope2.readyJobIds, [job2.id]);
+    assert.equal(envelope2.statuses[job2.id], "aborted");
+    assert.equal(fakeCli.calls.length, 2, "Second delivery occurred for second barrier");
+
+    await service.evaluateParkWakes(job2.id);
+    assert.equal(fakeCli.calls.length, 2, "Duplicate evaluateParkWakes must not re-deliver");
+    const outboxRows2 = store.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ? AND generation = ?").all(receipt2.parkId, receipt2.generation);
+    assert.equal(outboxRows2.length, 1, "Exactly one outbox row for receipt2");
   } finally {
     await service.stop();
     store.close();
@@ -1326,3 +1418,352 @@ test("WAKE-V3: existing-outbox guard includes pending and prevents duplicate out
   }
 });
 
+// ---------------------------------------------------------------------------
+// 18. Ambiguous/unknown CLI outcome remains fail-closed in waking/indeterminate and is never blindly retried;
+//     only an explicitly deterministic pre-accept non-delivery may become retryable if provable
+// ---------------------------------------------------------------------------
+test("WAKE-V3: ambiguous/unknown CLI outcome remains fail-closed in waking/indeterminate and is never blindly retried; only deterministic pre-accept is retryable", async () => {
+  const { tmp, config, store } = await createTestEnv();
+  const fakeCodex = new FakeCodexDelivery();
+  const fakeCli = new FakeCliTransport();
+  const service = createTestService(config, store, fakeCodex, fakeCli);
+  await service.start();
+
+  try {
+    const agent = setupAgent(store, tmp, "agent_ambiguous_cli");
+    const j1 = store.createJob({ id: "job_amb1", agentId: agent.id, kind: "spawn", requestId: "ramb1", promptHash: "hamb1" });
+    store.bindJob({ jobId: j1.id, threadId: "thread_amb", originatingTurnId: "tamb", originatingItemId: "iamb" });
+
+    const receipt = await service.park({ job_ids: [j1.id] });
+    assert.equal(receipt.armed, true);
+
+    // Part A: Ambiguous/unknown CLI outcome (e.g. timeout, exit code 1 with unproven send)
+    fakeCli.nextResult = {
+      success: false,
+      unknownOutcome: true,
+      error: "Command failed with exit code 1: transient pipe failure",
+    };
+
+    const r1 = path.join(tmp, "ramb1.json");
+    await writeFile(r1, JSON.stringify({ envelope: { summary: "amb done" } }));
+    makeJobCompleted(store, j1.id, r1, "amb done");
+
+    // Evaluate park wakes -> triggers dispatchWakeOutbox
+    await service.evaluateParkWakes(j1.id);
+
+    const outbox = store.getWakeOutbox(receipt.parkId, receipt.generation);
+    assert.ok(outbox, "Outbox record must exist");
+
+    // Ambiguous/unknown CLI outcome MUST remain fail-closed in waking/indeterminate:
+    // It must NOT be marked permanently failed (which abandons reconciliation),
+    // and must NOT be marked pending/deferred for blind retry.
+    assert.equal(outbox.status, "waking", "Ambiguous/unknown CLI outcome must remain fail-closed in waking/indeterminate status");
+    assert.notEqual(outbox.status, "failed", "Ambiguous outcome must not be permanently failed");
+    assert.notEqual(outbox.status, "pending", "Ambiguous outcome must not be reset to pending for blind retry");
+    assert.notEqual(outbox.status, "deferred_active_writer", "Ambiguous outcome without activeWriter proof must not become deferred");
+
+    // Barrier must remain fail-closed in waking/indeterminate and NOT be re-armed
+    const barrier = store.getParkBarrier(receipt.parkId)!;
+    assert.equal(barrier.state, "waking", "Barrier must remain waking/indeterminate when delivery outcome is unknown");
+    assert.equal(barrier.armed, false, "Barrier armed must be false while indeterminate");
+
+    // Ambiguous outcome is NEVER blindly retried without authoritative proof
+    const callsBefore = fakeCli.calls.length;
+    await (service as any).recoverWakeOutbox();
+    await service.evaluateParkWakes(j1.id);
+    assert.equal(fakeCli.calls.length, callsBefore, "Ambiguous outcome must never be blindly retried without authoritative proof");
+
+    // Part B: Explicitly deterministic pre-accept non-delivery (activeWriter: true)
+    // Only deterministic pre-accept non-delivery may become retryable
+    const j2 = store.createJob({ id: "job_det_retry", agentId: agent.id, kind: "spawn", requestId: "rdet", promptHash: "hdet" });
+    store.bindJob({ jobId: j2.id, threadId: "thread_det", originatingTurnId: "tdet", originatingItemId: "idet" });
+
+    fakeCli.nextResult = {
+      success: false,
+      activeWriter: true,
+      error: "Active writer conflict",
+    };
+
+    const receipt2 = await service.park({ job_ids: [j2.id] });
+    const r2 = path.join(tmp, "rdet.json");
+    await writeFile(r2, JSON.stringify({ envelope: { summary: "det done" } }));
+    makeJobCompleted(store, j2.id, r2, "det done");
+
+    await service.evaluateParkWakes(j2.id);
+
+    const outbox2 = store.getWakeOutbox(receipt2.parkId, receipt2.generation)!;
+    assert.ok(outbox2);
+    assert.equal(outbox2.status, "deferred_active_writer", "Deterministic pre-accept non-delivery may become retryable");
+
+    const barrier2 = store.getParkBarrier(receipt2.parkId)!;
+    assert.equal(barrier2.state, "armed", "Barrier must be armed for retry on deterministic pre-accept non-delivery");
+
+    // When transport recovers, retry succeeds
+    fakeCli.nextResult = { success: true, accepted: true, executablePath: "codex.exe", version: "0.150.0" };
+    store.db.prepare("UPDATE wake_outbox SET next_attempt_at = ? WHERE id = ?").run(new Date(Date.now() - 5000).toISOString(), outbox2.id);
+    await (service as any).recoverWakeOutbox();
+
+    const deliveredOutbox = store.getWakeOutbox(receipt2.parkId, receipt2.generation)!;
+    assert.equal(deliveredOutbox.status, "delivered");
+    const deliveredBarrier = store.getParkBarrier(receipt2.parkId)!;
+    assert.equal(deliveredBarrier.state, "woken");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 19. Startup with no authoritative downstream evidence remains indeterminate, not armed
+// ---------------------------------------------------------------------------
+test("WAKE-V3: startup with no authoritative downstream evidence remains indeterminate, not armed", async () => {
+  const { tmp, config, store: store1 } = await createTestEnv();
+  const dbPath = path.join(tmp, "bridge.sqlite");
+  let store2: BridgeStore | null = null;
+  let service2: BridgeService | null = null;
+
+  try {
+    const agent = setupAgent(store1, tmp, "agent_unproven_recov");
+    const job = store1.createJob({ id: "job_upr1", agentId: agent.id, kind: "spawn", requestId: "rupr1", promptHash: "hupr1" });
+    store1.bindJob({ jobId: job.id, threadId: "thread_upr", originatingTurnId: "tupr", originatingItemId: "iupr" });
+
+    // Barrier was claimed and left in 'waking' state before restart
+    store1.createOrUpdateParkBarrier({
+      id: "park_upr_1",
+      threadId: "thread_upr",
+      turnId: "tupr",
+      generation: 1,
+      armed: false,
+      deliveryMode: "cli_resume",
+      state: "waking",
+    });
+    store1.setParkJobs("park_upr_1", [job.id]);
+
+    const marker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=park_upr_1:gen=1] -->`;
+    const wakeEnv: WakeEnvelope = {
+      parkId: "park_upr_1",
+      generation: 1,
+      reason: "subagents park wake",
+      jobIds: [job.id],
+      readyJobIds: [job.id],
+      statuses: { [job.id]: "completed" },
+      resultHashes: {},
+      pendingCount: 0,
+      instruction: "Call subagents_follow",
+      marker,
+    };
+
+    // Outbox was in 'waking' status before restart (in-flight dispatch interrupted by process termination)
+    store1.createWakeOutbox({
+      id: "wake_upr_1",
+      parkId: "park_upr_1",
+      generation: 1,
+      threadId: "thread_upr",
+      deliveryMode: "cli_resume",
+      status: "waking",
+      wakeState: "waiting",
+      wakeMarker: marker,
+      payloadJson: JSON.stringify(wakeEnv),
+      attempts: 1,
+    });
+
+    const r1 = path.join(tmp, "rupr1.json");
+    await writeFile(r1, JSON.stringify({ envelope: { summary: "upr done" } }));
+    makeJobCompleted(store1, job.id, r1, "upr done");
+
+    store1.close();
+
+    // Restart: fresh store and service pointing to existing DB
+    store2 = new BridgeStore(dbPath);
+    const fakeCodex2 = new FakeCodexDelivery();
+    const fakeCli2 = new FakeCliTransport();
+
+    // Downstream checks initially unproven (not found in queue DB or transcript)
+    fakeCli2.queuedWakeHandler = async () => ({ found: false });
+    fakeCodex2.reconcileSendResult = false;
+
+    service2 = createTestService(config, store2, fakeCodex2, fakeCli2);
+    await service2.start();
+
+    // Startup with no authoritative downstream evidence remains indeterminate, not armed
+    const recoveredBarrier = store2.getParkBarrier("park_upr_1")!;
+    assert.equal(recoveredBarrier.state, "waking", "Startup with no downstream evidence must remain indeterminate in waking, not armed");
+    assert.equal(recoveredBarrier.armed, false, "Recovered barrier armed flag must remain false");
+
+    // Waking outbox remains fail-closed in waking/indeterminate and is never blindly retried
+    const recoveredOutbox = store2.getWakeOutboxById("wake_upr_1")!;
+    assert.equal(recoveredOutbox.status, "waking", "Unproven waking outbox must remain in waking/indeterminate status");
+    assert.notEqual(recoveredOutbox.status, "delivered", "Unproven outbox must not be marked delivered without downstream evidence");
+    assert.notEqual(recoveredOutbox.status, "pending", "Unproven outbox must not be reset to pending for blind retry");
+    assert.notEqual(recoveredOutbox.status, "deferred_active_writer", "Unproven outbox must not become deferred without activeWriter proof");
+
+    // Verify no duplicate wake outbox materialization occurs even after re-evaluation
+    await service2.evaluateParkWakes(job.id);
+    const outboxRows = store2.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ?").all("park_upr_1");
+    assert.equal(outboxRows.length, 1, "No duplicate wake outbox materialization occurs");
+
+    // Verify no premature or duplicate transport calls while unproven
+    assert.equal(fakeCli2.calls.length, 0, "No duplicate transport calls during unproven recovery");
+  } finally {
+    await service2?.stop();
+    store2?.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 20. Confirmed queue/transcript evidence reconciles to delivered/woken exactly once without another CLI call or duplicate outbox
+// ---------------------------------------------------------------------------
+test("WAKE-V3: confirmed queue/transcript evidence reconciles to delivered/woken exactly once without another CLI call or duplicate outbox", async () => {
+  const { tmp, config, store: store1 } = await createTestEnv();
+  const dbPath = path.join(tmp, "bridge.sqlite");
+  let store2: BridgeStore | null = null;
+  let service2: BridgeService | null = null;
+
+  try {
+    const agent = setupAgent(store1, tmp, "agent_term_confirm");
+    const job = store1.createJob({ id: "job_term1", agentId: agent.id, kind: "spawn", requestId: "rterm1", promptHash: "hterm1" });
+    store1.bindJob({ jobId: job.id, threadId: "thread_term", originatingTurnId: "tterm", originatingItemId: "iterm" });
+
+    store1.createOrUpdateParkBarrier({
+      id: "park_term_1",
+      threadId: "thread_term",
+      turnId: "tterm",
+      generation: 1,
+      armed: false,
+      deliveryMode: "cli_resume",
+      state: "waking",
+    });
+    store1.setParkJobs("park_term_1", [job.id]);
+
+    const marker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=park_term_1:gen=1] -->`;
+    const wakeEnv: WakeEnvelope = {
+      parkId: "park_term_1",
+      generation: 1,
+      reason: "subagents park wake",
+      jobIds: [job.id],
+      readyJobIds: [job.id],
+      statuses: { [job.id]: "completed" },
+      resultHashes: {},
+      pendingCount: 0,
+      instruction: "Call subagents_follow",
+      marker,
+    };
+
+    store1.createWakeOutbox({
+      id: "wake_term_1",
+      parkId: "park_term_1",
+      generation: 1,
+      threadId: "thread_term",
+      deliveryMode: "cli_resume",
+      status: "waking",
+      wakeState: "waiting",
+      wakeMarker: marker,
+      payloadJson: JSON.stringify(wakeEnv),
+      attempts: 1,
+    });
+
+    const r1 = path.join(tmp, "rterm1.json");
+    await writeFile(r1, JSON.stringify({ envelope: { summary: "term done" } }));
+    makeJobCompleted(store1, job.id, r1, "term done");
+
+    store1.close();
+
+    store2 = new BridgeStore(dbPath);
+    const fakeCodex2 = new FakeCodexDelivery();
+    const fakeCli2 = new FakeCliTransport();
+
+    // Downstream evidence initially unproven during service start
+    fakeCli2.queuedWakeHandler = async () => ({ found: false });
+    fakeCodex2.reconcileSendResult = false;
+
+    service2 = createTestService(config, store2, fakeCodex2, fakeCli2);
+    await service2.start();
+
+    // Now downstream queue evidence confirms delivery (e.g. Codex queue DB records accepted wake)
+    const confirmedMessageId = "msg_downstream_confirmed_888";
+    fakeCli2.queuedWakeHandler = async (threadId: string, m: string) => {
+      if (threadId === "thread_term" && m === marker) {
+        return {
+          found: true,
+          messageId: confirmedMessageId,
+          deliveryMode: "queued",
+        };
+      }
+      return { found: false };
+    };
+
+    // Recovery cycle encounters confirmed downstream queue evidence
+    await (service2 as any).recoverWakeOutbox();
+
+    // 1. Delivery transitions to delivered with confirmed messageId and deliveryMode
+    const outbox = store2.getWakeOutboxById("wake_term_1")!;
+    assert.equal(outbox.status, "delivered", "Outbox must transition to delivered when downstream evidence confirms");
+    assert.equal(outbox.deliveryMode, "queued", "Delivery mode must reflect confirmed queued delivery");
+    assert.equal(outbox.messageId, confirmedMessageId, "Message ID must match confirmed downstream message ID");
+
+    // 2. Barrier transitions to woken
+    const barrier = store2.getParkBarrier("park_term_1")!;
+    assert.equal(barrier.state, "woken", "Barrier must transition to woken when downstream evidence confirms");
+    assert.equal(barrier.armed, false, "Barrier armed must be false once woken");
+
+    // 3. Exactly once: zero transport delivery invocations (confirmed from downstream)
+    assert.equal(fakeCli2.calls.length, 0, "No new transport deliverWake call when confirmed downstream");
+
+    // 4. Terminal immutability: subsequent evaluateParkWakes, recovery, or status update attempts cannot mutate or re-deliver
+    await service2.evaluateParkWakes(job.id);
+    await (service2 as any).recoverWakeOutbox();
+
+    assert.equal(fakeCli2.calls.length, 0, "Terminal delivery must never re-invoke transport deliverWake");
+    const outboxRows = store2.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ?").all("park_term_1");
+    assert.equal(outboxRows.length, 1, "Exactly one outbox record must exist");
+
+    const terminalOutbox = store2.getWakeOutboxById("wake_term_1")!;
+    assert.equal(terminalOutbox.status, "delivered", "Delivered status is immutable and terminal");
+    assert.equal(terminalOutbox.attempts, outbox.attempts, "Attempts must not change after terminal confirmation");
+
+    // 5. Also verify transcript evidence reconciliation path
+    const jTrans = store2.createJob({ id: "job_trans_rec", agentId: agent.id, kind: "spawn", requestId: "rtr", promptHash: "htr" });
+    store2.bindJob({ jobId: jTrans.id, threadId: "thread_trans", originatingTurnId: "ttr", originatingItemId: "itr" });
+    store2.createOrUpdateParkBarrier({
+      id: "park_trans_1",
+      threadId: "thread_trans",
+      turnId: "ttr",
+      generation: 1,
+      armed: false,
+      deliveryMode: "cli_resume",
+      state: "waking",
+    });
+    store2.setParkJobs("park_trans_1", [jTrans.id]);
+
+    const transMarker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=park_trans_1:gen=1] -->`;
+    store2.createWakeOutbox({
+      id: "wake_trans_1",
+      parkId: "park_trans_1",
+      generation: 1,
+      threadId: "thread_trans",
+      deliveryMode: "cli_resume",
+      status: "waking",
+      wakeState: "waiting",
+      wakeMarker: transMarker,
+      payloadJson: JSON.stringify({ ...wakeEnv, parkId: "park_trans_1", marker: transMarker }),
+      attempts: 1,
+    });
+
+    // Transcript evidence confirms (queue check does not match)
+    fakeCodex2.reconcileSendResult = true;
+    await (service2 as any).recoverWakeOutbox();
+
+    const transOutbox = store2.getWakeOutboxById("wake_trans_1")!;
+    assert.equal(transOutbox.status, "delivered", "Transcript reconciliation must transition waking outbox to delivered");
+    const transBarrier = store2.getParkBarrier("park_trans_1")!;
+    assert.equal(transBarrier.state, "woken", "Transcript reconciliation must transition barrier to woken");
+    assert.equal(transBarrier.armed, false);
+    assert.equal(fakeCli2.calls.length, 0, "No CLI calls during transcript reconciliation");
+  } finally {
+    await service2?.stop();
+    store2?.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

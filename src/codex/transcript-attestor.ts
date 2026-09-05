@@ -32,8 +32,10 @@ export const DEFAULT_ACCEPTED_SERVERS = ["subagents", "deepseek-subagent", "deep
 export const DEFAULT_ACCEPTED_TOOLS = [
   "subagents_spawn",
   "subagents_continue",
+  "subagents_spawn_batch",
   "deepseek_spawn",
   "deepseek_continue",
+  "deepseek_spawn_batch",
 ];
 
 export function isValidPath(val: unknown): val is string {
@@ -261,8 +263,14 @@ export class TranscriptAttestor {
           (typeof metaTech?.jobId === "string" && metaTech.jobId) ||
           null;
 
-        if (reportedJobId !== jobId) continue;
-        const isAccepted = structured?.accepted === true || metaTech?.accepted === true;
+        const items = (Array.isArray(structured?.items) ? structured.items : Array.isArray(metaTech?.items) ? metaTech.items : null) as Array<Record<string, unknown>> | null;
+        const matchingItem = items?.find((it) => (it && typeof it === "object" && ((it as any).jobId === jobId || (it as any).job_id === jobId)));
+        const hasJobInJobIds = (Array.isArray(structured?.jobIds) && structured.jobIds.includes(jobId)) ||
+          (Array.isArray(structured?.job_ids) && structured.job_ids.includes(jobId)) ||
+          (Array.isArray(metaTech?.jobIds) && metaTech.jobIds.includes(jobId));
+
+        if (reportedJobId !== jobId && !matchingItem && !hasJobInJobIds) continue;
+        const isAccepted = structured?.accepted === true || metaTech?.accepted === true || (matchingItem as any)?.accepted === true;
         if (!isAccepted) continue;
 
         // Check staleness if job creation time is provided (e.g. events older than 24 hours)

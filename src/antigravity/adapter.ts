@@ -1,6 +1,6 @@
 import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH, AGY_MODEL, buildAgyArgs } from "./args.js";
 import { parseAgyOutput } from "./parser.js";
-import { AntigravityProcessError, runAgy, AGY_DEFAULT_TIMEOUT_MS, type SpawnLike } from "./runner.js";
+import { AntigravityProcessError, runAgy, type SpawnLike } from "./runner.js";
 import { InvalidRequestError } from "../errors.js";
 import { redactSecrets, truncate } from "../security.js";
 import { AntigravitySupervisor } from "./supervisor.js";
@@ -15,7 +15,7 @@ import type {
 export interface AntigravityAdapterOptions {
   command?: string | undefined;
   model?: string | undefined;
-  timeoutMs?: number | undefined;
+  timeoutMs?: number | null | undefined;
   sandbox?: boolean | undefined;
   addDirs?: string[] | undefined;
   dangerouslySkipPermissions?: boolean | undefined;
@@ -29,7 +29,7 @@ export interface AntigravityRunOptions {
   cwd: string;
   model?: string | undefined;
   signal?: AbortSignal | undefined;
-  timeoutMs?: number | undefined;
+  timeoutMs?: number | null | undefined;
   fence?: number | undefined;
   attemptManifest?: AntigravityAttemptManifest | undefined;
   dataDir?: string | undefined;
@@ -42,7 +42,7 @@ export interface AntigravityRunOptions {
 export interface AntigravityProviderLike {
   runPrompt(options: AntigravityRunOptions): Promise<AntigravityRunResult>;
   runAttempt?(manifest: AntigravityAttemptManifest, signal?: AbortSignal, onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>): Promise<AntigravityRunResult>;
-  extendTimeout?(jobIdOrAttemptId: string, timeoutMs: number): boolean;
+  extendTimeout?(jobIdOrAttemptId: string, timeoutMs: number | null): boolean;
 }
 
 /**
@@ -63,7 +63,7 @@ export interface AntigravityProviderLike {
 export class AntigravityAdapter implements AntigravityProviderLike {
   readonly command: string;
   readonly model: string;
-  readonly timeoutMs: number;
+  readonly timeoutMs: number | null;
   readonly sandbox: boolean;
   readonly addDirs: string[];
   readonly dangerouslySkipPermissions: boolean;
@@ -75,7 +75,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
   constructor(options: AntigravityAdapterOptions = {}) {
     this.command = options.command ?? AGY_COMMAND;
     this.model = options.model ?? AGY_MODEL;
-    this.timeoutMs = options.timeoutMs ?? AGY_DEFAULT_TIMEOUT_MS;
+    this.timeoutMs = typeof options.timeoutMs === "number" && options.timeoutMs > 0 ? options.timeoutMs : null;
     this.sandbox = options.sandbox === true;
     this.addDirs = [...new Set(options.addDirs ?? [])];
     this.dangerouslySkipPermissions = options.dangerouslySkipPermissions === true;
@@ -84,7 +84,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     this.dataDir = options.dataDir;
   }
 
-  extendTimeout(jobIdOrAttemptId: string, timeoutMs: number): boolean {
+  extendTimeout(jobIdOrAttemptId: string, timeoutMs: number | null): boolean {
     const supervisor = this.activeSupervisors.get(jobIdOrAttemptId);
     if (supervisor) {
       supervisor.extendTimeout(timeoutMs);
@@ -122,7 +122,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       throw new AntigravityProcessError("aborted", manifest.command, status.error || "agy run was cancelled");
     }
     if (status.status === "timed_out") {
-      throw new AntigravityProcessError("timeout", manifest.command, status.error || (manifest.command + " did not finish within " + manifest.timeoutMs + "ms"));
+      throw new AntigravityProcessError("timeout", manifest.command, status.error || (manifest.command + " did not finish within " + (manifest.timeoutMs ?? 0) + "ms"));
     }
     if (status.status === "failed") {
       if (status.exitCode !== null && status.exitCode !== 0) {
@@ -173,7 +173,9 @@ export class AntigravityAdapter implements AntigravityProviderLike {
         modelVariant: null,
         modelRoute: "antigravity-flash-high",
         command: this.command,
-        timeoutMs: options.timeoutMs ?? this.timeoutMs,
+        timeoutMs: options.timeoutMs !== undefined
+          ? (typeof options.timeoutMs === "number" && options.timeoutMs > 0 ? options.timeoutMs : null)
+          : this.timeoutMs,
         fence: options.fence,
         sandbox: this.sandbox,
         addDirs: this.addDirs,
@@ -183,7 +185,9 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     }
 
     const model = options.model ?? this.model;
-    const effectiveTimeoutMs = options.timeoutMs ?? this.timeoutMs;
+    const effectiveTimeoutMs = options.timeoutMs !== undefined
+      ? (typeof options.timeoutMs === "number" && options.timeoutMs > 0 ? options.timeoutMs : null)
+      : this.timeoutMs;
     const args = buildAgyArgs(options.prompt, {
       model,
       timeoutMs: effectiveTimeoutMs,

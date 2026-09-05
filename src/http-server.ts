@@ -4,7 +4,7 @@ import { Agent, fetch, type Dispatcher } from "undici";
 import { isLoopbackHost, newId, redactSecrets, truncate } from "./security.js";
 import { BridgeError, InvalidRequestError } from "./errors.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
-import type { AgentMode, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkPredicateType, ParkReceipt, SpawnInput, WorkspaceStrategy } from "./types.js";
+import type { AcceptedBatchOperation, AgentMode, BatchItemInput, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkPredicateType, ParkReceipt, SpawnBatchInput, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
 
 // The follow endpoint holds the HTTP response open until the worker finishes.
@@ -84,6 +84,9 @@ export class BridgeHttpServer {
         displayName: "DeepSeek Sub-Agent",
         state,
         ready,
+        capabilities: {
+          batch_scheduler: true,
+        },
         status: status ?? { running: true, state, ready },
         ...(status?.error ? { error: status.error } : {}),
       });
@@ -127,6 +130,11 @@ export class BridgeHttpServer {
     }) : null;
     if (method === "POST" && url.pathname === "/v1/jobs/spawn") {
       const result = await this.service.spawn(toSpawnInput(body));
+      writeJson(response, 202, result);
+      return;
+    }
+    if (method === "POST" && url.pathname === "/v1/jobs/spawn-batch") {
+      const result = await this.service.spawnBatch(toSpawnBatchInput(body));
       writeJson(response, 202, result);
       return;
     }
@@ -281,6 +289,10 @@ export class BridgeHttpClient {
     return this.call<ParkReceipt>("/v1/jobs/park", { ...input, is_alias: isAlias }, signal);
   }
 
+  async spawnBatch(input: SpawnBatchInput): Promise<AcceptedBatchOperation> {
+    return this.call<AcceptedBatchOperation>("/v1/jobs/spawn-batch", input);
+  }
+
   async close(): Promise<void> {
     await this.dispatcher.destroy();
   }
@@ -326,10 +338,22 @@ function writeError(response: ServerResponse, error: unknown): void {
       body.retry = false;
       body.jobId = error.jobId;
     }
-    if (error.status === 503) {
+    if (error.status === 503 || (error.status as any) === 429) {
       body.retry = true;
     }
     writeJson(response, error.status, body);
+    return;
+  }
+  const status = typeof error === "object" && error !== null && ("status" in error || "statusCode" in error)
+    ? Number((error as any).status ?? (error as any).statusCode)
+    : undefined;
+  if (status === 429 || status === 503) {
+    writeJson(response, status, {
+      error: redactSecrets(error instanceof Error ? error.message : String(error)),
+      code: status === 429 ? "rate_limited" : "service_unavailable",
+      status,
+      retry: true,
+    });
     return;
   }
   writeJson(response, 500, { error: redactSecrets(String(error)), code: "internal", status: 500 });
@@ -385,6 +409,7 @@ function defaultCodeForStatus(status: number): string {
   if (status === 401) return "unauthorized";
   if (status === 404) return "not_found";
   if (status === 409) return "conflict";
+  if (status === 429) return "rate_limited";
   if (status === 503) return "service_unavailable";
   return "internal";
 }
@@ -451,6 +476,8 @@ function toSpawnInput(body: unknown): SpawnInput {
   const modelRoute = optionalString(value.modelRoute ?? value.model_route);
   const mcpSessionId = optionalString(value.mcpSessionId ?? value.mcp_session_id);
   const trustedThreadId = optionalString(value.trustedThreadId ?? value.trusted_thread_id);
+  const priority = typeof value.priority === "number" ? value.priority : undefined;
+  const exclusiveResources = optionalArray(value.exclusiveResources ?? value.exclusive_resources);
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     topic: requiredString(value.topic, "topic"),
@@ -465,6 +492,56 @@ function toSpawnInput(body: unknown): SpawnInput {
     ...(modelRoute ? { modelRoute } : {}),
     ...(mcpSessionId ? { mcpSessionId } : {}),
     ...(trustedThreadId ? { trustedThreadId } : {}),
+    ...(priority !== undefined ? { priority } : {}),
+    ...(exclusiveResources ? { exclusiveResources } : {}),
+  };
+}
+
+function toSpawnBatchInput(body: unknown): SpawnBatchInput {
+  const value = asRecord(body);
+  const batchRequestId = optionalString(value.batchRequestId ?? value.batch_request_id);
+  const rawItems = value.items;
+  if (!Array.isArray(rawItems)) throw new InvalidRequestError("items must be an array");
+  const items = rawItems.map((itemRaw) => {
+    const item = asRecord(itemRaw);
+    const cwd = optionalString(item.cwd);
+    const mode = item.mode === undefined ? undefined : enumValue(item.mode, ["analyze", "edit", "test"], "mode") as AgentMode;
+    const workspaceStrategyValue = item.workspaceStrategy ?? item.workspace_strategy;
+    const workspaceStrategy = workspaceStrategyValue === undefined
+      ? undefined
+      : enumValue(workspaceStrategyValue, ["shared", "worktree"], "workspaceStrategy") as WorkspaceStrategy;
+    const contextFiles = optionalArray(item.contextFiles ?? item.context_files);
+    const priority = typeof item.priority === "number" ? item.priority : undefined;
+    const exclusiveResources = optionalArray(item.exclusiveResources ?? item.exclusive_resources);
+    const mcpSessionId = optionalString(item.mcpSessionId ?? item.mcp_session_id);
+    const trustedThreadId = optionalString(item.trustedThreadId ?? item.trusted_thread_id);
+    const threadId = optionalString(item.threadId ?? item.thread_id);
+    const turnId = optionalString(item.turnId ?? item.turn_id);
+    const requestId = optionalString(item.requestId ?? item.request_id);
+    const topic = optionalString(item.topic);
+    const visualContext = optionalString(item.visualContext ?? item.visual_context);
+    const modelRoute = optionalString(item.modelRoute ?? item.model_route);
+    return {
+      task: requiredString(item.task, "task"),
+      ...(requestId ? { requestId } : {}),
+      ...(topic ? { topic } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(mode ? { mode } : {}),
+      ...(workspaceStrategy ? { workspaceStrategy } : {}),
+      ...(contextFiles ? { contextFiles } : {}),
+      ...(priority !== undefined ? { priority } : {}),
+      ...(exclusiveResources ? { exclusiveResources } : {}),
+      ...(mcpSessionId ? { mcpSessionId } : {}),
+      ...(trustedThreadId ? { trustedThreadId } : {}),
+      ...(threadId ? { threadId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(visualContext ? { visualContext } : {}),
+      ...(modelRoute ? { modelRoute } : {}),
+    };
+  });
+  return {
+    ...(batchRequestId ? { batchRequestId } : {}),
+    items,
   };
 }
 

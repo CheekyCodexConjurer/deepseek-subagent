@@ -288,8 +288,48 @@ export function createMcpServer(
     workspace_strategy: z.enum(["shared", "worktree"]).optional(),
     context_files: z.array(z.string()).optional(),
     visual_context: z.string().optional(),
+    priority: z.number().int().min(1).max(100).optional(),
+    exclusive_resources: z.array(z.string().min(1)).optional(),
     thread_id: z.string().optional(),
     turn_id: z.string().optional(),
+  };
+
+  const spawnBatchItemSchema = z.object({
+    request_id: z.string().min(1).optional(),
+    topic: z.string().min(1).max(240).optional(),
+    task: z.string().min(1),
+    cwd: z.string().optional(),
+    mode: z.enum(["analyze", "edit", "test"]).optional(),
+    workspace_strategy: z.enum(["shared", "worktree"]).optional(),
+    context_files: z.array(z.string()).optional(),
+    visual_context: z.string().optional(),
+    priority: z.number().int().min(1).max(100).optional(),
+    exclusive_resources: z.array(z.string().min(1)).optional(),
+    thread_id: z.string().optional(),
+    turn_id: z.string().optional(),
+  });
+
+  const spawnBatchInputSchema = {
+    batch_request_id: z.string().min(1).optional(),
+    items: z.array(spawnBatchItemSchema).min(1),
+  };
+
+  const batchItemReceiptSchema = z.object({
+    jobId: z.string(),
+    agentId: z.string(),
+    requestId: z.string().optional(),
+    status: z.string(),
+  });
+
+  const spawnBatchOutputSchema = {
+    accepted: z.boolean(),
+    batchId: z.string(),
+    batchRequestId: z.string(),
+    items: z.array(batchItemReceiptSchema),
+    jobIds: z.array(z.string()),
+    obligationState: z.literal("pending"),
+    nextRequiredAction: z.string(),
+    capabilities: z.record(z.string(), z.boolean()).optional(),
   };
 
   const continueInputSchema = {
@@ -467,6 +507,8 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("subagents_follow"),
+      priority: z.number().optional(),
+      exclusiveResources: z.array(z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -479,6 +521,34 @@ export function createMcpServer(
       };
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload, extra?.signal);
       return acceptedResult(result, false);
+    } catch (error) {
+      if (extra?.signal?.aborted) throw error;
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("subagents_spawn_batch", {
+    title: DISPLAY_NAME + " · Spawn Batch",
+    description: "Start a batch of asynchronous tasks with atomic admission into the swarm queue. Returns immediately after acceptance; do not poll. Accepted is not a result: acceptance creates pending obligations — consume the jobs with subagents_follow before a dependent gate or a final response, or use subagents_park to wait across the batch. Items specify stable request_id, bounded priority (1-100), and generic exclusive_resources. The bridge pins the active model route at admission; no provider fallback.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: spawnBatchInputSchema,
+    outputSchema: spawnBatchOutputSchema,
+  }, async (args, extra) => {
+    try {
+      for (const item of args.items) {
+        validateCallerThread(item.thread_id);
+      }
+      const payload = {
+        batch_request_id: args.batch_request_id ?? newId("batch_req"),
+        items: args.items.map((item) => ({
+          ...item,
+          ...(item.request_id ? { request_id: item.request_id } : {}),
+          mcp_session_id: mcpProcessSessionId,
+          ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
+        })),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn-batch", payload, extra?.signal);
+      return acceptedBatchResult(result, false);
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
       return errorResult(error);
@@ -528,7 +598,10 @@ export function createMcpServer(
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Observable SubAgents MCP status snapshot returned." }],
-        structuredContent: result,
+        structuredContent: {
+          ...result,
+          capabilities: { batch_scheduler: true },
+        },
       };
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
@@ -736,6 +809,8 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("deepseek_follow"),
+      priority: z.number().optional(),
+      exclusiveResources: z.array(z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -748,6 +823,34 @@ export function createMcpServer(
       };
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn", payload, extra?.signal);
       return acceptedResult(result, true);
+    } catch (error) {
+      if (extra?.signal?.aborted) throw error;
+      return errorResult(error);
+    }
+  });
+
+  server.registerTool("deepseek_spawn_batch", {
+    title: LEGACY_DISPLAY_NAME + " · Spawn Batch",
+    description: "Start a batch of asynchronous DeepSeek tasks with atomic admission into the swarm queue. Returns immediately after acceptance; do not poll. Accepted is not a result: acceptance creates pending obligations — consume the jobs with deepseek_follow before a dependent gate or a final response, or use deepseek_park to wait across the batch. Items specify stable request_id, bounded priority (1-100), and generic exclusive_resources.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    inputSchema: spawnBatchInputSchema,
+    outputSchema: spawnBatchOutputSchema,
+  }, async (args, extra) => {
+    try {
+      for (const item of args.items) {
+        validateCallerThread(item.thread_id);
+      }
+      const payload = {
+        batch_request_id: args.batch_request_id ?? newId("batch_req"),
+        items: args.items.map((item) => ({
+          ...item,
+          ...(item.request_id ? { request_id: item.request_id } : {}),
+          mcp_session_id: mcpProcessSessionId,
+          ...(trustedThreadId ? { trusted_thread_id: trustedThreadId } : {}),
+        })),
+      };
+      const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/spawn-batch", payload, extra?.signal);
+      return acceptedBatchResult(result, true);
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
       return errorResult(error);
@@ -797,7 +900,10 @@ export function createMcpServer(
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/consult", args, extra?.signal);
       return {
         content: [{ type: "text", text: "Observable DeepSeek progress snapshot returned." }],
-        structuredContent: result,
+        structuredContent: {
+          ...result,
+          capabilities: { batch_scheduler: true },
+        },
       };
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
@@ -947,6 +1053,53 @@ export function createMcpServer(
   return server;
 }
 
+function acceptedBatchResult(result: Record<string, unknown>, isAlias = false): {
+  content: [{ type: "text"; text: string }];
+  structuredContent: {
+    accepted: true;
+    batchId: string;
+    batchRequestId: string;
+    items: unknown;
+    jobIds: string[];
+    obligationState: "pending";
+    nextRequiredAction: "deepseek_follow" | "subagents_follow";
+    capabilities?: Record<string, boolean>;
+  };
+  _meta: Record<string, unknown>;
+} {
+  const batchId = String(result.batchId ?? "");
+  const batchRequestId = String(result.batchRequestId ?? "");
+  const rawItems = (result.items as Array<Record<string, unknown>>) ?? [];
+  const nextRequiredAction = isAlias ? "deepseek_follow" : "subagents_follow";
+  const displayName = isAlias ? LEGACY_DISPLAY_NAME : DISPLAY_NAME;
+  const jobIds = rawItems.map((it) => String(it.jobId ?? ""));
+  const text = isAlias
+    ? `DeepSeek Sub-Agent accepted batch ${batchId} (${rawItems.length} items). Jobs: ${jobIds.join(", ")}. Pending obligations created. Follow each job or park across the batch before dependent gates.`
+    : `${DISPLAY_NAME} accepted batch ${batchId} (${rawItems.length} items). Jobs: ${jobIds.join(", ")}. Pending obligations created. Follow each job or park across the batch before dependent gates.`;
+
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: {
+      accepted: true,
+      batchId,
+      batchRequestId,
+      items: rawItems,
+      jobIds,
+      obligationState: "pending",
+      nextRequiredAction,
+      capabilities: { batch_scheduler: true },
+    },
+    _meta: {
+      technical: {
+        batchId,
+        batchRequestId,
+        items: rawItems,
+        jobIds,
+      },
+    },
+  };
+}
+
 function acceptedResult(result: Record<string, unknown>, isAlias = false): {
   content: [{ type: "text"; text: string }];
   structuredContent: {
@@ -994,6 +1147,8 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
       state: "Starting",
       obligationState: "pending",
       nextRequiredAction,
+      ...(result.priority !== undefined ? { priority: result.priority } : {}),
+      ...(result.exclusiveResources !== undefined ? { exclusiveResources: result.exclusiveResources } : {}),
     },
     _meta: {
       technical: {
@@ -1002,6 +1157,8 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
         state: "Starting",
         provider: result.modelProviderId ?? "deepseek",
         model: modelDisplayName,
+        ...(result.priority !== undefined ? { priority: result.priority } : {}),
+        ...(result.exclusiveResources !== undefined ? { exclusiveResources: result.exclusiveResources } : {}),
       },
     },
   };

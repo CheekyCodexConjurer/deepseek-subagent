@@ -1,11 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { AGY_MAX_PROMPT_LENGTH, buildAgyArgs, formatPrintTimeout } from "../../src/antigravity/args.js";
+import { AGY_MAX_PROMPT_LENGTH, AGY_PRINT_TIMEOUT_UNLIMITED, buildAgyArgs, formatPrintTimeout } from "../../src/antigravity/args.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { extractAgyJson, parseAgyOutput, parseAgyStatus } from "../../src/antigravity/parser.js";
 import { AntigravityProcessError, runAgy } from "../../src/antigravity/runner.js";
+import { AntigravitySpool } from "../../src/antigravity/spool.js";
+import { AntigravitySupervisor } from "../../src/antigravity/supervisor.js";
+import type { AntigravityAttemptManifest } from "../../src/antigravity/types.js";
+import { writePrivateFile } from "../../src/security.js";
 import { InvalidRequestError } from "../../src/errors.js";
 
 const fixturePath = fileURLToPath(new URL("../fixtures/agy.cjs", import.meta.url));
@@ -24,14 +31,14 @@ function fixtureSpawn(behavior: string, calls: string[] = []) {
   };
 }
 
-test("buildAgyArgs matches the smoke-observed contract with the prompt last", () => {
+test("buildAgyArgs matches the smoke-observed contract with sentinel 2562047h47m16s by default", () => {
   assert.deepEqual(buildAgyArgs("do the thing", {}), [
     "--model",
     "gemini-3.8-flash-high",
     "-p",
     "do the thing",
     "--print-timeout",
-    "15m",
+    AGY_PRINT_TIMEOUT_UNLIMITED,
   ]);
 });
 
@@ -46,7 +53,7 @@ test("buildAgyArgs honors model and print-timeout overrides", () => {
   ]);
 });
 
-test("buildAgyArgs adds the lab-only sandbox permission flags before the prompt", () => {
+test("buildAgyArgs adds the lab-only sandbox permission flags before the prompt with sentinel print-timeout", () => {
   assert.deepEqual(buildAgyArgs("x", {
     sandbox: true,
     addDirs: ["C:\\lab\\external-a", "C:\\lab\\external-b"],
@@ -63,7 +70,7 @@ test("buildAgyArgs adds the lab-only sandbox permission flags before the prompt"
     "-p",
     "x",
     "--print-timeout",
-    "15m",
+    AGY_PRINT_TIMEOUT_UNLIMITED,
   ]);
 });
 
@@ -464,4 +471,401 @@ test("AntigravityAdapter fails closed on prompt exceeding safe command line leng
     },
   );
   assert.equal(calls.length, 0);
+});
+
+test("buildAgyArgs refutes omission and represents null/undefined timeout as sentinel 2562047h47m16s", () => {
+  const argsDefault = buildAgyArgs("task default", {});
+  assert.equal(argsDefault.includes("--print-timeout"), true);
+  assert.equal(argsDefault[argsDefault.indexOf("--print-timeout") + 1], AGY_PRINT_TIMEOUT_UNLIMITED);
+
+  const argsNull = buildAgyArgs("task null", { timeoutMs: null });
+  assert.equal(argsNull.includes("--print-timeout"), true);
+  assert.equal(argsNull[argsNull.indexOf("--print-timeout") + 1], AGY_PRINT_TIMEOUT_UNLIMITED);
+
+  const argsUndefined = buildAgyArgs("task undefined", { timeoutMs: undefined });
+  assert.equal(argsUndefined.includes("--print-timeout"), true);
+  assert.equal(argsUndefined[argsUndefined.indexOf("--print-timeout") + 1], AGY_PRINT_TIMEOUT_UNLIMITED);
+
+  const argsPositive = buildAgyArgs("task positive", { timeoutMs: 120_000 });
+  assert.equal(argsPositive.includes("--print-timeout"), true);
+  assert.equal(argsPositive[argsPositive.indexOf("--print-timeout") + 1], "2m");
+});
+
+test("runAgy in unlimited mode stays alive beyond short deadline until explicit abort", async () => {
+  const controller = new AbortController();
+  const spawnedPids: number[] = [];
+  const start = Date.now();
+
+  const runPromise = runAgy(fixtureArgs, {
+    command: "node",
+    cwd: process.cwd(),
+    // No timeoutMs specified (unlimited mode default)
+    signal: controller.signal,
+    spawnFn: fixtureSpawn("hang"),
+  });
+
+  // Wait 150ms — which is beyond a typical short deadline (e.g. 50ms-100ms)
+  await new Promise((r) => setTimeout(r, 150));
+
+  // The runner must still be alive!
+  controller.abort();
+
+  await assert.rejects(
+    runPromise,
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "aborted");
+      return true;
+    },
+  );
+
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed >= 140, "Runner must have stayed alive until aborted, elapsed: " + elapsed + "ms");
+});
+
+test("runAgy preserves opt-in positive timeout", async () => {
+  await assert.rejects(
+    () => runAgy(fixtureArgs, {
+      command: "node",
+      cwd: process.cwd(),
+      timeoutMs: 80,
+      spawnFn: fixtureSpawn("hang"),
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "timeout");
+      assert.match(error.message, /80ms/);
+      return true;
+    },
+  );
+});
+
+test("AntigravitySupervisor runs unlimited by default and stays alive beyond short deadline until cancel signal", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-supervisor-unlimited-"));
+  try {
+    const spool = new AntigravitySpool(tempDir);
+    const attempt = await spool.createAttempt({
+      agentId: "agent_unlimited",
+      jobId: "job_unlimited",
+      requestId: "req_unlimited",
+      prompt: "Execute unlimited task",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      // Notice: timeoutMs omitted -> unlimited
+    });
+
+    assert.equal(attempt.timeoutMs, null, "Attempt manifest should represent unlimited as null");
+
+    const supervisor = new AntigravitySupervisor({
+      spoolDir: attempt.attemptDir,
+      manifest: attempt,
+      spawnFn: fixtureSpawn("hang"),
+    });
+
+    const runPromise = supervisor.run();
+
+    // Wait 150ms beyond a short deadline
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Cancel via spool signal file
+    await spool.writeCancelSignal(attempt.attemptId, "Explicit cancellation");
+
+    const status = await runPromise;
+    assert.equal(status.status, "aborted");
+    assert.match(status.error ?? "", /signal file|cancelled/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("AntigravitySupervisor preserves opt-in positive timeout", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-supervisor-optin-"));
+  try {
+    const spool = new AntigravitySpool(tempDir);
+    const attempt = await spool.createAttempt({
+      agentId: "agent_optin",
+      jobId: "job_optin",
+      requestId: "req_optin",
+      prompt: "Execute opt-in task",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      timeoutMs: 80,
+    });
+
+    assert.equal(attempt.timeoutMs, 80);
+
+    const supervisor = new AntigravitySupervisor({
+      spoolDir: attempt.attemptDir,
+      manifest: attempt,
+      spawnFn: fixtureSpawn("hang"),
+    });
+
+    const status = await supervisor.run();
+    assert.equal(status.status, "timed_out");
+    assert.match(status.error ?? "", /80ms.*terminated/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("AntigravitySpool accepts both old numeric timeout manifests and new unlimited null manifests", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-spool-migration-"));
+  try {
+    const spool = new AntigravitySpool(tempDir);
+
+    // 1. Create a new attempt without timeoutMs -> new manifest with timeoutMs: null
+    const newAttempt = await spool.createAttempt({
+      agentId: "agent_new",
+      jobId: "job_new",
+      requestId: "req_new",
+      prompt: "New attempt prompt",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
+    assert.equal(newAttempt.timeoutMs, null);
+
+    const readNew = await spool.readManifest(newAttempt.attemptDir);
+    assert.ok(readNew);
+    assert.equal(readNew.timeoutMs, null, "New manifest should have timeoutMs: null");
+    assert.equal(readNew.args.includes("--print-timeout"), true, "New args must include --print-timeout");
+    assert.equal(readNew.args[readNew.args.indexOf("--print-timeout") + 1], AGY_PRINT_TIMEOUT_UNLIMITED, "New args must use sentinel");
+
+    // 2. Simulate an old manifest on disk with numeric timeoutMs: 30000
+    const oldAttemptDir = path.join(tempDir, "spool", "antigravity", "job_old", "attempt_old");
+    const oldManifestContent = JSON.stringify({
+      schemaVersion: 1,
+      agentId: "agent_old",
+      jobId: "job_old",
+      requestId: "req_old",
+      attemptId: "attempt_old",
+      parentAttemptId: null,
+      promptHash: "hash_old",
+      promptPath: path.join(oldAttemptDir, "prompt.txt"),
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      command: "node",
+      args: ["--model", "gemini-3.8-flash-high", "-p", "old prompt", "--print-timeout", "30s"],
+      timeoutMs: 30000,
+      sandbox: false,
+      addDirs: [],
+      dangerouslySkipPermissions: false,
+      attemptDir: oldAttemptDir,
+      stdoutPath: path.join(oldAttemptDir, "stdout.log"),
+      stderrPath: path.join(oldAttemptDir, "stderr.log"),
+      statusPath: path.join(oldAttemptDir, "status.json"),
+      heartbeatPath: path.join(oldAttemptDir, "heartbeat.json"),
+      cancelPath: path.join(oldAttemptDir, "cancel.signal"),
+      createdAt: new Date().toISOString(),
+      maxOutputBytes: 1048576,
+      fence: 1,
+    }, null, 2);
+
+    await writePrivateFile(path.join(oldAttemptDir, "manifest.json"), oldManifestContent);
+
+    const readOld = await spool.readManifest(oldAttemptDir);
+    assert.ok(readOld);
+    assert.equal(readOld.timeoutMs, 30000, "Old manifest with numeric timeoutMs must be read successfully");
+    assert.equal(readOld.attemptId, "attempt_old");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("AntigravityAdapter runs unlimited by default through durable spool with no pending handles", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-adapter-unlimited-"));
+  try {
+    const adapter = new AntigravityAdapter({
+      command: "node",
+      dataDir: tempDir,
+      spawnFn: fixtureSpawn("ok"),
+    });
+
+    assert.equal(adapter.timeoutMs, null, "Adapter timeoutMs must be null (unlimited) by default");
+
+    const result = await adapter.runPrompt({
+      prompt: "End-to-end unlimited task",
+      cwd: tempDir,
+      dataDir: tempDir,
+      agentId: "agent_e2e",
+      jobId: "job_e2e",
+      requestId: "req_e2e",
+      // No timeoutMs -> unlimited
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(result.runId, "run_fixture_1");
+
+    const spool = new AntigravitySpool(tempDir);
+    const attempts = await spool.listAttempts("job_e2e");
+    assert.equal(attempts.length, 1);
+    const attempt = attempts[0]!;
+    assert.equal(attempt.timeoutMs, null, "Spool manifest must record timeoutMs as null");
+    assert.equal(attempt.args.includes("--print-timeout"), true, "Args must include --print-timeout");
+    assert.equal(attempt.args[attempt.args.indexOf("--print-timeout") + 1], AGY_PRINT_TIMEOUT_UNLIMITED, "Args must use sentinel");
+
+    const status = await spool.readStatus(attempt.attemptId, "job_e2e");
+    assert.ok(status);
+    assert.equal(status!.status, "completed");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("Heartbeat updates and lease reconciliation function normally during unlimited execution without clock kills", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-heartbeat-liveness-"));
+  try {
+    const spool = new AntigravitySpool(tempDir);
+    const attempt = await spool.createAttempt({
+      agentId: "agent_hb",
+      jobId: "job_hb",
+      requestId: "req_hb",
+      prompt: "Heartbeat check",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      fence: 42,
+    });
+
+    const heartbeats: number[] = [];
+    const supervisor = new AntigravitySupervisor({
+      spoolDir: attempt.attemptDir,
+      manifest: attempt,
+      heartbeatIntervalMs: 50,
+      spawnFn: fixtureSpawn("hang"),
+      onHeartbeat: (hb) => {
+        heartbeats.push(hb.updatedAt);
+      },
+    });
+
+    const runPromise = supervisor.run();
+
+    // Wait 160ms for multiple heartbeats to fire
+    await new Promise((r) => setTimeout(r, 160));
+
+    assert.ok(heartbeats.length >= 2, "Heartbeats must continue firing periodically without clock kill");
+
+    const activeHb = await spool.readHeartbeat(attempt.attemptId, "job_hb");
+    assert.ok(activeHb);
+    assert.equal(activeHb!.fence, 42);
+    assert.ok(spool.isHeartbeatLive(activeHb, 5000));
+
+    // Cancel cleanly
+    await spool.writeCancelSignal(attempt.attemptId, "Done testing heartbeat");
+    const status = await runPromise;
+    assert.equal(status.status, "aborted");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("authoritative binary contract refutes omitting --print-timeout with exit error", async () => {
+  const customArgs = ["--model", "gemini-3.8-flash-high", "-p", "task without print-timeout"];
+  await assert.rejects(
+    () => runAgy(customArgs, { command: "node", cwd: process.cwd(), spawnFn: fixtureSpawn("ok") }),
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "exit");
+      assert.equal(error.code, 2);
+      assert.match(error.message, /--print-timeout must not be omitted/);
+      return true;
+    },
+  );
+});
+
+test("authoritative binary smoke refutes --print-timeout 0s with immediate timeout error", async () => {
+  const zeroArgs = ["--model", "gemini-3.8-flash-high", "-p", "task zero", "--print-timeout", "0s"];
+  await assert.rejects(
+    () => runAgy(zeroArgs, { command: "node", cwd: process.cwd(), spawnFn: fixtureSpawn("ok") }),
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "exit");
+      assert.equal(error.code, 1);
+      assert.match(error.message, /timeout waiting for response/);
+      return true;
+    },
+  );
+
+  const zeroBareArgs = ["--model", "gemini-3.8-flash-high", "-p", "task zero bare", "--print-timeout", "0"];
+  await assert.rejects(
+    () => runAgy(zeroBareArgs, { command: "node", cwd: process.cwd(), spawnFn: fixtureSpawn("ok") }),
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "exit");
+      assert.equal(error.code, 1);
+      assert.match(error.message, /timeout waiting for response/);
+      return true;
+    },
+  );
+});
+
+test("authoritative binary smoke confirms --print-timeout 2562047h47m16s responds OK", async () => {
+  const sentinelArgs = ["--model", "gemini-3.8-flash-high", "-p", "sentinel task", "--print-timeout", AGY_PRINT_TIMEOUT_UNLIMITED];
+  const result = await runAgy(sentinelArgs, { command: "node", cwd: process.cwd(), spawnFn: fixtureSpawn("ok") });
+  assert.equal(result.code, 0);
+  const parsed = JSON.parse(result.stdout) as { status: string; summary: string };
+  assert.equal(parsed.status, "success");
+  assert.equal(parsed.summary, ENVELOPE.summary);
+});
+
+test("unlimited run leaves no lingering handles or timers in runner or supervisor", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-handles-"));
+  try {
+    // 1. Runner in unlimited mode
+    const runnerController = new AbortController();
+    const runnerResult = await runAgy(fixtureArgs, {
+      command: "node",
+      cwd: process.cwd(),
+      signal: runnerController.signal,
+      spawnFn: fixtureSpawn("ok"),
+    });
+    assert.equal(runnerResult.code, 0);
+
+    // 2. Supervisor in unlimited mode
+    const spool = new AntigravitySpool(tempDir);
+    const attempt = await spool.createAttempt({
+      agentId: "agent_handles",
+      jobId: "job_handles",
+      requestId: "req_handles",
+      prompt: "Handle check task",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
+    assert.equal(attempt.timeoutMs, null);
+
+    const supervisorController = new AbortController();
+    const supervisor = new AntigravitySupervisor({
+      spoolDir: attempt.attemptDir,
+      manifest: attempt,
+      signal: supervisorController.signal,
+      spawnFn: fixtureSpawn("ok"),
+    });
+
+    const status = await supervisor.run();
+    assert.equal(status.status, "completed");
+
+    // Internal timer handles must be completely stopped/cleared
+    assert.equal((supervisor as any).heartbeatTimer, null);
+    assert.equal((supervisor as any).cancelWatcherTimer, null);
+    assert.equal((supervisor as any).timeoutTimer, null);
+    assert.equal((supervisor as any).abortHandler, null);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });

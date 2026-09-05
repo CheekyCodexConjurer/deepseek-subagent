@@ -37,9 +37,10 @@ export class AntigravitySupervisor {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private cancelWatcherTimer: NodeJS.Timeout | null = null;
   private timeoutTimer: NodeJS.Timeout | null = null;
-  private effectiveTimeoutMs: number;
+  private abortHandler: (() => void) | null = null;
+  private effectiveTimeoutMs: number | null;
   private startTime = 0;
-  private resetTimeoutFn: ((newTimeoutMs: number) => void) | null = null;
+  private resetTimeoutFn: ((newTimeoutMs: number | null) => void) | null = null;
 
   constructor(options: SupervisorOptions) {
     this.spoolDir = options.spoolDir;
@@ -49,14 +50,18 @@ export class AntigravitySupervisor {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 500;
     this.signal = options.signal;
     this.onHeartbeat = options.onHeartbeat;
-    this.effectiveTimeoutMs = options.manifest.timeoutMs;
+    this.effectiveTimeoutMs = (typeof options.manifest.timeoutMs === "number" && options.manifest.timeoutMs > 0)
+      ? options.manifest.timeoutMs
+      : null;
     this.nonce = newId("nonce");
   }
 
-  extendTimeout(newTimeoutMs: number): void {
+  extendTimeout(newTimeoutMs: number | null): void {
     if (this.resetTimeoutFn) {
       this.resetTimeoutFn(newTimeoutMs);
-    } else if (newTimeoutMs > this.effectiveTimeoutMs) {
+    } else if (newTimeoutMs === null) {
+      this.effectiveTimeoutMs = null;
+    } else if (typeof newTimeoutMs === "number" && (this.effectiveTimeoutMs === null || newTimeoutMs > this.effectiveTimeoutMs)) {
       this.effectiveTimeoutMs = newTimeoutMs;
     }
   }
@@ -142,14 +147,21 @@ export class AntigravitySupervisor {
 
       // Watch for caller AbortSignal
       if (this.signal) {
-        this.signal.addEventListener("abort", () => {
+        this.abortHandler = () => {
           void cancelTriggered("agy run was cancelled by the caller", "aborted");
-        }, { once: true });
+        };
+        this.signal.addEventListener("abort", this.abortHandler, { once: true });
       }
 
       // Execution timeout timer
-      const resetTimeoutTimer = (newTimeoutMs: number) => {
-        if (newTimeoutMs <= this.effectiveTimeoutMs) return;
+      const resetTimeoutTimer = (newTimeoutMs: number | null) => {
+        if (newTimeoutMs === null || newTimeoutMs === undefined) {
+          this.effectiveTimeoutMs = null;
+          if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+          this.timeoutTimer = null;
+          return;
+        }
+        if (typeof this.effectiveTimeoutMs === "number" && newTimeoutMs <= this.effectiveTimeoutMs) return;
         this.effectiveTimeoutMs = newTimeoutMs;
         if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
         const elapsed = Date.now() - this.startTime;
@@ -164,7 +176,7 @@ export class AntigravitySupervisor {
       };
       this.resetTimeoutFn = resetTimeoutTimer;
 
-      if (this.effectiveTimeoutMs > 0) {
+      if (typeof this.effectiveTimeoutMs === "number" && this.effectiveTimeoutMs > 0) {
         this.timeoutTimer = setTimeout(() => {
           void cancelTriggered(
             this.manifest.command + " did not finish within " + this.effectiveTimeoutMs + "ms; terminated",
@@ -192,9 +204,11 @@ export class AntigravitySupervisor {
         if (activeDeadlinePath) {
           try {
             const raw = readFileSync(activeDeadlinePath, "utf8");
-            const data = JSON.parse(raw) as { timeoutMs?: number };
-            if (typeof data.timeoutMs === "number" && data.timeoutMs > this.effectiveTimeoutMs) {
+            const data = JSON.parse(raw) as { timeoutMs?: number | null };
+            if (typeof data.timeoutMs === "number" && (this.effectiveTimeoutMs === null || data.timeoutMs > this.effectiveTimeoutMs)) {
               resetTimeoutTimer(data.timeoutMs);
+            } else if (data.timeoutMs === null && this.effectiveTimeoutMs !== null) {
+              resetTimeoutTimer(null);
             }
           } catch {}
         }
@@ -279,6 +293,10 @@ export class AntigravitySupervisor {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.cancelWatcherTimer) clearInterval(this.cancelWatcherTimer);
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    if (this.signal && this.abortHandler) {
+      this.signal.removeEventListener("abort", this.abortHandler);
+      this.abortHandler = null;
+    }
     this.heartbeatTimer = null;
     this.cancelWatcherTimer = null;
     this.timeoutTimer = null;

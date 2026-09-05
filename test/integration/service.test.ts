@@ -780,7 +780,7 @@ test("startup reconciliation recovers a running job once without a duplicate del
       cwd: directory,
     });
     client.messages = [{
-      info: { id: "assistant_recovery", role: "assistant", sessionID: "session_1" },
+      info: { id: "assistant_recovery", role: "assistant", sessionID: "session_1", finish: "stop" },
       parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: recovered" }],
     }];
     await first.stop();
@@ -1453,8 +1453,8 @@ test("follow waits on session.idle without polling and returns the persisted res
   }
 });
 
-test("follow deadline uses the same session for graceful finalization and returns completed_partial", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-partial-"));
+test("healthy or hanging job remains active beyond follow window without automatic completion timeout or graceful finalize abort", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-timeout-active-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
   const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
@@ -1462,27 +1462,27 @@ test("follow deadline uses the same session for graceful finalization and return
     manager: new FakeManager(client),
     inbox: new FakeInbox(directory),
   });
-  const internal = service as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<{ status: string; deadlineReached: boolean; gracefulFinalize: boolean; partial: boolean }> };
-  };
   try {
     await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_partial", topic: "Partial follow", task: "Run until the controlled deadline", cwd: directory });
+    const accepted = await service.spawn({ requestId: "request_no_timeout_active", topic: "No timeout follow", task: "Run without hard completion timeout", cwd: directory });
     const job = service.getJob(accepted.jobId);
     assert.ok(job);
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.02);
-    await waitForCondition(() => client.promptCalls.some((call) => call.task.includes("Pare de expandir")));
+
+    const followPromise = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
+
+    assert.ok(client.promptCalls.length >= 1);
+    assert.equal(client.promptCalls.some((call) => call.task.includes("Pare de expandir")), false, "Must not inject graceful finalize prompt");
+
+    assert.deepEqual(client.aborted, [], "Worker must not be aborted automatically");
+    assert.equal(["dispatching", "running", "following"].includes(service.getJob(accepted.jobId)?.status ?? ""), true);
+
     client.messages = [{
-      info: { id: "assistant_follow_partial", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: partial after deadline" }],
+      info: { id: "assistant_no_timeout", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: completed without timeout abort" }],
     }];
     await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const result = await lifecycle.promise;
-    assert.equal(result.status, "completed_partial");
-    assert.equal(result.deadlineReached, true);
-    assert.equal(result.gracefulFinalize, true);
-    assert.equal(result.partial, true);
-    assert.deepEqual(client.promptCalls.filter((call) => call.task.includes("Pare de expandir")).map((call) => call.sessionId), ["session_1"]);
+    const result = await followPromise;
+    assert.equal(result.status, "completed");
     assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
   } finally {
     await service.stop();
@@ -1491,8 +1491,8 @@ test("follow deadline uses the same session for graceful finalization and return
   }
 });
 
-test("busy graceful finalization aborts only the active turn and resubmits to the same session", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-busy-"));
+test("hanging or busy job is not auto-finalized and only explicit abort terminalizes", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-timeout-abort-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
   const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
@@ -1500,56 +1500,23 @@ test("busy graceful finalization aborts only the active turn and resubmits to th
     manager: new FakeManager(client),
     inbox: new FakeInbox(directory),
   });
-  const internal = service as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<{ status: string }> };
-  };
   try {
     await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_busy", topic: "Busy finalize", task: "Run until busy finalization", cwd: directory });
-    client.promptErrors.push(new Error("HTTP 409 conflict: session busy"));
+    const accepted = await service.spawn({ requestId: "request_no_timeout_explicit_abort", topic: "Hanging job", task: "Wait for explicit abort", cwd: directory });
     const job = service.getJob(accepted.jobId);
     assert.ok(job);
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.05);
-    await waitForCondition(() => client.aborted.length === 1);
-    assert.equal(client.aborted[0], "session_1");
-    assert.deepEqual(client.promptCalls.slice(-2).map((call) => call.sessionId), ["session_1", "session_1"]);
-    client.messages = [{
-      info: { id: "assistant_follow_busy", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: busy recovery" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal((await lifecycle.promise).status, "completed_partial");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
-test("follow grace timeout aborts the worker and returns partial timeout evidence", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-timeout-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<{ status: string; workerAborted: boolean; resultAvailable: boolean }> };
-  };
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_timeout", topic: "Timeout follow", task: "Run until timeout", cwd: directory });
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
-    const result = await lifecycle.promise;
-    assert.equal(result.status, "timed_out");
-    assert.equal(result.workerAborted, true);
-    assert.equal(result.resultAvailable, true);
-    assert.deepEqual(client.aborted, ["session_1"]);
-    assert.equal(JSON.parse(await readFile(service.getJob(accepted.jobId)?.resultPath ?? "", "utf8")).envelope.status, "timed_out");
+    const followPromise = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
+
+    assert.deepEqual(client.aborted, []);
+
+    const abortResult = await service.abort(accepted.agentId, "Operator cancelled hanging task");
+    assert.equal(abortResult.status, "aborted");
+    assert.equal(client.aborted.length, 1);
+
+    const followResult = await followPromise;
+    assert.equal(followResult.status, "aborted");
+    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
   } finally {
     await service.stop();
     store.close();
@@ -1561,7 +1528,7 @@ test("restart recovers a timed-out job when initial evidence capture failed", as
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-timeout-recovery-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 });
   const first = new BridgeService(config, {
     store,
     manager: new FakeManager(client),
@@ -1573,6 +1540,7 @@ test("restart recovers a timed-out job when initial evidence capture failed", as
   try {
     await first.start();
     const accepted = await first.spawn({ requestId: "request_follow_timeout_recovery", topic: "Timeout recovery", task: "Recover timeout evidence", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 1);
     const job = first.getJob(accepted.jobId);
     assert.ok(job);
     client.listMessagesError = new Error("transient evidence read failure");
@@ -1779,8 +1747,8 @@ test("a new approval during timeout abort renews its own window", async () => {
   }
 });
 
-test("two follow calls share one deadline and one graceful finalizer", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-shared-"));
+test("multiple follow callers share one lifecycle without triggering automatic graceful finalize", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-shared-no-timeout-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
   const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
@@ -1788,26 +1756,22 @@ test("two follow calls share one deadline and one graceful finalizer", async () 
     manager: new FakeManager(client),
     inbox: new FakeInbox(directory),
   });
-  const internal = service as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): void;
-  };
   try {
     await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_shared", topic: "Shared follow", task: "Use one finalizer", cwd: directory });
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-    internal.ensureFollowLifecycle(job, 0, 0.02);
+    const accepted = await service.spawn({ requestId: "request_follow_shared_no_timeout", topic: "Shared follow", task: "Share lifecycle without auto finalize", cwd: directory });
     const first = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
     const second = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-    await waitForCondition(() => client.promptCalls.filter((call) => call.task.includes("Pare de expandir")).length === 1);
+
+    assert.equal(client.promptCalls.some((call) => call.task.includes("Pare de expandir")), false);
+
     client.messages = [{
-      info: { id: "assistant_follow_shared", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: shared finalizer" }],
+      info: { id: "assistant_shared_done", role: "assistant", sessionID: "session_1" },
+      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: shared completion" }],
     }];
     await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const results = await Promise.all([first, second]);
-    assert.deepEqual(results.map((result) => result.status), ["completed_partial", "completed_partial"]);
-    assert.equal(client.promptCalls.filter((call) => call.task.includes("Pare de expandir")).length, 1);
+    const [res1, res2] = await Promise.all([first, second]);
+    assert.equal(res1.status, "completed");
+    assert.equal(res2.status, "completed");
   } finally {
     await service.stop();
     store.close();
@@ -1859,7 +1823,7 @@ test("daemon restart reconstructs finalizing follow without sending a duplicate 
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-restart-"));
   const store = await BridgeStore.open(directory);
   const firstClient = new FakeClient();
-  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
     store,
     manager: new FakeManager(firstClient),
     inbox: new FakeInbox(directory),
@@ -1870,6 +1834,7 @@ test("daemon restart reconstructs finalizing follow without sending a duplicate 
   try {
     await first.start();
     const accepted = await first.spawn({ requestId: "request_follow_restart", topic: "Restart follow", task: "Persist follow state", cwd: directory });
+    await waitForCondition(() => firstClient.promptCalls.length === 1);
     const job = first.getJob(accepted.jobId);
     assert.ok(job);
     const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.2);
@@ -1880,7 +1845,7 @@ test("daemon restart reconstructs finalizing follow without sending a duplicate 
     await first.stop();
 
     const secondClient = new FakeClient();
-    const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
       store,
       manager: new FakeManager(secondClient),
       inbox: new FakeInbox(directory),
@@ -2446,7 +2411,7 @@ test("failed and timed-out writers remain continuable until closed", async () =>
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-writer-lifecycle-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
     store,
     manager: new FakeManager(client),
     inbox: new FakeInbox(directory),
@@ -2479,6 +2444,7 @@ test("failed and timed-out writers remain continuable until closed", async () =>
     assert.equal(continuedAfterFailure.status, "accepted");
 
     const timedOut = await service.spawn({ requestId: "request_writer_timeout_seed", topic: "Timeout writer", task: "Hit the grace deadline", cwd: directory });
+    await waitForCondition(() => client.promptCalls.length === 4);
     const job = service.getJob(timedOut.jobId);
     assert.ok(job);
     const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
@@ -3714,12 +3680,12 @@ test("antigravity spawn returns accepted while agy is still executing; deepseek_
   }
 });
 
-test("antigravity follow grace timeout aborts the live process controller, never a bogus OpenCode session, and keeps the job terminal", async () => {
+test("antigravity follow grace does not kill process with healthy liveness and only explicit abort terminalizes and cleans up", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-follow-timeout-"));
   const store = await BridgeStore.open(directory);
   const client = new FakeClient();
   const agyCalls: string[] = [];
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
     store,
     manager: new FakeManager(client),
     inbox: new FakeInbox(directory),
@@ -3746,36 +3712,52 @@ test("antigravity follow grace timeout aborts the live process controller, never
     assert.ok(controller, "the live Antigravity abort controller is registered");
     const job = service.getJob(accepted.jobId);
     assert.ok(job);
+
+    // Follow lifecycle with zero wait to trigger deadline timer evaluation immediately
     const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
-    const result = await lifecycle.promise;
-    assert.equal(result.status, "timed_out");
-    assert.equal(result.workerAborted, true);
-    assert.equal(controller.signal.aborted, true, "the follow grace timeout must abort the live Antigravity controller");
-    assert.equal(store.getJob(accepted.jobId)?.status, "timed_out");
-    assert.equal(store.getAgent(accepted.agentId)?.status, "timed_out");
+
+    // Allow deadline timer to evaluate without killing healthy liveness
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Follow/grace MUST NOT abort or kill process while liveness is healthy
+    assert.equal(controller.signal.aborted, false, "follow/grace must not abort controller while liveness is healthy");
+    assert.notEqual(store.getJob(accepted.jobId)?.status, "timed_out", "job must not time out while liveness is healthy");
+    assert.notEqual(store.getJob(accepted.jobId)?.status, "aborted", "job must not abort while liveness is healthy");
+    assert.equal(store.getAgent(accepted.agentId)?.status, "working", "agent remains working");
+
+    // Only explicit abort terminalizes and cleans up
+    const abortResult = await service.abort(accepted.agentId, "Operator cancelled hanging task");
+    assert.equal(abortResult.status, "aborted");
+    assert.equal(controller.signal.aborted, true, "explicit abort must abort the live Antigravity controller");
+    assert.equal(store.getJob(accepted.jobId)?.status, "aborted");
+    assert.equal(store.getAgent(accepted.agentId)?.status, "closed");
     assert.deepEqual(client.aborted, [], "no bogus OpenCode abort may be issued for an Antigravity session");
     assert.equal(client.abortCalls, 0);
+
+    const followResult = await lifecycle.promise;
+    assert.equal(followResult.status, "aborted");
+    assert.equal(followResult.workerAborted, true);
+
     const activities = store.listActivity(accepted.agentId, 30);
     assert.ok(
-      activities.some((entry) => /Sent abort signal to the Antigravity process tree/.test(entry.summary)),
+      activities.some((entry) => /Sent abort signal to the/.test(entry.summary)),
       "provider-accurate abort activity is recorded",
     );
     assert.ok(
       !activities.some((entry) => /Worker abort failed after the follow grace period/.test(entry.summary)),
       "no OpenCode worker abort is claimed for an Antigravity run",
     );
-    // The killed agy child settles in the background task; the late process
-    // exit must never persist or deliver a result after the follow timed out.
+
     await waitForCondition(
       () => store.listActivity(accepted.agentId, 30).some((entry) => /Antigravity process ended after the bridge abort signal/.test(entry.summary)),
       3_000,
     );
-    assert.equal(store.getJob(accepted.jobId)?.resultPath, null, "a late Antigravity run must never persist a result after timeout");
-    assert.equal(store.getJob(accepted.jobId)?.status, "timed_out", "the job stays terminal after the late process exit");
-    assert.equal(store.getAgent(accepted.agentId)?.status, "timed_out", "the agent stays terminal after the late process exit");
+    assert.equal(store.getJob(accepted.jobId)?.resultPath, null, "a late Antigravity run must never persist a result after abort");
+    assert.equal(store.getJob(accepted.jobId)?.status, "aborted", "the job stays terminal after the late process exit");
+    assert.equal(store.getAgent(accepted.agentId)?.status, "closed", "the agent stays closed after the late process exit");
+
     const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    assert.equal(followed.status, "timed_out");
-    assert.equal(followed.workerAborted, true);
+    assert.equal(followed.status, "aborted");
   } finally {
     await service.stop();
     store.close();
@@ -4946,9 +4928,9 @@ test("worktree strategy preserves global GEMINI.md canonical path without escape
   }
 });
 
-test("antigravity timeout triggers exactly one internal fallback to enabled OpenCode route for analyze mode", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-fallback-"));
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-fallback-data-"));
+test("antigravity timeout does not switch to OpenCode, enforcing zero fallback and fixed route", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-nofallback-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-timeout-nofallback-data-"));
   const store = await BridgeStore.open(dataDir);
   const client = new FakeClient();
   const agyCalls: string[] = [];
@@ -4979,7 +4961,7 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
     await service.start();
     service.setActiveRoute("antigravity-flash-high");
     const accepted = await service.spawn({
-      requestId: "request_timeout_fallback_ok",
+      requestId: "request_timeout_nofallback",
       topic: "Analyze timeout failover",
       task: "Inspect repository and analyze architecture",
       cwd: directory,
@@ -4991,62 +4973,29 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
     assert.equal(accepted.accepted, true);
     assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
 
-    // Wait for Antigravity timeout to trigger OpenCode fallback
-    await waitForCondition(() => client.promptCalls.length === 1, 3_000);
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 3_000);
 
     assert.equal(agyCalls.length, 1, "exactly one agy execution was attempted");
-    assert.equal(client.sessionCount, 1, "real OpenCode session created on fallback");
-    assert.equal(client.promptCalls.length, 1, "reconstructed prompt dispatched to OpenCode");
+    assert.equal(client.sessionCount, 0, "zero OpenCode session created; no fallback switch");
+    assert.equal(client.promptCalls.length, 0, "zero OpenCode prompt dispatched; route is fixed");
 
-    const prompt = client.promptCalls[0]?.task ?? "";
-    assert.ok(prompt.includes("Important analyze context data"), "OpenCode prompt received reconstructed inline context");
-    assert.ok(prompt.includes("Inspect repository and analyze architecture"), "OpenCode prompt received original task");
-
-    // Verify agent primary route identity is preserved
     const agent = store.getAgent(accepted.agentId);
     assert.ok(agent);
-    assert.equal(agent.modelRoute, "antigravity-flash-high", "primary route name preserved on agent");
+    assert.equal(agent.modelRoute, "antigravity-flash-high", "primary route preserved on agent");
     assert.equal(agent.modelProviderId, "antigravity", "primary provider preserved on agent");
     assert.equal(agent.modelId, "gemini-3.8-flash-high", "primary model id preserved on agent");
-    assert.notEqual(agent.opencodeSessionId, "antigravity:" + agent.id, "real OpenCode session ID bound to agent");
+    assert.equal(agent.status, "failed", "agent is marked failed on timeout");
 
-    // Verify fallback audit on job
-    const jobBeforeComplete = store.getJob(accepted.jobId);
-    assert.ok(jobBeforeComplete);
-    assert.equal(jobBeforeComplete.fallbackFrom, "antigravity-flash-high");
-    assert.equal(jobBeforeComplete.fallbackTo, "flash-max");
-    assert.equal(jobBeforeComplete.fallbackCount, 1);
-    assert.ok(jobBeforeComplete.fallbackReason?.includes("did not finish within"), "fallback reason captured timeout error");
-
-    // Emit OpenCode completion event
-    client.messages = [{
-      info: { id: "msg_fallback_res", role: "assistant", sessionID: agent.opencodeSessionId },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: Fallback analysis completed successfully.\nFILES:\n- none\nTESTS:\n- none\nRISKS:\n- none" }],
-    }];
-
-    await client.emit({
-      type: "session.idle",
-      properties: { sessionID: agent.opencodeSessionId, status: "idle" },
-    });
-
-
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "delivered", 2_000);
-
-    const completedJob = store.getJob(accepted.jobId);
-    assert.ok(completedJob);
-    assert.equal(completedJob.status, "delivered");
-    assert.equal(completedJob.fallbackStatus, "succeeded");
+    const failedJob = store.getJob(accepted.jobId);
+    assert.ok(failedJob);
+    assert.equal(failedJob.status, "failed");
+    assert.match(failedJob.error ?? "", /did not finish within/);
+    assert.equal(failedJob.fallbackCount ?? 0, 0, "zero fallback attempted");
+    assert.equal(failedJob.fallbackFrom, null, "no fallback from route");
+    assert.equal(failedJob.fallbackTo, null, "no fallback to route");
 
     const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    assert.equal(followed.status, "completed");
-    assert.equal(followed.result?.envelope.summary, "Fallback analysis completed successfully.");
-
-    const persisted = JSON.parse(await readFile(completedJob.resultPath!, "utf8")) as { envelope: ResultEnvelope };
-    assert.equal(persisted.envelope.status, "completed");
-    assert.equal(persisted.envelope.summary, "Fallback analysis completed successfully.");
-    assert.ok(persisted.envelope.fallback);
-    assert.equal(persisted.envelope.fallback.from, "antigravity-flash-high");
-    assert.equal(persisted.envelope.fallback.to, "flash-max");
+    assert.equal(followed.status, "failed");
   } finally {
     await service.stop();
     store.close();
@@ -5055,120 +5004,7 @@ test("antigravity timeout triggers exactly one internal fallback to enabled Open
   }
 });
 
-test("antigravity timeout does not fall back when antigravityTimeoutFallbackRoute is null", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-null-"));
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-null-data-"));
-  const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
-  const agyCalls: string[] = [];
-
-  const config = createDefaultConfig({
-    dataDir,
-    configPath: path.join(dataDir, "config.json"),
-    antigravityTimeoutFallbackRoute: null,
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
-    ],
-  });
-
-  const service = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
-    antigravity: new AntigravityAdapter({
-      command: "node",
-      timeoutMs: 100,
-      spawnFn: agyFixtureSpawn("hang", agyCalls),
-    }),
-  });
-
-  try {
-    await service.start();
-    service.setActiveRoute("antigravity-flash-high");
-    const accepted = await service.spawn({
-      requestId: "request_no_fallback_null",
-      topic: "No fallback null route",
-      task: "Analyze task",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "antigravity-flash-high",
-    });
-
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
-    assert.equal(agyCalls.length, 1);
-    assert.equal(client.sessionCount, 0, "no OpenCode session created when fallback route is null");
-    assert.equal(client.promptCalls.length, 0, "no OpenCode prompt dispatched");
-
-    const job = store.getJob(accepted.jobId);
-    assert.equal(job?.status, "failed");
-    assert.match(job?.error ?? "", /did not finish within/);
-    assert.equal(job?.fallbackCount ?? 0, 0);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("antigravity timeout does not fall back for edit mode or test mode", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-mode-"));
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-mode-data-"));
-  const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
-  const agyCalls: string[] = [];
-
-  const config = createDefaultConfig({
-    dataDir,
-    configPath: path.join(dataDir, "config.json"),
-    antigravityTimeoutFallbackRoute: "flash-max",
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
-    ],
-  });
-
-  const service = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
-    antigravity: new AntigravityAdapter({
-      command: "node",
-      timeoutMs: 100,
-      spawnFn: agyFixtureSpawn("hang", agyCalls),
-    }),
-  });
-
-  try {
-    await service.start();
-    service.setActiveRoute("antigravity-flash-high");
-    const accepted = await service.spawn({
-      requestId: "request_no_fallback_edit_mode",
-      topic: "No fallback edit mode",
-      task: "Edit some files",
-      cwd: directory,
-      mode: "edit",
-      workspaceStrategy: "shared",
-      modelRoute: "antigravity-flash-high",
-    });
-
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
-    assert.equal(client.sessionCount, 0, "no OpenCode fallback for edit mode");
-    assert.equal(client.promptCalls.length, 0);
-
-    const job = store.getJob(accepted.jobId);
-    assert.equal(job?.status, "failed");
-    assert.equal(job?.fallbackCount ?? 0, 0);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("antigravity non-timeout errors do not trigger fallback", async () => {
+test("antigravity non-timeout errors do not trigger fallback and keep route fixed", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-"));
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-data-"));
   const store = await BridgeStore.open(dataDir);
@@ -5211,66 +5047,17 @@ test("antigravity non-timeout errors do not trigger fallback", async () => {
     assert.equal(client.sessionCount, 0, "no OpenCode fallback for exit error");
     assert.equal(client.promptCalls.length, 0);
 
+    const agent = store.getAgent(accepted.agentId);
+    assert.ok(agent);
+    assert.equal(agent.modelRoute, "antigravity-flash-high", "route preserved on agent");
+    assert.equal(agent.modelProviderId, "antigravity", "provider preserved on agent");
+
     const job = store.getJob(accepted.jobId);
     assert.equal(job?.status, "failed");
     assert.match(job?.error ?? "", /quota exceeded/);
     assert.equal(job?.fallbackCount ?? 0, 0);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("antigravity timeout does not fall back if fallback route is disabled or missing", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-disabled-"));
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-disabled-data-"));
-  const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
-  const agyCalls: string[] = [];
-
-  const config = createDefaultConfig({
-    dataDir,
-    configPath: path.join(dataDir, "config.json"),
-    antigravityTimeoutFallbackRoute: "pro-max", // pro-max is disabled by default
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
-    ],
-  });
-
-  const service = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
-    antigravity: new AntigravityAdapter({
-      command: "node",
-      timeoutMs: 100,
-      spawnFn: agyFixtureSpawn("hang", agyCalls),
-    }),
-  });
-
-  try {
-    await service.start();
-    service.setActiveRoute("antigravity-flash-high");
-    const accepted = await service.spawn({
-      requestId: "request_no_fallback_disabled_route",
-      topic: "No fallback disabled route",
-      task: "Analyze task",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "antigravity-flash-high",
-    });
-
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
-    assert.equal(client.sessionCount, 0, "no OpenCode session when fallback route is disabled");
-    assert.equal(client.promptCalls.length, 0);
-
-    const job = store.getJob(accepted.jobId);
-    assert.equal(job?.status, "failed");
-    assert.equal(job?.fallbackCount ?? 0, 0);
+    assert.equal(job?.fallbackFrom, null);
+    assert.equal(job?.fallbackTo, null);
   } finally {
     await service.stop();
     store.close();
@@ -5332,61 +5119,6 @@ test("abort racing Antigravity timeout never launches OpenCode fallback", async 
 
     const job = store.getJob(accepted.jobId);
     assert.equal(job?.status, "aborted");
-    assert.equal(job?.fallbackCount ?? 0, 0);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("antigravity timeout does not fall back when fallback route provider is not opencode-go", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-non-opencode-"));
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-non-opencode-data-"));
-  const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
-  const agyCalls: string[] = [];
-
-  const config = createDefaultConfig({
-    dataDir,
-    configPath: path.join(dataDir, "config.json"),
-    antigravityTimeoutFallbackRoute: "custom-other",
-    modelRoutes: [
-      { name: "custom-other", providerId: "other-provider", modelId: "other-model", variant: null, enabled: true, default: false, display: "Other Provider · Model" },
-      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
-    ],
-  });
-
-  const service = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
-    antigravity: new AntigravityAdapter({
-      command: "node",
-      timeoutMs: 100,
-      spawnFn: agyFixtureSpawn("hang", agyCalls),
-    }),
-  });
-
-  try {
-    await service.start();
-    service.setActiveRoute("antigravity-flash-high");
-    const accepted = await service.spawn({
-      requestId: "request_no_fallback_non_opencode",
-      topic: "No fallback non opencode route",
-      task: "Analyze task",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "antigravity-flash-high",
-    });
-
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 2_000);
-    assert.equal(client.sessionCount, 0, "no OpenCode session when fallback route is not opencode-go");
-    assert.equal(client.promptCalls.length, 0);
-
-    const job = store.getJob(accepted.jobId);
-    assert.equal(job?.status, "failed");
     assert.equal(job?.fallbackCount ?? 0, 0);
   } finally {
     await service.stop();

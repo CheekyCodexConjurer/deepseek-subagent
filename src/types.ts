@@ -40,6 +40,7 @@ export interface RouteStatusInfo {
 
 export type JobStatus =
   | "created"
+  | "queued"
   | "dispatching"
   | "running"
   | "following"
@@ -81,6 +82,8 @@ export interface SpawnInput {
   modelRoute?: string;
   mcpSessionId?: string;
   trustedThreadId?: string;
+  priority?: number;
+  exclusiveResources?: string[];
 }
 
 export interface ContinueInput {
@@ -192,6 +195,83 @@ export interface JobRecord {
   earlyExitAt?: string | null;
   earlyExitReason?: string | null;
   escalationProposal?: string | null;
+  batchId?: string | null;
+  priority?: number;
+  exclusiveResources?: string[] | null;
+  queuedAt?: string | null;
+  dispatchedAt?: string | null;
+}
+
+export interface BatchRecord {
+  id: string;
+  requestId: string;
+  batchHash: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BatchItemInput {
+  requestId?: string;
+  topic?: string;
+  task: string;
+  cwd?: string;
+  mode?: AgentMode;
+  workspaceStrategy?: WorkspaceStrategy;
+  contextFiles?: string[];
+  visualContext?: string;
+  priority?: number;
+  exclusiveResources?: string[];
+  threadId?: string;
+  turnId?: string;
+  mcpSessionId?: string;
+  trustedThreadId?: string;
+  modelRoute?: string;
+}
+
+export interface SpawnBatchInput {
+  batchRequestId?: string;
+  items: BatchItemInput[];
+  threadId?: string;
+  turnId?: string;
+  mcpSessionId?: string;
+  trustedThreadId?: string;
+}
+
+export interface BatchItemReceipt {
+  jobId: string;
+  agentId: string;
+  requestId?: string;
+  status: "accepted" | "queued";
+  accepted?: true;
+  topic?: string;
+  modelDisplayName?: string;
+  state?: "Starting" | "Queued";
+  priority?: number;
+  message?: string;
+}
+
+export interface AcceptedBatchOperation {
+  accepted: true;
+  batchId: string;
+  batchRequestId: string;
+  items: BatchItemReceipt[];
+  status?: "accepted";
+  jobIds?: string[];
+  state?: "Starting";
+  obligationState?: "pending";
+  nextRequiredAction?: "subagents_follow" | "deepseek_follow";
+  message?: string;
+  capabilities?: Record<string, boolean>;
+}
+
+export interface SwarmOperationalCounters {
+  queueDepth: number;
+  active: number;
+  targetCredits: number;
+  oldestWaitMs: number | null;
+  resourceClaims: Array<{ resource: string; jobId: string }>;
+  capabilities?: Record<string, boolean>;
 }
 
 
@@ -489,7 +569,8 @@ export interface BridgeConfig {
   maxContextFileBytes: number;
   globalGeminiContextPath: string;
   backupDir: string;
-  workerMaxExecutionMinutes?: number;
+  workerMaxExecutionMinutes?: number | null;
+  swarmCreditCeiling?: number;
 }
 
 

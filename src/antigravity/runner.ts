@@ -22,7 +22,7 @@ export type SpawnLike = (command: string, args: string[], options: SpawnOptions)
 export interface RunAgyOptions {
   command?: string;
   cwd: string;
-  timeoutMs?: number;
+  timeoutMs?: number | null;
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   spawnFn?: SpawnLike;
@@ -73,10 +73,13 @@ function boundedSink(limit: number): { buffers: Buffer[]; length: number; append
  * bounded stdout/stderr. Fails closed on spawn failure, non-zero exit, timeout
  * or cancellation; there is never a retry or a second process here, so callers
  * get exactly one attempt per invocation.
+ *
+ * Default execution mode is unlimited: no timer kills healthy agy unless an
+ * explicit positive timeoutMs is requested.
  */
 export async function runAgy(args: string[], options: RunAgyOptions): Promise<AgyProcessResult> {
   const command = options.command ?? AGY_COMMAND;
-  const timeoutMs = options.timeoutMs ?? AGY_DEFAULT_TIMEOUT_MS;
+  const timeoutMs = (typeof options.timeoutMs === "number" && options.timeoutMs > 0) ? options.timeoutMs : null;
   const maxOutputBytes = options.maxOutputBytes ?? AGY_MAX_OUTPUT_BYTES;
   if (options.signal?.aborted) {
     throw new AntigravityProcessError("aborted", command, "agy run was cancelled before it started");
@@ -116,19 +119,21 @@ export async function runAgy(args: string[], options: RunAgyOptions): Promise<Ag
       });
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      void killTree(child).finally(() => {
-        reject(new AntigravityProcessError(
-          "timeout",
-          command,
-          command + " did not finish within " + timeoutMs + "ms; the process tree was terminated",
-        ));
-      });
-    }, timeoutMs);
-    timer.unref?.();
+    if (timeoutMs !== null) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        void killTree(child).finally(() => {
+          reject(new AntigravityProcessError(
+            "timeout",
+            command,
+            command + " did not finish within " + timeoutMs + "ms; the process tree was terminated",
+          ));
+        });
+      }, timeoutMs);
+      timer.unref?.();
+    }
     child.once("error", (error) => {
       if (settled) return;
       settled = true;

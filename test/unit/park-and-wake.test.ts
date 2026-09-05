@@ -1204,9 +1204,9 @@ async function freePort(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// 20. BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeService and persists executable/version
+// 20. BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeService, persists executable/version, and treats ambiguous CLI failure as fail-closed indeterminate with no blind retry
 // ---------------------------------------------------------------------------
-test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeService and persists executable/version", async () => {
+test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeService, persists executable/version, and treats ambiguous CLI failure as fail-closed indeterminate with no blind retry", async () => {
   const { tmp, config, store } = await createTestEnv();
   const injectedCliCalls: Array<{ threadId: string; marker: string }> = [];
   let cliResult: { success: boolean; activeWriter?: boolean; error?: string; executablePath?: string; version?: string } = {
@@ -1318,7 +1318,7 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
     assert.equal(outboxDeferred.selectedExecutable, "C:\\Codex\\codex.exe");
     assert.equal(outboxDeferred.executableVersion, "0.153.0");
 
-    // 3. Failure path through injected CLI transport
+    // 3. Ambiguous failure path through injected CLI transport remains fail-closed indeterminate with no blind retry
     const job3 = store.createJob({
       id: "job_cli3",
       agentId: agent.id,
@@ -1348,11 +1348,26 @@ test("BLK-BRIDGE-1: external CLI wake reaches injected transport through BridgeS
 
     await service.evaluateParkWakes(job3.id);
 
-    const outboxFailed = store.getWakeOutbox(receipt3.parkId, 1);
-    assert.ok(outboxFailed);
-    assert.equal(outboxFailed.status, "failed");
-    assert.equal(outboxFailed.selectedExecutable, "C:\\Codex\\codex.exe");
-    assert.equal(outboxFailed.executableVersion, "0.153.0");
+    const outboxIndeterminate = store.getWakeOutbox(receipt3.parkId, 1);
+    assert.ok(outboxIndeterminate);
+    assert.equal(outboxIndeterminate.status, "waking");
+    assert.notEqual(outboxIndeterminate.status, "failed");
+    assert.notEqual(outboxIndeterminate.status, "pending");
+    assert.notEqual(outboxIndeterminate.status, "deferred_active_writer");
+    assert.equal(outboxIndeterminate.selectedExecutable, "C:\\Codex\\codex.exe");
+    assert.equal(outboxIndeterminate.executableVersion, "0.153.0");
+    assert.equal(outboxIndeterminate.lastError, "process crashed with 1");
+
+    const barrier3 = store.getParkBarrier(receipt3.parkId);
+    assert.ok(barrier3);
+    assert.equal(barrier3.state, "waking", "Barrier must remain waking/indeterminate when delivery outcome is unknown");
+    assert.equal(barrier3.armed, false, "Barrier armed must be false while indeterminate");
+
+    // Ambiguous outcome is never blindly retried without authoritative proof
+    const callsBefore = injectedCliCalls.length;
+    await (service as any).recoverWakeOutbox();
+    await service.evaluateParkWakes(job3.id);
+    assert.equal(injectedCliCalls.length, callsBefore, "Ambiguous outcome must never be blindly retried without authoritative proof");
   } finally {
     await service.stop();
     store.close();

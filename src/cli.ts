@@ -364,13 +364,20 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
   push({
     name: "follow_mode",
     status: "ok",
-    detail: "event-driven waiter with one deadline timer and persisted restart state",
+    detail: "event-driven waiter without clock deadline; default execution is unlimited",
+  });
+  push({
+    name: "worker_execution_timeout",
+    status: "ok",
+    detail: config.workerMaxExecutionMinutes
+      ? `configured: ${config.workerMaxExecutionMinutes} min limit`
+      : "default: unlimited (follow wait+grace no longer impose completion deadlines)",
   });
   push({
     name: "follow_default_timeout",
     status: isValidFollowDefaults(config) ? "ok" : "error",
     detail: isValidFollowDefaults(config)
-      ? `${config.followDefaultWaitMinutes} min wait + ${config.followDefaultGraceMinutes} min graceful finalize`
+      ? `${config.followDefaultWaitMinutes} min wait + ${config.followDefaultGraceMinutes} min graceful finalize (compatibility defaults; operational default is unlimited)`
       : "MISCONFIGURED: follow defaults must be whole minutes within 1..60 wait and 1..10 grace",
   });
   const codexToolTimeout = await readCodexMcpToolTimeout();
@@ -442,6 +449,8 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
   await doctorObligationChecks(databasePath, push);
   console.error("[doctor] checking retention policy");
   doctorRetentionCheck(config, databasePath, push);
+  console.error("[doctor] checking swarm scheduler counters");
+  doctorSwarmCheck(config, databasePath, push);
   const report: DoctorReport = {
     generatedAt: new Date().toISOString(),
     displayName: "DeepSeek Sub-Agent",
@@ -569,6 +578,35 @@ export function doctorRetentionCheck(config: BridgeConfig, databasePath: string,
     });
   } catch (error) {
     push({ name: "retention", status: "error", detail: redactSecrets(String(error)) });
+  }
+}
+
+export function doctorSwarmCheck(config: BridgeConfig, databasePath: string, push: (check: DoctorCheck) => void): void {
+  if (!existsSync(databasePath)) {
+    push({ name: "swarm", status: "ok", detail: "no database yet; capability=batch_scheduler" });
+    push({ name: "batch_scheduler", status: "ok", detail: "batch_scheduler capability ready" });
+    return;
+  }
+  try {
+    withStore(databasePath, (store) => {
+      const queueDepth = store.getQueueDepth();
+      const active = store.getActiveJobCount();
+      const targetCredits = config.swarmCreditCeiling ?? 8;
+      const oldestWaitMs = store.getOldestWaitMs();
+      push({
+        name: "swarm",
+        status: "ok",
+        detail: `capability=batch_scheduler queueDepth=${queueDepth} active=${active} targetCredits=${targetCredits} oldestWaitMs=${oldestWaitMs ?? "none"}`,
+      });
+      push({
+        name: "batch_scheduler",
+        status: "ok",
+        detail: `batch_scheduler capability operational (queueDepth=${queueDepth} active=${active} targetCredits=${targetCredits})`,
+      });
+    });
+  } catch (error) {
+    push({ name: "swarm", status: "error", detail: redactSecrets(String(error)) });
+    push({ name: "batch_scheduler", status: "error", detail: redactSecrets(String(error)) });
   }
 }
 

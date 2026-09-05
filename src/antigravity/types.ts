@@ -43,7 +43,7 @@ export interface AntigravityAttemptManifest {
   modelRoute: string | null;
   command: string;
   args: string[];
-  timeoutMs: number;
+  timeoutMs: number | null;
   sandbox: boolean;
   addDirs: string[];
   dangerouslySkipPermissions: boolean;

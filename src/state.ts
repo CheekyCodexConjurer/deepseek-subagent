@@ -1,12 +1,13 @@
 import type { AgentStatus, JobStatus } from "./types.js";
 
 const JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
-  created: ["dispatching", "failed", "aborted"],
+  created: ["queued", "dispatching", "failed", "aborted"],
+  queued: ["dispatching", "failed", "aborted"],
   dispatching: ["running", "following", "needs_approval", "failed", "aborted"],
   running: ["needs_approval", "following", "completed", "failed", "aborted", "timed_out"],
   following: ["needs_approval", "finalizing", "completed", "completed_partial", "failed", "aborted", "timed_out"],
   finalizing: ["needs_approval", "completed", "completed_partial", "failed", "aborted", "timed_out"],
-  needs_approval: ["running", "failed", "aborted"],
+  needs_approval: ["running", "queued", "failed", "aborted"],
   completed: ["delivery_pending", "delivered", "failed"],
   completed_partial: ["delivery_pending", "delivered", "failed"],
   timed_out: ["delivery_pending", "delivered", "failed"],

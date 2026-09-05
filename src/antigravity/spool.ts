@@ -2,7 +2,6 @@ import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { AGY_COMMAND, buildAgyArgs } from "./args.js";
-import { AGY_DEFAULT_TIMEOUT_MS } from "./runner.js";
 import {
   ensurePrivateDir,
   isProcessAlive,
@@ -33,7 +32,7 @@ export interface CreateAttemptInput {
   modelRoute: string | null;
   command?: string | undefined;
   args?: string[] | undefined;
-  timeoutMs?: number | undefined;
+  timeoutMs?: number | null | undefined;
   sandbox?: boolean | undefined;
   addDirs?: string[] | undefined;
   dangerouslySkipPermissions?: boolean | undefined;
@@ -59,7 +58,7 @@ export class AntigravitySpool {
     await ensurePrivateDir(dir);
 
     const command = input.command ?? AGY_COMMAND;
-    const timeoutMs = input.timeoutMs ?? AGY_DEFAULT_TIMEOUT_MS;
+    const timeoutMs = typeof input.timeoutMs === "number" && input.timeoutMs > 0 ? input.timeoutMs : null;
     const sandbox = input.sandbox === true;
     const addDirs = [...new Set(input.addDirs ?? [])];
     const dangerouslySkipPermissions = input.dangerouslySkipPermissions === true;
@@ -147,9 +146,17 @@ export class AntigravitySpool {
       : path.join(manifestOrAttemptPath, "manifest.json");
     try {
       const raw = await readFile(target, "utf8");
-      const parsed = JSON.parse(raw) as AntigravityAttemptManifest;
-      if (parsed?.schemaVersion === 1 && typeof parsed.attemptId === "string" && typeof parsed.jobId === "string") {
-        return parsed;
+      const parsed = JSON.parse(raw) as any;
+      if (
+        parsed?.schemaVersion === 1 &&
+        typeof parsed.attemptId === "string" &&
+        typeof parsed.jobId === "string" &&
+        (typeof parsed.timeoutMs === "number" || parsed.timeoutMs === null || parsed.timeoutMs === undefined)
+      ) {
+        return {
+          ...parsed,
+          timeoutMs: typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : null,
+        } as AntigravityAttemptManifest;
       }
       return null;
     } catch {
@@ -243,7 +250,7 @@ export class AntigravitySpool {
     await writePrivateFile(cancelPath, payload);
   }
 
-  async writeDeadlineExtension(attemptIdOrJobIdOrDir: string, timeoutMs: number, jobId?: string): Promise<void> {
+  async writeDeadlineExtension(attemptIdOrJobIdOrDir: string, timeoutMs: number | null, jobId?: string): Promise<void> {
     const jobDir = this.jobSpoolDir(attemptIdOrJobIdOrDir);
     const payload = JSON.stringify({ timeoutMs, requestedAt: new Date().toISOString() }, null, 2) + "\n";
     if (existsSync(jobDir)) {

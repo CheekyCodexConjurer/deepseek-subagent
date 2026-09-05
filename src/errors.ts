@@ -1,7 +1,8 @@
-export type BridgeErrorStatus = 400 | 401 | 403 | 404 | 409 | 500 | 503;
+export type BridgeErrorStatus = 400 | 401 | 403 | 404 | 409 | 429 | 500 | 503;
 
 export type BridgeErrorCode =
   | "invalid_request"
+  | "rate_limited"
   | "unknown_route"
   | "route_disabled"
   | "route_override_denied"
@@ -95,6 +96,13 @@ export class InternalBridgeError extends BridgeError {
   constructor(message: string) {
     super(500, "internal", message);
     this.name = "InternalBridgeError";
+  }
+}
+
+export class RateLimitedError extends BridgeError {
+  constructor(message = "Rate limit exceeded; request throttled", details?: unknown) {
+    super(429, "rate_limited", message, details);
+    this.name = "RateLimitedError";
   }
 }
 

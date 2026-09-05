@@ -214,7 +214,10 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
     globalGeminiContextPath: overrides.globalGeminiContextPath ?? defaultGlobalGeminiContextPath(),
     backupDir: overrides.backupDir ?? path.join(dataDir, "backups"),
-    workerMaxExecutionMinutes: boundedInteger(overrides.workerMaxExecutionMinutes, FOLLOW_MAX_TOTAL_MINUTES, 1, 240),
+    workerMaxExecutionMinutes: typeof overrides.workerMaxExecutionMinutes === "number" && Number.isInteger(overrides.workerMaxExecutionMinutes) && overrides.workerMaxExecutionMinutes >= 1 && overrides.workerMaxExecutionMinutes <= 240
+      ? overrides.workerMaxExecutionMinutes
+      : null,
+    swarmCreditCeiling: boundedInteger(overrides.swarmCreditCeiling, 8, 1, 64),
   };
 }
 
@@ -281,7 +284,10 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
       maxContextFileBytes: boundedInteger(raw.maxContextFileBytes, defaults.maxContextFileBytes, 1_024, 64_000_000),
       globalGeminiContextPath: asString(raw.globalGeminiContextPath, defaults.globalGeminiContextPath),
       backupDir: asString(raw.backupDir, path.join(dataDir, "backups")),
-      workerMaxExecutionMinutes: boundedInteger(raw.workerMaxExecutionMinutes, defaults.workerMaxExecutionMinutes ?? FOLLOW_MAX_TOTAL_MINUTES, 1, 240),
+      workerMaxExecutionMinutes: typeof raw.workerMaxExecutionMinutes === "number" && Number.isInteger(raw.workerMaxExecutionMinutes) && raw.workerMaxExecutionMinutes >= 1 && raw.workerMaxExecutionMinutes <= 240
+        ? raw.workerMaxExecutionMinutes
+        : (defaults.workerMaxExecutionMinutes ?? null),
+      swarmCreditCeiling: boundedInteger(raw.swarmCreditCeiling, defaults.swarmCreditCeiling ?? 8, 1, 64),
     };
 
   } catch {

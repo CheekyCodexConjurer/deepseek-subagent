@@ -1,10 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type AddressInfo } from "node:net";
+import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "../../src/http-server.js";
+import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError } from "../../src/http-server.js";
 import { createLazyDaemonBootstrap, createMcpServer, ensureDaemonRunning } from "../../src/mcp.js";
+import { TranscriptAttestor } from "../../src/codex/transcript-attestor.js";
+import type { BridgeService } from "../../src/service.js";
 
 function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<string, unknown>> } {
   return {
@@ -18,6 +24,21 @@ function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<str
           agentId: "agent_1",
           jobId: "job_1",
           state: "Starting",
+        };
+      }
+      if (pathname === "/v1/jobs/spawn-batch") {
+        return {
+          accepted: true,
+          batchId: "batch_1",
+          batchRequestId: "batch_req_1",
+          items: [
+            {
+              jobId: "job_1",
+              agentId: "agent_1",
+              requestId: "req_1",
+              status: "accepted",
+            },
+          ],
         };
       }
       if (pathname === "/v1/jobs/consult") {
@@ -40,7 +61,7 @@ function acceptedCallFixture(): { call: (pathname: string) => Promise<Record<str
   };
 }
 
-test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and deepseek_* migration aliases", async () => {
+test("MCP exposes SubAgents MCP canonical identity, nine canonical tools and deepseek_* migration aliases", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
     configPath: "C:\\\\deepseek-test-data\\\\config.json",
@@ -56,6 +77,7 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
     const tools = result.tools;
     assert.deepEqual(tools.map((tool) => tool.name), [
       "subagents_spawn",
+      "subagents_spawn_batch",
       "subagents_continue",
       "subagents_status",
       "subagents_follow",
@@ -64,6 +86,7 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
       "subagents_close",
       "subagents_recover_result",
       "deepseek_spawn",
+      "deepseek_spawn_batch",
       "deepseek_continue",
       "deepseek_consult",
       "deepseek_follow",
@@ -80,6 +103,7 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
     assert.match(tools[0]?.description ?? "", /operator-only/i);
 
     const spawn = tools.find((tool) => tool.name === "subagents_spawn");
+    const spawnBatch = tools.find((tool) => tool.name === "subagents_spawn_batch");
     const continueTool = tools.find((tool) => tool.name === "subagents_continue");
     const statusTool = tools.find((tool) => tool.name === "subagents_status");
     const follow = tools.find((tool) => tool.name === "subagents_follow");
@@ -89,6 +113,7 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
     const recover = tools.find((tool) => tool.name === "subagents_recover_result");
 
     assert.equal(spawn?.title, "SubAgents MCP · Spawn");
+    assert.equal(spawnBatch?.title, "SubAgents MCP · Spawn Batch");
     assert.equal(continueTool?.title, "SubAgents MCP · Continue");
     assert.equal(statusTool?.title, "SubAgents MCP · Status");
     assert.equal(follow?.title, "SubAgents MCP · Follow");
@@ -98,6 +123,7 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
     assert.equal(recover?.title, "SubAgents MCP · Recover result");
 
     assert.match(spawn?.description ?? "", /subagents_follow/i);
+    assert.match(spawnBatch?.description ?? "", /subagents_follow/i);
     assert.match(continueTool?.description ?? "", /subagents_follow/i);
     assert.match(statusTool?.description ?? "", /observable/i);
     assert.match(statusTool?.description ?? "", /never exposes private reasoning/i);
@@ -109,10 +135,12 @@ test("MCP exposes SubAgents MCP canonical identity, eight canonical tools and de
 
     // Verify migration aliases are preserved
     const legacySpawn = tools.find((tool) => tool.name === "deepseek_spawn");
+    const legacySpawnBatch = tools.find((tool) => tool.name === "deepseek_spawn_batch");
     const legacyConsult = tools.find((tool) => tool.name === "deepseek_consult");
     const legacyFollow = tools.find((tool) => tool.name === "deepseek_follow");
     const legacyPark = tools.find((tool) => tool.name === "deepseek_park");
     assert.equal(legacySpawn?.title, "DeepSeek Sub-Agent · Spawn");
+    assert.equal(legacySpawnBatch?.title, "DeepSeek Sub-Agent · Spawn Batch");
     assert.equal(legacyConsult?.title, "DeepSeek Sub-Agent · Consult");
     assert.equal(legacyFollow?.title, "DeepSeek Sub-Agent · Follow");
     assert.equal(legacyPark?.title, "DeepSeek Sub-Agent · Park");
@@ -179,7 +207,7 @@ test("MCP handshake and tool listing complete without waiting for daemon startup
   await client.connect(clientTransport);
   try {
     const result = await client.listTools();
-    assert.equal(result.tools.length, 16);
+    assert.equal(result.tools.length, 18);
     assert.equal(starts, 0, "tool listing must not bootstrap the daemon");
     const first = client.callTool({ name: "deepseek_spawn", arguments: { topic: "test topic", task: "test task" } });
     const second = client.callTool({ name: "deepseek_consult", arguments: { agent_id: "agent_1" } });
@@ -1642,6 +1670,279 @@ test("MCP subagents_park and deepseek_park park turn, preserve pending obligatio
     assert.equal(dsStruct.armed, true);
     assert.equal(dsStruct.obligationState, "pending");
     assert.equal(dsStruct.nextRequiredAction, "deepseek_follow");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP subagents_spawn_batch and deepseek_spawn_batch validate schema, dispatch batch and return pending obligation", async () => {
+  let lastCall: { pathname: string; body: unknown } | null = null;
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      lastCall = { pathname, body };
+      if (pathname === "/v1/jobs/spawn-batch") {
+        return {
+          accepted: true,
+          batchId: "batch_42",
+          batchRequestId: "batch_req_42",
+          items: [
+            {
+              jobId: "job_b1",
+              agentId: "agent_b1",
+              requestId: "req_b1",
+              status: "accepted",
+            },
+            {
+              jobId: "job_b2",
+              agentId: "agent_b2",
+              requestId: "req_b2",
+              status: "queued",
+            },
+          ],
+        };
+      }
+      throw new Error("Unexpected pathname: " + pathname);
+    },
+  };
+  const server = createMcpServer(bridgeClient as unknown as BridgeHttpClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  try {
+    // 1. Canonical subagents_spawn_batch
+    const subRes = await client.callTool({
+      name: "subagents_spawn_batch",
+      arguments: {
+        batch_request_id: "batch_req_custom",
+        items: [
+          { topic: "Topic 1", task: "Task 1", priority: 80, exclusive_resources: ["res-a"] },
+          { topic: "Topic 2", task: "Task 2", priority: 40 },
+        ],
+      },
+    });
+    assert.equal(subRes.isError, undefined);
+    assert.equal(lastCall?.pathname, "/v1/jobs/spawn-batch");
+    const subText = (subRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(subText, /SubAgents MCP accepted batch batch_42 \(2 items\)/);
+    assert.match(subText, /Jobs: job_b1, job_b2/);
+    assert.match(subText, /Follow each job/);
+
+    const subStruct = subRes.structuredContent as Record<string, unknown>;
+    assert.equal(subStruct.accepted, true);
+    assert.equal(subStruct.batchId, "batch_42");
+    assert.equal(subStruct.batchRequestId, "batch_req_42");
+    assert.deepEqual(subStruct.jobIds, ["job_b1", "job_b2"]);
+    assert.equal(subStruct.obligationState, "pending");
+    assert.equal(subStruct.nextRequiredAction, "subagents_follow");
+
+    // 2. Migration alias deepseek_spawn_batch
+    const dsRes = await client.callTool({
+      name: "deepseek_spawn_batch",
+      arguments: {
+        batch_request_id: "batch_req_custom_2",
+        items: [
+          { topic: "Legacy 1", task: "Legacy task 1" },
+        ],
+      },
+    });
+    assert.equal(dsRes.isError, undefined);
+    const dsText = (dsRes.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+    assert.match(dsText, /DeepSeek Sub-Agent accepted batch batch_42/);
+    assert.match(dsText, /Follow each job/);
+
+    const dsStruct = dsRes.structuredContent as Record<string, unknown>;
+    assert.equal(dsStruct.accepted, true);
+    assert.equal(dsStruct.batchId, "batch_42");
+    assert.equal(dsStruct.obligationState, "pending");
+    assert.equal(dsStruct.nextRequiredAction, "deepseek_follow");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+async function freePort(): Promise<number> {
+  const probe = createServer();
+  return new Promise<number>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? (address as AddressInfo).port : 0;
+      probe.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+test("HTTP endpoint /v1/jobs/spawn-batch handles batch requests and returns accepted receipts", async () => {
+  let capturedInput: unknown = null;
+  const service = {
+    isReady: () => true,
+    status: () => ({ state: "ready", ready: true }),
+    spawnBatch: async (input: unknown) => {
+      capturedInput = input;
+      return {
+        accepted: true,
+        batchId: "http_batch_123",
+        batchRequestId: "req_http_b1",
+        items: [
+          {
+            jobId: "job_h1",
+            agentId: "agent_h1",
+            requestId: "r1",
+            status: "accepted",
+          },
+          {
+            jobId: "job_h2",
+            agentId: "agent_h2",
+            requestId: "r2",
+            status: "queued",
+          },
+        ],
+      };
+    },
+  } as unknown as BridgeService;
+
+  const port = await freePort();
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: port,
+    daemonToken: "test-token",
+    dataDir: "C:\\test-data",
+    configPath: "C:\\test-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  const client = new BridgeHttpClient(config);
+
+  try {
+    const res = await client.call("/v1/jobs/spawn-batch", {
+      batch_request_id: "req_http_b1",
+      items: [
+        { topic: "Topic 1", task: "Task 1", priority: 80, exclusive_resources: ["gpu"] },
+        { topic: "Topic 2", task: "Task 2", priority: 20 },
+      ],
+    });
+
+    assert.equal(res.accepted, true);
+    assert.equal(res.batchId, "http_batch_123");
+    assert.equal(res.batchRequestId, "req_http_b1");
+    assert.equal(Array.isArray(res.items), true);
+    assert.equal((res.items as unknown[]).length, 2);
+
+    const typedInput = capturedInput as { batchRequestId?: string; items: Array<{ priority?: number; exclusiveResources?: string[] }> };
+    assert.equal(typedInput.batchRequestId, "req_http_b1");
+    assert.equal(typedInput.items[0]?.priority, 80);
+    assert.deepEqual(typedInput.items[0]?.exclusiveResources, ["gpu"]);
+    assert.equal(typedInput.items[1]?.priority, 20);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("TranscriptAttestor attests each individual job inside items[] from batch spawn tools", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "ds-attest-batch-tools-"));
+  try {
+    const sessionsDir = path.join(tmpDir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+
+    const job1 = "job_batch_item_1";
+    const job2 = "job_batch_item_2";
+    const threadId = "22222222-3333-4444-8555-666666666666";
+    const turnId = "77777777-8888-4999-9aaa-bbbbbbbbbbbb";
+
+    const transcriptLines = [
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          thread_id: threadId,
+          turn_id: turnId,
+          item: {
+            id: "tool_batch_call_1",
+            type: "mcptoolcall",
+            status: "completed",
+            server: "subagents",
+            tool: "subagents_spawn_batch",
+            result: {
+              structuredContent: {
+                accepted: true,
+                batchId: "batch_mcp_attest",
+                items: [
+                  { jobId: job1, agentId: "agent_1", status: "accepted" },
+                  { jobId: job2, agentId: "agent_2", status: "queued" },
+                ],
+              },
+            },
+          },
+        },
+      }),
+    ];
+
+    await writeFile(path.join(sessionsDir, "transcript.jsonl"), transcriptLines.join("\n") + "\n");
+
+    const attestor = new TranscriptAttestor({ sessionsDir });
+    const match1 = await attestor.attestJob(job1);
+    assert.ok(match1, "Must attest job1 inside items[]");
+    assert.equal(match1.jobId, job1);
+    assert.equal(match1.threadId, threadId);
+    assert.equal(match1.turnId, turnId);
+
+    const match2 = await attestor.attestJob(job2);
+    assert.ok(match2, "Must attest job2 inside items[]");
+    assert.equal(match2.jobId, job2);
+    assert.equal(match2.threadId, threadId);
+    assert.equal(match2.turnId, turnId);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("MCP subagents_spawn_batch accepts mode=test and unary subagents_spawn accepts priority/exclusive_resources", async () => {
+  let lastCall: { pathname: string; body: unknown } | null = null;
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      lastCall = { pathname, body };
+      return { accepted: true, status: "accepted", topic: "Topic Unary Prio", agentId: "a1", jobId: "j1", batchId: "b1", items: [{ jobId: "j1", agentId: "a1", status: "accepted" }] };
+    },
+  };
+  const server = createMcpServer(bridgeClient as unknown as BridgeHttpClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  try {
+    // 1. Verify subagents_spawn_batch with mode="test":
+    const batchRes = await client.callTool({
+      name: "subagents_spawn_batch",
+      arguments: {
+        batch_request_id: "audit_batch_mode_test",
+        items: [
+          { topic: "Topic Test", task: "Task Test", mode: "test" },
+        ],
+      },
+    });
+    assert.equal(batchRes.isError, undefined, "subagents_spawn_batch must accept mode='test'");
+    assert.equal(lastCall?.pathname, "/v1/jobs/spawn-batch");
+
+    // 2. Verify subagents_spawn with priority and exclusive_resources:
+    const unaryRes = await client.callTool({
+      name: "subagents_spawn",
+      arguments: {
+        topic: "Topic Unary Prio",
+        task: "Task Unary Prio",
+        priority: 85,
+        exclusive_resources: ["gpu"],
+      },
+    });
+    assert.equal(unaryRes.isError, undefined, "subagents_spawn must accept priority and exclusive_resources");
+    assert.equal(lastCall?.pathname, "/v1/jobs/spawn");
+    const unaryBody = (lastCall?.body ?? {}) as Record<string, unknown>;
+    assert.equal(unaryBody.priority, 85);
+    assert.deepEqual(unaryBody.exclusive_resources, ["gpu"]);
   } finally {
     await client.close();
     await server.close();
