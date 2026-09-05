@@ -4,6 +4,7 @@ import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { detectTaskSessionOrigin, type TaskSessionOrigin } from "./session-origin.js";
 
 export interface CodexCliCandidate {
   executablePath: string;
@@ -811,6 +812,9 @@ export interface DefaultCodexCliTransportOptions {
   runner?: ProcessRunner | undefined;
   codexHome?: string | undefined;
   queueDbPath?: string | undefined;
+  sessionsDir?: string | undefined;
+  env?: Record<string, string | undefined> | undefined;
+  sessionOriginResolver?: ((threadId: string) => Promise<TaskSessionOrigin | null>) | undefined;
 }
 
 export class DefaultCodexCliTransport implements CodexCliTransport {
@@ -819,6 +823,11 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
   private readonly runner: ProcessRunner;
   private readonly codexHome: string | undefined;
   private readonly queueDbPath: string | undefined;
+  private readonly sessionsDir: string | undefined;
+  private readonly env: Record<string, string | undefined> | undefined;
+  private readonly sessionOriginResolver:
+    | ((threadId: string) => Promise<TaskSessionOrigin | null>)
+    | undefined;
 
   constructor(options: DefaultCodexCliTransportOptions = {}) {
     this.config = options.config;
@@ -826,6 +835,9 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
     this.runner = options.runner ?? defaultProcessRunner;
     this.codexHome = options.codexHome;
     this.queueDbPath = options.queueDbPath;
+    this.sessionsDir = options.sessionsDir;
+    this.env = options.env;
+    this.sessionOriginResolver = options.sessionOriginResolver;
   }
 
   async reconcileQueuedWake(
@@ -876,6 +888,22 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
       return { success: false, error: "No Codex CLI candidate executables found" };
     }
 
+    let isExecSession = false;
+    try {
+      const origin = this.sessionOriginResolver
+        ? await this.sessionOriginResolver(threadId)
+        : await detectTaskSessionOrigin(threadId, {
+            sessionsDir: this.sessionsDir,
+            codexHome: this.codexHome,
+            env: this.env,
+          });
+      if (origin?.isExec === true) {
+        isExecSession = true;
+      }
+    } catch {
+      isExecSession = false;
+    }
+
     const markerPayload = ensureLineTerminatedMarker(marker);
 
     const probed: CandidateCapabilities[] = [];
@@ -903,8 +931,10 @@ export class DefaultCodexCliTransport implements CodexCliTransport {
         continue;
       }
 
-      // For a queue-capable candidate, run queue first
-      if (queueSupported) {
+      // For a queue-capable candidate, run queue first EXCEPT for proven exec sessions
+      // Proven exec sessions must bypass queue and directly invoke existing exec resume
+      // Desktop or unknown origin preserves queue-first
+      if (queueSupported && !isExecSession) {
         const queueResult = await this.runner(
           candidate,
           ["queue", "--thread", threadId, "--message", marker],

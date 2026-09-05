@@ -1,34 +1,84 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { AGY_MAX_PROMPT_LENGTH, AGY_PRINT_TIMEOUT_UNLIMITED, buildAgyArgs, formatPrintTimeout } from "../../src/antigravity/args.js";
 import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { extractAgyJson, parseAgyOutput, parseAgyStatus } from "../../src/antigravity/parser.js";
-import { AntigravityProcessError, runAgy } from "../../src/antigravity/runner.js";
+import { AntigravityProcessError, runAgy, type AgyProcessResult, type SpawnLike } from "../../src/antigravity/runner.js";
 import { AntigravitySpool } from "../../src/antigravity/spool.js";
 import { AntigravitySupervisor } from "../../src/antigravity/supervisor.js";
-import type { AntigravityAttemptManifest } from "../../src/antigravity/types.js";
+import type { AntigravityAttemptManifest, AntigravityAttemptStatus } from "../../src/antigravity/types.js";
 import { writePrivateFile } from "../../src/security.js";
 import { InvalidRequestError } from "../../src/errors.js";
 
 const fixturePath = fileURLToPath(new URL("../fixtures/agy.cjs", import.meta.url));
 const fixtureArgs = buildAgyArgs("runner fixture task", {});
 
-function fixtureSpawn(behavior: string, calls: string[] = []) {
+function fixtureSpawn(behavior: string, calls: string[] = [], spawned: ChildProcess[] = []) {
   return (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv; shell: false; windowsHide: boolean; stdio: ReadonlyArray<"ignore" | "pipe"> }) => {
     calls.push(command);
-    return spawn(process.execPath, [fixturePath, ...args], {
+    const child = spawn(process.execPath, [fixturePath, ...args], {
       cwd: options.cwd,
       env: { ...process.env, ...(options.env ?? {}), AGY_FIXTURE: behavior },
       shell: false,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    spawned.push(child);
+    return child;
   };
+}
+
+async function killProcessTree(pid: number): Promise<void> {
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) => {
+      try {
+        const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+          shell: false,
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        killer.once("error", () => resolve());
+        killer.once("close", () => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  } else {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+}
+
+async function cleanupSupervisor(
+  controller: AbortController,
+  runPromise: Promise<any> | null,
+  tempDir?: string,
+  processes?: ChildProcess[],
+): Promise<void> {
+  controller.abort();
+  if (runPromise) {
+    await runPromise.catch(() => {});
+  }
+  if (processes) {
+    for (const child of processes) {
+      if (child.pid) {
+        try {
+          process.kill(child.pid, 0);
+          await killProcessTree(child.pid);
+        } catch {}
+      }
+    }
+  }
+  if (tempDir) {
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 }
 
 test("buildAgyArgs matches the smoke-observed contract with sentinel 2562047h47m16s by default", () => {
@@ -203,15 +253,21 @@ test("runAgy caps captured stdout at the configured byte limit", async () => {
 });
 
 test("runAgy kills a hanging run on timeout and rejects with kind timeout", async () => {
-  await assert.rejects(
-    () => runAgy(fixtureArgs, { command: "node", cwd: process.cwd(), timeoutMs: 100, spawnFn: fixtureSpawn("hang") }),
-    (error: unknown) => {
-      assert.ok(error instanceof AntigravityProcessError);
-      assert.equal(error.kind, "timeout");
-      assert.match(error.message, /100ms/);
-      return true;
-    },
-  );
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  try {
+    await assert.rejects(
+      () => runAgy(fixtureArgs, { command: "node", cwd: process.cwd(), timeoutMs: 100, signal: controller.signal, spawnFn: fixtureSpawn("hang", [], spawnedProcesses) }),
+      (error: unknown) => {
+        assert.ok(error instanceof AntigravityProcessError);
+        assert.equal(error.kind, "timeout");
+        assert.match(error.message, /100ms/);
+        return true;
+      },
+    );
+  } finally {
+    await cleanupSupervisor(controller, null, undefined, spawnedProcesses);
+  }
 });
 
 test("runAgy rejects with kind aborted when the caller cancels mid-run", async () => {
@@ -360,11 +416,17 @@ test("AntigravityAdapter never falls back: exactly one spawn on error, timeout a
   assert.equal(failCalls.length, 1);
 
   const hangCalls: string[] = [];
-  const hangAdapter = new AntigravityAdapter({ command: "node", timeoutMs: 100, spawnFn: fixtureSpawn("hang", hangCalls) });
-  await assert.rejects(
-    () => hangAdapter.runPrompt({ prompt: "hang", cwd: process.cwd() }),
-    (error: unknown) => error instanceof AntigravityProcessError && error.kind === "timeout",
-  );
+  const hangProcesses: ChildProcess[] = [];
+  const hangController = new AbortController();
+  const hangAdapter = new AntigravityAdapter({ command: "node", timeoutMs: 100, spawnFn: fixtureSpawn("hang", hangCalls, hangProcesses) });
+  try {
+    await assert.rejects(
+      () => hangAdapter.runPrompt({ prompt: "hang", cwd: process.cwd(), signal: hangController.signal }),
+      (error: unknown) => error instanceof AntigravityProcessError && error.kind === "timeout",
+    );
+  } finally {
+    await cleanupSupervisor(hangController, null, undefined, hangProcesses);
+  }
   assert.equal(hangCalls.length, 1);
 
   const slowCalls: string[] = [];
@@ -493,55 +555,69 @@ test("buildAgyArgs refutes omission and represents null/undefined timeout as sen
 
 test("runAgy in unlimited mode stays alive beyond short deadline until explicit abort", async () => {
   const controller = new AbortController();
-  const spawnedPids: number[] = [];
+  const spawnedProcesses: ChildProcess[] = [];
   const start = Date.now();
+  let runPromise: Promise<AgyProcessResult> | null = null;
+  try {
+    runPromise = runAgy(fixtureArgs, {
+      command: "node",
+      cwd: process.cwd(),
+      // No timeoutMs specified (unlimited mode default)
+      signal: controller.signal,
+      spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
+    });
 
-  const runPromise = runAgy(fixtureArgs, {
-    command: "node",
-    cwd: process.cwd(),
-    // No timeoutMs specified (unlimited mode default)
-    signal: controller.signal,
-    spawnFn: fixtureSpawn("hang"),
-  });
+    // Wait 150ms — which is beyond a typical short deadline (e.g. 50ms-100ms)
+    await new Promise((r) => setTimeout(r, 150));
 
-  // Wait 150ms — which is beyond a typical short deadline (e.g. 50ms-100ms)
-  await new Promise((r) => setTimeout(r, 150));
+    // The runner must still be alive!
+    controller.abort();
 
-  // The runner must still be alive!
-  controller.abort();
+    await assert.rejects(
+      runPromise,
+      (error: unknown) => {
+        assert.ok(error instanceof AntigravityProcessError);
+        assert.equal(error.kind, "aborted");
+        return true;
+      },
+    );
 
-  await assert.rejects(
-    runPromise,
-    (error: unknown) => {
-      assert.ok(error instanceof AntigravityProcessError);
-      assert.equal(error.kind, "aborted");
-      return true;
-    },
-  );
-
-  const elapsed = Date.now() - start;
-  assert.ok(elapsed >= 140, "Runner must have stayed alive until aborted, elapsed: " + elapsed + "ms");
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed >= 140, "Runner must have stayed alive until aborted, elapsed: " + elapsed + "ms");
+  } finally {
+    await cleanupSupervisor(controller, runPromise, undefined, spawnedProcesses);
+  }
 });
 
 test("runAgy preserves opt-in positive timeout", async () => {
-  await assert.rejects(
-    () => runAgy(fixtureArgs, {
-      command: "node",
-      cwd: process.cwd(),
-      timeoutMs: 80,
-      spawnFn: fixtureSpawn("hang"),
-    }),
-    (error: unknown) => {
-      assert.ok(error instanceof AntigravityProcessError);
-      assert.equal(error.kind, "timeout");
-      assert.match(error.message, /80ms/);
-      return true;
-    },
-  );
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  try {
+    await assert.rejects(
+      () => runAgy(fixtureArgs, {
+        command: "node",
+        cwd: process.cwd(),
+        timeoutMs: 80,
+        signal: controller.signal,
+        spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof AntigravityProcessError);
+        assert.equal(error.kind, "timeout");
+        assert.match(error.message, /80ms/);
+        return true;
+      },
+    );
+  } finally {
+    await cleanupSupervisor(controller, null, undefined, spawnedProcesses);
+  }
 });
 
 test("AntigravitySupervisor runs unlimited by default and stays alive beyond short deadline until cancel signal", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-supervisor-unlimited-"));
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  let runPromise: Promise<AntigravityAttemptStatus> | null = null;
   try {
     const spool = new AntigravitySpool(tempDir);
     const attempt = await spool.createAttempt({
@@ -562,10 +638,11 @@ test("AntigravitySupervisor runs unlimited by default and stays alive beyond sho
     const supervisor = new AntigravitySupervisor({
       spoolDir: attempt.attemptDir,
       manifest: attempt,
-      spawnFn: fixtureSpawn("hang"),
+      signal: controller.signal,
+      spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
     });
 
-    const runPromise = supervisor.run();
+    runPromise = supervisor.run();
 
     // Wait 150ms beyond a short deadline
     await new Promise((r) => setTimeout(r, 150));
@@ -577,12 +654,15 @@ test("AntigravitySupervisor runs unlimited by default and stays alive beyond sho
     assert.equal(status.status, "aborted");
     assert.match(status.error ?? "", /signal file|cancelled/);
   } finally {
-    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await cleanupSupervisor(controller, runPromise, tempDir, spawnedProcesses);
   }
 });
 
 test("AntigravitySupervisor preserves opt-in positive timeout", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-supervisor-optin-"));
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  let runPromise: Promise<AntigravityAttemptStatus> | null = null;
   try {
     const spool = new AntigravitySpool(tempDir);
     const attempt = await spool.createAttempt({
@@ -603,14 +683,16 @@ test("AntigravitySupervisor preserves opt-in positive timeout", async () => {
     const supervisor = new AntigravitySupervisor({
       spoolDir: attempt.attemptDir,
       manifest: attempt,
-      spawnFn: fixtureSpawn("hang"),
+      signal: controller.signal,
+      spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
     });
 
-    const status = await supervisor.run();
+    runPromise = supervisor.run();
+    const status = await runPromise;
     assert.equal(status.status, "timed_out");
     assert.match(status.error ?? "", /80ms.*terminated/);
   } finally {
-    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await cleanupSupervisor(controller, runPromise, tempDir, spawnedProcesses);
   }
 });
 
@@ -725,6 +807,9 @@ test("AntigravityAdapter runs unlimited by default through durable spool with no
 
 test("Heartbeat updates and lease reconciliation function normally during unlimited execution without clock kills", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-heartbeat-liveness-"));
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  let runPromise: Promise<AntigravityAttemptStatus> | null = null;
   try {
     const spool = new AntigravitySpool(tempDir);
     const attempt = await spool.createAttempt({
@@ -741,20 +826,37 @@ test("Heartbeat updates and lease reconciliation function normally during unlimi
     });
 
     const heartbeats: number[] = [];
+    let notifyHeartbeat: (() => void) | null = null;
     const supervisor = new AntigravitySupervisor({
       spoolDir: attempt.attemptDir,
       manifest: attempt,
       heartbeatIntervalMs: 50,
-      spawnFn: fixtureSpawn("hang"),
+      signal: controller.signal,
+      spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
       onHeartbeat: (hb) => {
         heartbeats.push(hb.updatedAt);
+        notifyHeartbeat?.();
       },
     });
 
-    const runPromise = supervisor.run();
+    runPromise = supervisor.run();
 
-    // Wait 160ms for multiple heartbeats to fire
-    await new Promise((r) => setTimeout(r, 160));
+    // Event/condition driven wait with test-only load limit instead of fragile sleep
+    await new Promise<void>((resolve, reject) => {
+      if (heartbeats.length >= 2) return resolve();
+      const timer = setTimeout(() => {
+        notifyHeartbeat = null;
+        reject(new Error(`Timed out waiting for heartbeats under load (got ${heartbeats.length})`));
+      }, 5000);
+      timer.unref?.();
+      notifyHeartbeat = () => {
+        if (heartbeats.length >= 2) {
+          clearTimeout(timer);
+          notifyHeartbeat = null;
+          resolve();
+        }
+      };
+    });
 
     assert.ok(heartbeats.length >= 2, "Heartbeats must continue firing periodically without clock kill");
 
@@ -768,7 +870,7 @@ test("Heartbeat updates and lease reconciliation function normally during unlimi
     const status = await runPromise;
     assert.equal(status.status, "aborted");
   } finally {
-    await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await cleanupSupervisor(controller, runPromise, tempDir, spawnedProcesses);
   }
 });
 
@@ -823,6 +925,7 @@ test("authoritative binary smoke confirms --print-timeout 2562047h47m16s respond
 
 test("unlimited run leaves no lingering handles or timers in runner or supervisor", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-handles-"));
+  const supervisorController = new AbortController();
   try {
     // 1. Runner in unlimited mode
     const runnerController = new AbortController();
@@ -849,7 +952,6 @@ test("unlimited run leaves no lingering handles or timers in runner or superviso
     });
     assert.equal(attempt.timeoutMs, null);
 
-    const supervisorController = new AbortController();
     const supervisor = new AntigravitySupervisor({
       spoolDir: attempt.attemptDir,
       manifest: attempt,
@@ -866,6 +968,111 @@ test("unlimited run leaves no lingering handles or timers in runner or superviso
     assert.equal((supervisor as any).timeoutTimer, null);
     assert.equal((supervisor as any).abortHandler, null);
   } finally {
+    supervisorController.abort();
     await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
+});
+
+test("TDD: unconditional cleanup in finally kills hanging worker and clears handles on forced failure before cancel", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "agy-tdd-leak-proof-"));
+  const controller = new AbortController();
+  const spawnedProcesses: ChildProcess[] = [];
+  let runPromise: Promise<AntigravityAttemptStatus> | null = null;
+  let supervisorInstance: AntigravitySupervisor | null = null;
+  let forcedErrorCaught = false;
+
+  try {
+    const spool = new AntigravitySpool(tempDir);
+    const attempt = await spool.createAttempt({
+      agentId: "agent_tdd",
+      jobId: "job_tdd",
+      requestId: "req_tdd",
+      prompt: "Forced failure before cancel",
+      cwd: tempDir,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      fence: 100,
+    });
+
+    let onHeartbeatNotify: (() => void) | null = null;
+    supervisorInstance = new AntigravitySupervisor({
+      spoolDir: attempt.attemptDir,
+      manifest: attempt,
+      heartbeatIntervalMs: 50,
+      signal: controller.signal,
+      spawnFn: fixtureSpawn("hang", [], spawnedProcesses),
+      onHeartbeat: () => {
+        onHeartbeatNotify?.();
+      },
+    });
+
+    runPromise = supervisorInstance.run();
+
+    // Wait until child process has actually spawned and is running
+    await new Promise<void>((resolve, reject) => {
+      if (spawnedProcesses.length >= 1 && spawnedProcesses[0]?.pid) return resolve();
+      const timer = setTimeout(() => reject(new Error("Worker failed to spawn within 5000ms")), 5000);
+      timer.unref?.();
+      onHeartbeatNotify = () => {
+        if (spawnedProcesses.length >= 1 && spawnedProcesses[0]?.pid) {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+    });
+
+    const child = spawnedProcesses[0]!;
+    const childPid = child.pid!;
+    assert.ok(childPid > 0, "Spawned child must have a valid PID");
+
+    // Verify child is alive initially in OS
+    assert.doesNotThrow(() => process.kill(childPid, 0), "Child worker must be running in OS before forced failure");
+
+    // Force an assertion failure simulating test failure / load timeout BEFORE cancel signal is written
+    try {
+      assert.fail("Forced assertion failure before cancel signal");
+      // Any lines below are unreachable
+      await spool.writeCancelSignal(attempt.attemptId, "unreachable cancel");
+    } catch (err) {
+      forcedErrorCaught = true;
+      throw err; // rethrow so finally block is exercised on failure path
+    }
+  } catch (err: any) {
+    assert.equal(err.message, "Forced assertion failure before cancel signal");
+  } finally {
+    // Unconditional cleanup in finally ANTES rm
+    await cleanupSupervisor(controller, runPromise, tempDir, spawnedProcesses);
+  }
+
+  // 1. Proved that the error was caught on the failure path
+  assert.equal(forcedErrorCaught, true, "Forced failure must occur before cancel");
+
+  // 2. Proved zero lingering PIDs (child process is dead in OS)
+  const child = spawnedProcesses[0]!;
+  const childPid = child.pid!;
+  const deadline = Date.now() + 3000;
+  let pidAlive = true;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(childPid, 0);
+      await new Promise((r) => setTimeout(r, 50));
+    } catch {
+      pidAlive = false;
+      break;
+    }
+  }
+  assert.equal(pidAlive, false, `Worker PID ${childPid} must be terminated in OS despite failure before cancel`);
+
+  // 3. Proved zero lingering supervisor handles/timers
+  assert.ok(supervisorInstance);
+  assert.equal((supervisorInstance as any).heartbeatTimer, null, "heartbeatTimer must be cleared");
+  assert.equal((supervisorInstance as any).cancelWatcherTimer, null, "cancelWatcherTimer must be cleared");
+  assert.equal((supervisorInstance as any).timeoutTimer, null, "timeoutTimer must be cleared");
+  assert.equal((supervisorInstance as any).abortHandler, null, "abortHandler must be removed");
+  assert.equal((supervisorInstance as any).settled, true, "supervisor must be settled");
+
+  // 4. Proved tempDir was successfully removed without file lock / EPERM issues
+  assert.equal(existsSync(tempDir), false, "tempDir must be completely removed without handle locks");
 });

@@ -219,7 +219,7 @@ test("GATE-3: real transcript attestation binds unattached job from Codex sessio
 
   const sessionFile = path.join(sessionsDir, "rollout-session-test.jsonl");
   const hostEventMsg = {
-    timestamp: "2026-09-04T15:48:33.156Z",
+    timestamp: new Date().toISOString(),
     type: "event_msg",
     payload: {
       type: "item_completed",
@@ -919,7 +919,7 @@ test("GATE-12: transcript attestation ignores partial EOF and extracts valid pre
 
   const sessionFile = path.join(sessionsDir, "rollout-eof.jsonl");
   const validEvent = {
-    timestamp: "2026-09-04T15:48:33.156Z",
+    timestamp: new Date().toISOString(),
     type: "event_msg",
     payload: {
       type: "item_completed",

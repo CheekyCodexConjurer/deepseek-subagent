@@ -73,6 +73,10 @@ export const CANONICAL_SPAWN_TOOLS = ["subagents_spawn", "subagents_continue"] a
 export const TRANSITION_SPAWN_TOOLS = ["deepseek_spawn", "deepseek_continue"] as const;
 export const ACCEPTED_SPAWN_TOOLS = new Set<string>([...CANONICAL_SPAWN_TOOLS, ...TRANSITION_SPAWN_TOOLS]);
 
+export const CANONICAL_BATCH_SPAWN_TOOLS = ["subagents_spawn_batch"] as const;
+export const TRANSITION_BATCH_SPAWN_TOOLS = ["deepseek_spawn_batch"] as const;
+export const ACCEPTED_BATCH_SPAWN_TOOLS = new Set<string>([...CANONICAL_BATCH_SPAWN_TOOLS, ...TRANSITION_BATCH_SPAWN_TOOLS]);
+
 export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
   readonly available = true;
   readonly reason = null;
@@ -81,6 +85,7 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
   private readonly correlationListeners = new Set<(correlation: CodexCorrelation) => void>();
   private readonly correlations = new Map<string, CodexCorrelation>();
   private readonly itemCorrelations = new Map<string, CodexCorrelation>();
+  private readonly itemRecords = new Map<string, { threadId: string; turnId: string; isBatch: boolean; batchId: string | null; jobIds: Set<string> }>();
   private readonly turnWaiters = new Set<TurnWaiter>();
   private unsubscribe: (() => void) | null = null;
   private started = false;
@@ -128,6 +133,7 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     await this.rpc.close();
     this.correlations.clear();
     this.itemCorrelations.clear();
+    this.itemRecords.clear();
     this.started = false;
   }
 
@@ -274,37 +280,203 @@ export class CodexAppServerDeliveryAdapter implements CodexDeliveryAdapter {
     if (notification.method !== "item/completed") return;
     const params = asRecord(notification.params);
     const item = asRecord(params.item);
-    if (item.type !== "mcpToolCall") return;
-    if (item.status !== "completed") return;
+    const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
+    if (itemType !== "mcptoolcall") return;
+    const itemStatus = typeof item.status === "string" ? item.status.toLowerCase() : "";
+    if (itemStatus !== "completed") return;
     const tool = typeof item.tool === "string" ? item.tool : "";
-    if (!ACCEPTED_SPAWN_TOOLS.has(tool)) return;
-    const server = typeof item.server === "string" ? item.server : "";
+    const isUnary = ACCEPTED_SPAWN_TOOLS.has(tool);
+    const isBatch = ACCEPTED_BATCH_SPAWN_TOOLS.has(tool);
+    if (!isUnary && !isBatch) return;
+    const server = typeof item.server === "string" ? item.server.toLowerCase() : "";
     if (!ACCEPTED_SERVER_NAMES.has(server)) return;
-    const result = asRecord(item.result);
-    const structuredContent = asRecord(result.structuredContent);
-    if (structuredContent.accepted !== true || structuredContent.status !== "accepted") return;
-    const jobId = asString(structuredContent.jobId);
-    if (!jobId) return;
+
     const threadId = asString(params.threadId);
     if (!threadId) return;
     const turnId = asString(params.turnId);
     if (!turnId) return;
     const itemId = asString(item.id);
     if (!itemId) return;
-    const correlation = { jobId, threadId, turnId, itemId };
-    const previousItem = this.itemCorrelations.get(itemId);
+
+    const result = asRecord(item.result);
+    const structuredContent = asRecord(result.structuredContent);
+    const metaTechnical = asRecord(asRecord(result._meta).technical);
+
+    const hasStructured = Object.keys(structuredContent).length > 0;
+    const hasMeta = Object.keys(metaTechnical).length > 0;
+    if (!hasStructured && !hasMeta) return;
+
+    // Fail-closed: reject if either source explicitly signals rejection
+    if (
+      isExplicitlyRejected(structuredContent.status, structuredContent.accepted) ||
+      isExplicitlyRejected(metaTechnical.status, metaTechnical.accepted)
+    ) {
+      return;
+    }
+
+    // Fail-closed: reject contradictory accepted booleans between sources
+    if (
+      typeof structuredContent.accepted === "boolean" &&
+      typeof metaTechnical.accepted === "boolean" &&
+      structuredContent.accepted !== metaTechnical.accepted
+    ) {
+      return;
+    }
+
+    const jobIds: string[] = [];
+    let batchId: string | null = null;
+
+    if (isUnary) {
+      const scAccepted = structuredContent.accepted === true &&
+        (typeof structuredContent.status === "string" ? structuredContent.status.toLowerCase() === "accepted" : false);
+      const metaAccepted = metaTechnical.accepted === true &&
+        (typeof metaTechnical.status === "string" ? metaTechnical.status.toLowerCase() === "accepted" : metaTechnical.status === undefined);
+
+      if (!scAccepted && !metaAccepted) return;
+
+      const scJobId = asString(structuredContent.jobId);
+      const metaJobId = asString(metaTechnical.jobId);
+
+      // Contradictory identity between sources
+      if (scJobId && metaJobId && scJobId !== metaJobId) return;
+
+      // Identity must come only from an accepted source, never mixing identity from a rejected/unaccepted source
+      const jobId = scAccepted ? (scJobId ?? (metaAccepted ? metaJobId : null)) : (metaAccepted ? metaJobId : null);
+      if (!jobId) return;
+      jobIds.push(jobId);
+    } else if (isBatch) {
+      const scBatchAccepted = structuredContent.accepted === true;
+      const metaBatchAccepted = metaTechnical.accepted === true;
+      if (!scBatchAccepted && !metaBatchAccepted) return;
+
+      const scBatchId = asString(structuredContent.batchId) ?? asString(structuredContent.batch_id);
+      const metaBatchId = asString(metaTechnical.batchId) ?? asString(metaTechnical.batch_id);
+      if (scBatchId && metaBatchId && scBatchId !== metaBatchId) return;
+      batchId = scBatchId ?? metaBatchId ?? null;
+
+      const hasScItems = Array.isArray(structuredContent.items);
+      const hasMetaItems = Array.isArray(metaTechnical.items);
+      const hasItems = hasScItems || hasMetaItems;
+
+      if (hasItems) {
+        const scMap = parseBatchItemsMap(structuredContent.items);
+        const metaMap = parseBatchItemsMap(metaTechnical.items);
+
+        // Check cross-source consistency when both provide items
+        if (scMap && metaMap) {
+          if (scMap.size !== metaMap.size) return;
+          for (const [id, scItem] of scMap) {
+            const metaItem = metaMap.get(id);
+            if (!metaItem) return;
+            const scRej = isExplicitlyRejected(scItem.status, scItem.accepted);
+            const metaRej = isExplicitlyRejected(metaItem.status, metaItem.accepted);
+            if (scRej !== metaRej) return;
+            if (scItem.accepted !== undefined && metaItem.accepted !== undefined && scItem.accepted !== metaItem.accepted) {
+              return;
+            }
+            if (scItem.status !== undefined && metaItem.status !== undefined && scItem.status.toLowerCase() !== metaItem.status.toLowerCase()) {
+              return;
+            }
+          }
+        }
+
+        const combinedMap = scMap ?? metaMap ?? new Map<string, RawBatchItem>();
+        if (scMap && metaMap) {
+          for (const [id, item] of metaMap) {
+            if (!combinedMap.has(id)) {
+              combinedMap.set(id, item);
+            }
+          }
+        }
+
+        for (const [id, itemRec] of combinedMap) {
+          if (isExplicitlyRejected(itemRec.status, itemRec.accepted)) {
+            continue;
+          }
+          const normStatus = typeof itemRec.status === "string" ? itemRec.status.toLowerCase() : undefined;
+          const isAccepted = itemRec.accepted === true || normStatus === "accepted" || normStatus === "queued" ||
+            (itemRec.accepted === undefined && normStatus === undefined);
+          if (isAccepted && !jobIds.includes(id)) {
+            jobIds.push(id);
+          }
+        }
+
+        // When items are present, do NOT fall back to raw jobIds arrays!
+        if (jobIds.length === 0) return;
+      } else {
+        // Fallback to jobIds arrays ONLY when no items array was provided
+        const scJobIdArr = extractStringArray(structuredContent.jobIds) ?? extractStringArray(structuredContent.job_ids);
+        const metaJobIdArr = extractStringArray(metaTechnical.jobIds) ?? extractStringArray(metaTechnical.job_ids);
+
+        if (scJobIdArr && metaJobIdArr) {
+          if (scJobIdArr.length !== metaJobIdArr.length || !scJobIdArr.every((id, idx) => id === metaJobIdArr[idx])) {
+            return;
+          }
+        }
+
+        const sourceArr = scJobIdArr ?? metaJobIdArr ?? [];
+        for (const id of sourceArr) {
+          if (!jobIds.includes(id)) {
+            jobIds.push(id);
+          }
+        }
+        if (jobIds.length === 0) return;
+      }
+    }
+
+    const previousItem = this.itemRecords.get(itemId);
     if (previousItem) {
-      if (!sameCorrelation(previousItem, correlation)) return;
+      if (previousItem.threadId !== threadId || previousItem.turnId !== turnId) {
+        return;
+      }
+      if (previousItem.isBatch !== isBatch) {
+        return;
+      }
+      if (previousItem.batchId !== batchId) {
+        return;
+      }
+      if (previousItem.jobIds.size !== jobIds.length) {
+        return;
+      }
+      for (const id of jobIds) {
+        if (!previousItem.jobIds.has(id)) {
+          return;
+        }
+      }
+      // Exact replay of already accepted immutable set: reject duplicate emission
       return;
     }
-    const previous = this.correlations.get(jobId);
-    if (previous) {
-      if (!sameCorrelation(previous, correlation)) return;
-      return;
+
+    for (const jobId of jobIds) {
+      const candidate: CodexCorrelation = { jobId, threadId, turnId, itemId };
+      const previousJob = this.correlations.get(jobId);
+      if (previousJob && !sameCorrelation(previousJob, candidate)) {
+        return;
+      }
     }
-    this.correlations.set(jobId, correlation);
-    this.itemCorrelations.set(itemId, correlation);
-    for (const listener of this.correlationListeners) listener(correlation);
+
+    const itemRec = {
+      threadId,
+      turnId,
+      isBatch,
+      batchId,
+      jobIds: new Set<string>(jobIds),
+    };
+    this.itemRecords.set(itemId, itemRec);
+
+    const toEmit: CodexCorrelation[] = [];
+    for (const jobId of jobIds) {
+      const correlation: CodexCorrelation = { jobId, threadId, turnId, itemId };
+      this.correlations.set(jobId, correlation);
+      this.itemCorrelations.set(itemId, correlation);
+      toEmit.push(correlation);
+    }
+
+    for (const correlation of toEmit) {
+      for (const listener of this.correlationListeners) {
+        listener(correlation);
+      }
+    }
   }
 
   private async waitForTurnCompletion(threadId: string, turnId: string): Promise<void> {
@@ -385,4 +557,54 @@ function isTurnCompletionNotification(method: string): boolean {
   const normalized = method.toLowerCase();
   return normalized.startsWith("turn/") &&
     ["completed", "ended", "finished", "aborted", "failed"].some((suffix) => normalized.endsWith("/" + suffix));
+}
+
+interface RawBatchItem {
+  jobId: string;
+  accepted?: boolean | undefined;
+  status?: string | undefined;
+}
+
+function parseBatchItemsMap(arr: unknown): Map<string, RawBatchItem> | null {
+  if (!Array.isArray(arr)) return null;
+  const map = new Map<string, RawBatchItem>();
+  for (const it of arr) {
+    if (it && typeof it === "object") {
+      const rec = it as Record<string, unknown>;
+      const id = asString(rec.jobId) ?? asString(rec.job_id);
+      if (!id) continue;
+      map.set(id, {
+        jobId: id,
+        accepted: typeof rec.accepted === "boolean" ? rec.accepted : undefined,
+        status: typeof rec.status === "string" ? rec.status : undefined,
+      });
+    } else if (typeof it === "string") {
+      const id = asString(it);
+      if (id) {
+        map.set(id, { jobId: id });
+      }
+    }
+  }
+  return map;
+}
+
+function extractStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const result: string[] = [];
+  for (const raw of value) {
+    const id = asString(raw);
+    if (id && !result.includes(id)) {
+      result.push(id);
+    }
+  }
+  return result;
+}
+
+function isExplicitlyRejected(status: unknown, accepted: unknown): boolean {
+  if (accepted === false) return true;
+  if (typeof status === "string") {
+    const s = status.toLowerCase();
+    if (s === "rejected" || s === "failed" || s === "error") return true;
+  }
+  return false;
 }
