@@ -12,6 +12,7 @@ export interface AntigravityRunResult {
   status: AntigravityResultStatus;
   runId: string | null;
   summary: string;
+  fullText?: string;
   files: string[];
   tests: string[];
   risks: string[];
@@ -85,6 +86,7 @@ export interface AntigravityAttemptStatus {
   status: AntigravityResultStatus;
   exitCode: number | null;
   summary: string;
+  fullText?: string;
   runId: string | null;
   files: string[];
   tests: string[];

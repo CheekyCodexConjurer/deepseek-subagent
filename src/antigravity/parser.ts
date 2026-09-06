@@ -8,6 +8,7 @@ export interface ParsedAgyOutput {
   hasJson: boolean;
   runId: string | null;
   summary: string;
+  fullText: string;
   files: string[];
   tests: string[];
   risks: string[];
@@ -54,6 +55,66 @@ function firstStringList(record: Record<string, unknown>, keys: string[]): strin
   return [];
 }
 
+const CANDIDATE_MACHINE_KEY_REGEX =
+  /"(?:status|state|runId|run_id|taskId|task_id|sessionId|session_id|executionId|attemptId|attempt_id|reasoning|thought|thoughts|thinking|internal|diffSummary|diff_summary)"\s*:/i;
+
+const PROTOCOL_ENVELOPE_KEYS = new Set([
+  "status",
+  "state",
+  "result",
+  "runId",
+  "run_id",
+  "taskId",
+  "task_id",
+  "sessionId",
+  "session_id",
+  "executionId",
+  "attemptId",
+  "attempt_id",
+  "exitCode",
+  "exit_code",
+  "summary",
+  "output",
+  "description",
+  "message",
+  "fullText",
+  "full_text",
+  "rawAssistantText",
+  "raw_assistant_text",
+  "files",
+  "changedFiles",
+  "changed_files",
+  "tests",
+  "testResults",
+  "test_results",
+  "risks",
+  "warnings",
+  "diffSummary",
+  "diff_summary",
+  "diff",
+  "evidence",
+  "evidenceBundle",
+  "evidence_bundle",
+  "earlyExit",
+  "early_exit",
+  "escalation",
+  "escalationProposal",
+  "escalation_proposal",
+  "reasoning",
+  "thought",
+  "thoughts",
+  "thinking",
+  "internal",
+  "hidden",
+]);
+
+function isProtocolEnvelopeObject(obj: Record<string, unknown>): boolean {
+  for (const key of Object.keys(obj)) {
+    if (PROTOCOL_ENVELOPE_KEYS.has(key)) return true;
+  }
+  return false;
+}
+
 /**
  * Extracts a protocol JSON payload from agy output: only when the output is
  * an intentional envelope (the entire stdout parses as JSON, the entire stdout
@@ -83,7 +144,9 @@ export function extractAgyJson(stdout: string): Record<string, unknown> | null {
     try {
       const value: unknown = JSON.parse(wholeFenced[1].trim());
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        return value as Record<string, unknown>;
+        if (isProtocolEnvelopeObject(value as Record<string, unknown>)) {
+          return value as Record<string, unknown>;
+        }
       }
     } catch {
       // Try the next candidate shape.
@@ -94,7 +157,9 @@ export function extractAgyJson(stdout: string): Record<string, unknown> | null {
     try {
       const value: unknown = JSON.parse(trimmed);
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        return value as Record<string, unknown>;
+        if (isProtocolEnvelopeObject(value as Record<string, unknown>)) {
+          return value as Record<string, unknown>;
+        }
       }
     } catch {
       // Not valid JSON.
@@ -194,6 +259,30 @@ function parseAgyEvidence(json: Record<string, unknown> | null, stdout: string):
   return parseEvidence(stdout);
 }
 
+function isAmbiguousMachineEnvelope(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/^[ \t]*AGY_JSON:[ \t]*/m.test(trimmed)) return true;
+  const isCandidateShape = trimmed.startsWith("{") || /^```(?:json)?\s*\r?\n\s*\{/i.test(trimmed);
+  if (isCandidateShape && CANDIDATE_MACHINE_KEY_REGEX.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+function extractRecognizedVisibleText(json: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = json[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      if (key === "result" && parseAgyStatus(value) !== null) {
+        continue;
+      }
+      return value;
+    }
+  }
+  return null;
+}
+
 export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput {
   const json = extractAgyJson(stdout);
   const earlyExit = parseAgyEarlyExit(json, stdout);
@@ -203,11 +292,31 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     // Plain-text contract observed in the smoke: `--print-timeout` prints the
     // model response text and the CLI exits 0. There is no machine-readable
     // status in this mode.
+    const rawText = stdout.trim() || stderr.trim();
+    if (isAmbiguousMachineEnvelope(rawText)) {
+      // Malformed or ambiguous machine data: fail closed rather than exposing raw contents
+      return {
+        status: null,
+        hasJson: false,
+        runId: null,
+        summary: "",
+        fullText: "",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        ...(evidence ? { evidence } : {}),
+        ...(earlyExit ? { earlyExit } : {}),
+        ...(escalation ? { escalation } : {}),
+      };
+    }
+    const redacted = redactSecrets(rawText);
     return {
       status: null,
       hasJson: false,
       runId: null,
-      summary: truncate(redactSecrets(stdout.trim() || stderr.trim()), 4_000),
+      summary: truncate(redacted, 4_000),
+      fullText: truncate(redacted, 2_000_000),
       files: [],
       tests: [],
       risks: [],
@@ -219,17 +328,34 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
   }
   const rawStatus = firstString(json, ["status", "state", "result"]);
   const rawRunId = firstString(json, ["runId", "run_id", "taskId", "task_id", "sessionId", "session_id", "executionId"]);
-  const rawSummary = firstString(json, ["summary", "result", "output", "description", "message"]) ?? stdout.trim();
+  // Known machine envelope: extract ONLY recognized visible response fields.
+  // Never fall back to raw JSON/stdout when recognized response is absent.
+  const recognizedSummary = extractRecognizedVisibleText(json, ["summary", "output", "description", "message", "result"]) ?? "";
+  const recognizedFullText = extractRecognizedVisibleText(json, [
+    "fullText",
+    "full_text",
+    "rawAssistantText",
+    "raw_assistant_text",
+    "output",
+    "description",
+    "message",
+    "summary",
+    "result",
+  ]) ?? recognizedSummary;
   const rawFiles = firstStringList(json, ["files", "changedFiles", "changed_files"]);
   const rawTests = firstStringList(json, ["tests", "testResults", "test_results"]);
   const rawRisks = firstStringList(json, ["risks", "warnings"]);
   const rawDiff = firstString(json, ["diffSummary", "diff_summary", "diff"]) ?? "";
 
+  const redactedSummary = redactSecrets(recognizedSummary);
+  const redactedFullText = redactSecrets(recognizedFullText);
+
   return {
     status: parseAgyStatus(rawStatus),
     hasJson: true,
     runId: rawRunId ? truncate(redactSecrets(rawRunId), 200) : null,
-    summary: truncate(redactSecrets(rawSummary), 4_000),
+    summary: truncate(redactedSummary, 4_000),
+    fullText: truncate(redactedFullText, 2_000_000),
     files: rawFiles.slice(0, 100).map((f) => truncate(redactSecrets(f), 500)),
     tests: rawTests.slice(0, 100).map((t) => truncate(redactSecrets(t), 1_000)),
     risks: rawRisks.slice(0, 100).map((r) => truncate(redactSecrets(r), 1_000)),

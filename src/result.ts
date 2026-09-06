@@ -220,18 +220,96 @@ export async function persistAntigravityResult(
       return safe ? { escalation: safe } : {};
     })() : {}),
   };
+  const rawAssistantText = truncate(redactSecrets(extractAntigravityText(result)), maxLength);
   await mkdir(path.dirname(resultPath), { recursive: true });
   await writePrivateFile(
     resultPath,
     JSON.stringify({
       envelope,
-      rawAssistantText: truncate(redactSecrets(result.summary), maxLength),
+      rawAssistantText,
       messages: [],
       diff: { source: "antigravity", runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200) },
       savedAt: new Date().toISOString(),
     }, null, 2) + "\n",
   );
   return { envelope, resultPath };
+}
+
+const CANDIDATE_MACHINE_KEY_REGEX =
+  /"(?:status|state|runId|run_id|taskId|task_id|sessionId|session_id|executionId|attemptId|attempt_id|reasoning|thought|thoughts|thinking|internal|diffSummary|diff_summary)"\s*:/i;
+
+function extractSafeVisibleTextFromEnvelope(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const hasMarker = /^[ \t]*AGY_JSON:[ \t]*/m.test(trimmed);
+  const isCandidateShape = trimmed.startsWith("{") || /^```(?:json)?\s*\r?\n\s*\{/i.test(trimmed);
+  const isCandidate = hasMarker || (isCandidateShape && CANDIDATE_MACHINE_KEY_REGEX.test(trimmed));
+
+  if (!isCandidate) {
+    // Legitimate plaintext, Markdown link, bracket tag [STATUS], list [1, 2, 3], or non-protocol code example
+    return trimmed;
+  }
+
+  // Candidate machine envelope: attempt to safely parse and extract recognized response fields
+  try {
+    const marker = /^[ \t]*AGY_JSON:[ \t]*\r?\n?([\s\S]*)$/m.exec(trimmed);
+    const wholeFenced = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n?\s*```$/i.exec(trimmed);
+    const candidate = marker?.[1] ? marker[1].trim() : wholeFenced?.[1] ? wholeFenced[1].trim() : trimmed;
+    const parsed = JSON.parse(candidate);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const key of [
+        "fullText",
+        "full_text",
+        "rawAssistantText",
+        "raw_assistant_text",
+        "output",
+        "description",
+        "message",
+        "summary",
+        "result",
+      ]) {
+        const val = (parsed as Record<string, unknown>)[key];
+        if (typeof val === "string" && val.trim().length > 0) {
+          if (
+            key === "result" &&
+            /^(?:completed|completed_partial|timed_out|failed|aborted|success|partial|timeout|error|cancelled|canceled)$/i.test(val.trim())
+          ) {
+            continue;
+          }
+          return val;
+        }
+      }
+    }
+  } catch {}
+
+  // Known machine envelope with absent recognized response or malformed ambiguous data: fail closed
+  return "";
+}
+
+function extractAntigravityText(result: AntigravityRunResult): string {
+  if (typeof result.fullText === "string" && result.fullText.trim().length > 0) {
+    const extracted = extractSafeVisibleTextFromEnvelope(result.fullText);
+    if (extracted !== null && extracted.trim().length > 0) return extracted;
+  }
+  if (typeof result.rawOutput === "string" && result.rawOutput.trim().length > 0) {
+    const extracted = extractSafeVisibleTextFromEnvelope(result.rawOutput);
+    if (extracted !== null && extracted.trim().length > 0) return extracted;
+  }
+  if (typeof result.summary === "string" && result.summary.trim().length > 0) {
+    const extracted = extractSafeVisibleTextFromEnvelope(result.summary);
+    if (extracted !== null && extracted.trim().length > 0) return extracted;
+  }
+  return "";
+}
+
+function isAntigravityPersistedResult(value: Record<string, unknown>): boolean {
+  if (isRecord(value.diff) && value.diff.source === "antigravity") return true;
+  if (isRecord(value.envelope)) {
+    const env = value.envelope as Record<string, unknown>;
+    if (isRecord(env.receipt) && env.receipt.provider === "antigravity") return true;
+  }
+  return false;
 }
 
 export function sanitizePersistedResult(value: unknown, maxLength = 100_000): unknown {
@@ -241,8 +319,18 @@ export function sanitizePersistedResult(value: unknown, maxLength = 100_000): un
   if (envelope) output.envelope = envelope;
   const messages = Array.isArray(value.messages) ? value.messages : null;
   if (messages) output.messages = projectSafeMessages(messages);
-  if (messages && messages.length > 0 && messages.every((message) => hasOnlyTextParts(message)) && typeof value.rawAssistantText === "string") {
-    output.rawAssistantText = truncate(redactSecrets(value.rawAssistantText), maxLength);
+  const isAntigravity = isAntigravityPersistedResult(value);
+  if (typeof value.rawAssistantText === "string") {
+    // Invariant: never bypass explicit private message parts.
+    // If messages are present, every message must contain exclusively safe text parts.
+    const messagesAllowRaw = messages !== null && messages.length > 0 && messages.every((message) => hasOnlyTextParts(message));
+    const antigravityAllowRaw = isAntigravity && (!messages || messages.length === 0);
+    if (messagesAllowRaw || antigravityAllowRaw) {
+      const sanitized = extractSafeVisibleTextFromEnvelope(value.rawAssistantText) ?? value.rawAssistantText;
+      if (sanitized.length > 0) {
+        output.rawAssistantText = truncate(redactSecrets(sanitized), maxLength);
+      }
+    }
   }
   if ("diff" in value) output.diff = projectSafeDiff(value.diff);
   if (typeof value.savedAt === "string") output.savedAt = redactSecrets(value.savedAt);
@@ -308,6 +396,14 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
   return output;
 }
 
+/**
+ * Computes an advisory SHA-256 output hash over summary and diffSummary.
+ *
+ * NOTE: Per legacy receipt contract, this hashes summary-only (compact preview <= 4,000 chars)
+ * and diffSummary, not fullText. Callers must treat outputHash as advisory metadata for
+ * receipt provenance, correlation, and idempotency checks, rather than as a cryptographic digest
+ * of the full response text. The schema is preserved for backward compatibility.
+ */
 export function computeOutputHash(summary: string, diffSummary: string): string {
   return createHash("sha256")
     .update((summary || "").trim() + "\n---\n" + (diffSummary || "").trim())

@@ -2,7 +2,7 @@ import { appendFile, readFile, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { newId, redactSecrets, writePrivateFile } from "../security.js";
+import { newId, redactSecrets, truncate, writePrivateFile } from "../security.js";
 import { parseAgyOutput } from "./parser.js";
 import { AntigravitySpool } from "./spool.js";
 import type {
@@ -423,17 +423,25 @@ export class AntigravitySupervisor {
   ): Promise<AntigravityAttemptStatus> {
     this.stopTimers();
     await this.flushProgressDurable();
+    const effectiveParsed = parsed ?? (stdout.trim() || stderr.trim() ? parseAgyOutput(stdout, stderr) : null);
+    const fallbackText = error ? truncate(redactSecrets(error), 4_000) : "";
+    const summary = effectiveParsed ? (effectiveParsed.summary || fallbackText) : fallbackText;
+    const fullText = effectiveParsed
+      ? (effectiveParsed.fullText || (error ? truncate(redactSecrets(error), 2_000_000) : ""))
+      : (error ? truncate(redactSecrets(error), 2_000_000) : "");
+
     const statusPayload: AntigravityAttemptStatus = {
       schemaVersion: 1,
       attemptId: this.manifest.attemptId,
       status,
       exitCode,
-      summary: parsed?.summary || stdout.trim() || stderr.trim() || error || "",
-      runId: parsed?.runId ?? null,
-      files: parsed?.files ?? [],
-      tests: parsed?.tests ?? [],
-      risks: parsed?.risks ?? [],
-      diffSummary: parsed?.diffSummary ?? "none",
+      summary,
+      fullText,
+      runId: effectiveParsed?.runId ?? null,
+      files: effectiveParsed?.files ?? [],
+      tests: effectiveParsed?.tests ?? [],
+      risks: effectiveParsed?.risks ?? [],
+      diffSummary: effectiveParsed?.diffSummary ?? "none",
       error: error ? redactSecrets(error) : null,
       completedAt: new Date().toISOString(),
       stdout,
