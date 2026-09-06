@@ -192,6 +192,8 @@ export interface JobRecord {
   fence?: number | null;
   workerPid?: number | null;
   heartbeatAt?: string | null;
+  lastProgressAt?: string | null;
+  progressRevision?: number | null;
   earlyExitAt?: string | null;
   earlyExitReason?: string | null;
   escalationProposal?: string | null;
@@ -360,6 +362,8 @@ export interface SemanticProgress {
   lastActiveAt?: string | null;
   isStalled?: boolean;
   earlyExitTriggered?: boolean;
+  diagnosticEvidence?: string | null;
+  suspected?: boolean;
 }
 
 export interface EarlyExitSignal {
@@ -376,6 +380,11 @@ export interface EscalationProposal {
   reason: string;
   advisoryOnly: true;
   suggestedAction?: string;
+  diagnosticEvidence?: string | null;
+  attempt?: string | null;
+  fence?: number | null;
+  progressRevision?: number | null;
+  alertedAt?: string;
 }
 
 export interface ProgressSnapshot {
@@ -402,6 +411,7 @@ export interface ProgressSnapshot {
   semanticProgress?: SemanticProgress;
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
+  diagnosticEvidence?: string | null;
 }
 
 export interface FollowResult {
@@ -571,6 +581,8 @@ export interface BridgeConfig {
   backupDir: string;
   workerMaxExecutionMinutes?: number | null;
   swarmCreditCeiling?: number;
+  inactivityThresholdSeconds?: number;
+  advisoryCheckIntervalMs?: number;
 }
 
 

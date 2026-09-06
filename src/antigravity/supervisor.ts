@@ -10,6 +10,8 @@ import type {
   AntigravityAttemptStatus,
   AntigravityHeartbeat,
   AntigravityResultStatus,
+  AntigravityStreamProgress,
+  SupervisorMetrics,
 } from "./types.js";
 import type { SpawnLike } from "./runner.js";
 
@@ -21,6 +23,8 @@ export interface SupervisorOptions {
   heartbeatIntervalMs?: number | undefined;
   signal?: AbortSignal | undefined;
   onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
+  onProgress?: ((progress: AntigravityStreamProgress) => void | Promise<void>) | undefined;
+  coalesceIntervalMs?: number | undefined;
 }
 
 export class AntigravitySupervisor {
@@ -32,6 +36,8 @@ export class AntigravitySupervisor {
   private readonly signal: AbortSignal | undefined;
   private readonly nonce: string;
   private readonly onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
+  private readonly onProgress?: ((progress: AntigravityStreamProgress) => void | Promise<void>) | undefined;
+  private readonly coalesceIntervalMs: number;
   private child: ChildProcess | null = null;
   private settled = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -41,6 +47,18 @@ export class AntigravitySupervisor {
   private effectiveTimeoutMs: number | null;
   private startTime = 0;
   private resetTimeoutFn: ((newTimeoutMs: number | null) => void) | null = null;
+  private totalStreamBytes = 0;
+  private progressRevision = 0;
+  private lastProgressAt: string;
+  private pendingProgress: AntigravityStreamProgress | null = null;
+  private writeInProgress = false;
+  private coalesceTimer: NodeJS.Timeout | null = null;
+  private readonly metrics: SupervisorMetrics = {
+    chunksReceived: 0,
+    progressWritesAttempted: 0,
+    progressWritesCompleted: 0,
+    coalescedChunks: 0,
+  };
 
   constructor(options: SupervisorOptions) {
     this.spoolDir = options.spoolDir;
@@ -50,10 +68,82 @@ export class AntigravitySupervisor {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 500;
     this.signal = options.signal;
     this.onHeartbeat = options.onHeartbeat;
+    this.onProgress = options.onProgress;
+    this.coalesceIntervalMs = options.coalesceIntervalMs ?? 25;
+    this.lastProgressAt = options.manifest.createdAt || new Date().toISOString();
     this.effectiveTimeoutMs = (typeof options.manifest.timeoutMs === "number" && options.manifest.timeoutMs > 0)
       ? options.manifest.timeoutMs
       : null;
     this.nonce = newId("nonce");
+  }
+
+  private lastWriteCompletedAt = 0;
+
+  getMetrics(): SupervisorMetrics {
+    return { ...this.metrics };
+  }
+
+  private triggerProgressFlush(): void {
+    if (this.writeInProgress) {
+      this.metrics.coalescedChunks++;
+      return;
+    }
+    if (this.coalesceTimer) {
+      this.metrics.coalescedChunks++;
+      return;
+    }
+    const elapsed = Date.now() - this.lastWriteCompletedAt;
+    if (this.lastWriteCompletedAt > 0 && elapsed < this.coalesceIntervalMs) {
+      this.coalesceTimer = setTimeout(() => {
+        this.coalesceTimer = null;
+        void this.flushProgressLoop();
+      }, this.coalesceIntervalMs - elapsed);
+      this.coalesceTimer.unref?.();
+      return;
+    }
+    void this.flushProgressLoop();
+  }
+
+  private async flushProgressLoop(): Promise<void> {
+    if (this.writeInProgress || !this.pendingProgress) return;
+    this.writeInProgress = true;
+    try {
+      while (this.pendingProgress) {
+        const toWrite = this.pendingProgress;
+        this.pendingProgress = null;
+        this.metrics.progressWritesAttempted++;
+        const progressPath = this.manifest.progressPath ?? path.join(this.spoolDir, "progress.json");
+        await writePrivateFile(progressPath, JSON.stringify(toWrite, null, 2) + "\n").catch(() => undefined);
+        if (this.onProgress) {
+          try {
+            await this.onProgress(toWrite);
+          } catch {}
+        }
+        this.metrics.progressWritesCompleted++;
+        this.lastWriteCompletedAt = Date.now();
+        if (this.pendingProgress) {
+          // Bounded interval before processing next batch if disk write was instantaneous
+          const elapsed = Date.now() - this.lastWriteCompletedAt;
+          if (elapsed < this.coalesceIntervalMs) {
+            await new Promise((r) => setTimeout(r, this.coalesceIntervalMs - elapsed));
+          }
+        }
+      }
+    } finally {
+      this.writeInProgress = false;
+      this.lastWriteCompletedAt = Date.now();
+      if (this.pendingProgress && !this.coalesceTimer) {
+        this.triggerProgressFlush();
+      }
+    }
+  }
+
+  async flushProgressDurable(): Promise<void> {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = null;
+    }
+    await this.flushProgressLoop();
   }
 
   extendTimeout(newTimeoutMs: number | null): void {
@@ -111,7 +201,23 @@ export class AntigravitySupervisor {
         void this.updateHeartbeat(child.pid);
       }
 
+      const recordStreamProgress = (chunkLength: number) => {
+        this.metrics.chunksReceived++;
+        this.totalStreamBytes += chunkLength;
+        this.progressRevision++;
+        this.lastProgressAt = new Date().toISOString();
+        this.pendingProgress = {
+          attemptId: this.manifest.attemptId,
+          lastProgressAt: this.lastProgressAt,
+          progressRevision: this.progressRevision,
+          fence: this.manifest.fence ?? null,
+          totalBytes: this.totalStreamBytes,
+        };
+        this.triggerProgressFlush();
+      };
+
       child.stdout?.on("data", (chunk: Buffer) => {
+        recordStreamProgress(chunk.length);
         if (stdoutLength < maxBytes) {
           const remaining = maxBytes - stdoutLength;
           const slice = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
@@ -122,6 +228,7 @@ export class AntigravitySupervisor {
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
+        recordStreamProgress(chunk.length);
         if (stderrLength < maxBytes) {
           const remaining = maxBytes - stderrLength;
           const slice = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
@@ -280,6 +387,8 @@ export class AntigravitySupervisor {
       updatedAt: Date.now(),
       timestamp: new Date().toISOString(),
       fence: this.manifest.fence ?? null,
+      lastProgressAt: this.lastProgressAt,
+      progressRevision: this.progressRevision,
     };
     await writePrivateFile(this.manifest.heartbeatPath, JSON.stringify(heartbeat, null, 2) + "\n").catch(() => undefined);
     if (this.onHeartbeat) {
@@ -290,6 +399,7 @@ export class AntigravitySupervisor {
   }
 
   private stopTimers(): void {
+    if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.cancelWatcherTimer) clearInterval(this.cancelWatcherTimer);
     if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
@@ -297,6 +407,7 @@ export class AntigravitySupervisor {
       this.signal.removeEventListener("abort", this.abortHandler);
       this.abortHandler = null;
     }
+    this.coalesceTimer = null;
     this.heartbeatTimer = null;
     this.cancelWatcherTimer = null;
     this.timeoutTimer = null;
@@ -311,6 +422,7 @@ export class AntigravitySupervisor {
     parsed?: ReturnType<typeof parseAgyOutput>,
   ): Promise<AntigravityAttemptStatus> {
     this.stopTimers();
+    await this.flushProgressDurable();
     const statusPayload: AntigravityAttemptStatus = {
       schemaVersion: 1,
       attemptId: this.manifest.attemptId,

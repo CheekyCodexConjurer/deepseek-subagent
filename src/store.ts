@@ -468,6 +468,17 @@ export class BridgeStore {
           "CREATE INDEX IF NOT EXISTS idx_codex_bindings_correlation ON codex_bindings(thread_id, originating_turn_id, originating_item_id) WHERE originating_turn_id IS NOT NULL AND originating_item_id IS NOT NULL;",
         );
       }
+      const v22Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 22").get() as Row | undefined;
+      if (!v22Migration) {
+        const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
+        if (!jobCols.includes("last_progress_at")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN last_progress_at TEXT;");
+        }
+        if (!jobCols.includes("progress_revision")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN progress_revision INTEGER DEFAULT 0;");
+        }
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(22, ?)").run(new Date().toISOString());
+      }
     });
   }
 
@@ -1164,6 +1175,8 @@ export class BridgeStore {
     fence?: number;
     workerPid?: number | null;
     heartbeatAt?: string | null;
+    lastProgressAt?: string | null;
+    progressRevision?: number | null;
   }): JobRecord {
     const setClauses: string[] = [];
     const params: (string | number | null)[] = [];
@@ -1190,6 +1203,22 @@ export class BridgeStore {
       } else {
         setClauses.push("heartbeat_at = CASE WHEN heartbeat_at IS NULL OR heartbeat_at <= ? THEN ? ELSE heartbeat_at END");
         params.push(update.heartbeatAt, update.heartbeatAt);
+      }
+    }
+    if (update.lastProgressAt !== undefined) {
+      if (update.lastProgressAt === null) {
+        setClauses.push("last_progress_at = NULL");
+      } else {
+        setClauses.push("last_progress_at = ?");
+        params.push(update.lastProgressAt);
+      }
+    }
+    if (update.progressRevision !== undefined) {
+      if (update.progressRevision === null) {
+        setClauses.push("progress_revision = 0");
+      } else {
+        setClauses.push("progress_revision = ?");
+        params.push(update.progressRevision);
       }
     }
 
@@ -1222,6 +1251,53 @@ export class BridgeStore {
     const updated = this.getJob(id);
     if (!updated) throw new Error("Job disappeared: " + id);
     return updated;
+  }
+
+  updateJobProgress(id: string, update: {
+    lastProgressAt: string;
+    progressRevision: number;
+    attempt?: string | null;
+    fence?: number | null;
+  }): JobRecord {
+    let sql = "UPDATE jobs SET last_progress_at = ?, progress_revision = ?, escalation_proposal = NULL WHERE id = ?";
+    const params: (string | number | null)[] = [update.lastProgressAt, update.progressRevision, id];
+    if (update.fence !== undefined && update.fence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(update.fence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (update.fence !== undefined && update.fence !== null && existing.fence !== null && existing.fence !== undefined && update.fence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + update.fence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+    const updated = this.getJob(id);
+    if (!updated) throw new Error("Job disappeared: " + id);
+    return updated;
+  }
+
+  clearJobEscalation(id: string, expectedFence?: number | null): JobRecord {
+    let sql = "UPDATE jobs SET escalation_proposal = NULL WHERE id = ?";
+    const params: (string | number | null)[] = [id];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+    const job = this.getJob(id);
+    if (!job) throw new Error("Job disappeared: " + id);
+    return job;
   }
 
   setJobEarlyExit(id: string, input: { earlyExitAt: string; reason: string }, expectedFence?: number | null): JobRecord {
@@ -1389,8 +1465,21 @@ export class BridgeStore {
     return this.toActivity(row);
   }
 
-  listActivity(agentId: string, limit = 20): AgentActivity[] {
+  listActivity(agentId: string, limit = 20, jobId?: string | null): AgentActivity[] {
     const bounded = Math.max(1, Math.min(20, Math.trunc(limit)));
+    if (jobId) {
+      const job = this.getJob(jobId);
+      if (job) {
+        const rows = this.db.prepare(
+          `SELECT * FROM agent_activity
+           WHERE agent_id = ?
+             AND (job_id = ? OR (job_id IS NULL AND created_at >= ?))
+             AND (job_id = ? OR activity_type != 'result')
+           ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ).all(agentId, jobId, job.createdAt, jobId, bounded) as Row[];
+        return rows.map((row) => this.toActivity(row));
+      }
+    }
     const rows = this.db.prepare("SELECT * FROM agent_activity WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(agentId, bounded) as Row[];
     return rows.map((row) => this.toActivity(row));
   }
@@ -1683,6 +1772,8 @@ export class BridgeStore {
       fence: typeof row.fence === "number" || typeof row.fence === "bigint" ? Number(row.fence) : 1,
       workerPid: typeof row.worker_pid === "number" || typeof row.worker_pid === "bigint" ? Number(row.worker_pid) : null,
       heartbeatAt: nullableString(row, "heartbeat_at"),
+      lastProgressAt: nullableString(row, "last_progress_at"),
+      progressRevision: typeof row.progress_revision === "number" || typeof row.progress_revision === "bigint" ? Number(row.progress_revision) : 0,
       earlyExitAt: nullableString(row, "early_exit_at"),
       earlyExitReason: nullableString(row, "early_exit_reason"),
       escalationProposal: nullableString(row, "escalation_proposal"),
@@ -1970,6 +2061,11 @@ export class BridgeStore {
   getWakeOutbox(parkId: string, generation: number): WakeOutboxRecord | null {
     const row = this.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ? AND generation = ?").get(parkId, generation) as Row | undefined;
     return row ? this.toWakeOutbox(row) : null;
+  }
+
+  listWakeOutboxesForPark(parkId: string): WakeOutboxRecord[] {
+    const rows = this.db.prepare("SELECT * FROM wake_outbox WHERE park_id = ? ORDER BY generation ASC").all(parkId) as Row[];
+    return rows.map((r) => this.toWakeOutbox(r));
   }
 
   getWakeOutboxById(id: string): WakeOutboxRecord | null {

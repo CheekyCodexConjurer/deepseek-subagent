@@ -218,6 +218,8 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
       ? overrides.workerMaxExecutionMinutes
       : null,
     swarmCreditCeiling: boundedInteger(overrides.swarmCreditCeiling, 8, 1, 64),
+    inactivityThresholdSeconds: overrides.inactivityThresholdSeconds ?? 300,
+    advisoryCheckIntervalMs: overrides.advisoryCheckIntervalMs ?? 1000,
   };
 }
 

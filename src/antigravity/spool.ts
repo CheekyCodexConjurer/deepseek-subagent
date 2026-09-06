@@ -15,6 +15,7 @@ import type {
   AntigravityAttemptStatus,
   AntigravityHeartbeat,
   AntigravityRecoveryClaim,
+  AntigravityStreamProgress,
 } from "./types.js";
 
 export const ANTIGRAVITY_HEARTBEAT_TTL_MS = 10_000;
@@ -78,10 +79,20 @@ export class AntigravitySpool {
     const statusPath = path.join(dir, "status.json");
     const heartbeatPath = path.join(dir, "heartbeat.json");
     const cancelPath = path.join(dir, "cancel.signal");
+    const progressPath = path.join(dir, "progress.json");
     const manifestPath = path.join(dir, "manifest.json");
 
     // Write transient prompt file with mode 0600
     await writePrivateFile(promptPath, input.prompt);
+
+    const initialProgress: AntigravityStreamProgress = {
+      attemptId,
+      lastProgressAt: new Date().toISOString(),
+      progressRevision: 0,
+      fence: input.fence ?? 1,
+      totalBytes: 0,
+    };
+    await writePrivateFile(progressPath, JSON.stringify(initialProgress, null, 2) + "\n");
 
     const manifest: AntigravityAttemptManifest = {
       schemaVersion: 1,
@@ -109,6 +120,7 @@ export class AntigravitySpool {
       statusPath,
       heartbeatPath,
       cancelPath,
+      progressPath,
       createdAt: new Date().toISOString(),
       maxOutputBytes,
       fence: input.fence ?? 1,
@@ -156,6 +168,7 @@ export class AntigravitySpool {
         return {
           ...parsed,
           timeoutMs: typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : null,
+          progressPath: parsed.progressPath ?? path.join(path.dirname(target), "progress.json"),
         } as AntigravityAttemptManifest;
       }
       return null;
@@ -289,6 +302,29 @@ export class AntigravitySpool {
     return await writePrivateFileExclusive(claimPath, JSON.stringify(payload, null, 2) + "\n");
   }
 
+  async readProgress(attemptIdOrDir: string, jobId?: string): Promise<AntigravityStreamProgress | null> {
+    const dir = await this.resolveAttemptDir(attemptIdOrDir, jobId);
+    if (!dir) return null;
+    const progressPath = path.join(dir, "progress.json");
+    try {
+      const raw = await readFile(progressPath, "utf8");
+      const parsed = JSON.parse(raw) as AntigravityStreamProgress;
+      if (typeof parsed?.attemptId === "string" && typeof parsed?.lastProgressAt === "string" && typeof parsed?.progressRevision === "number") {
+        return parsed;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async writeProgress(attemptIdOrDir: string, progress: AntigravityStreamProgress, jobId?: string): Promise<void> {
+    const dir = await this.resolveAttemptDir(attemptIdOrDir, jobId);
+    if (!dir) throw new Error("Attempt directory not found for: " + attemptIdOrDir);
+    const progressPath = path.join(dir, "progress.json");
+    await writePrivateFile(progressPath, JSON.stringify(progress, null, 2) + "\n");
+  }
+
   async cleanupPrompt(attemptIdOrDir: string, jobId?: string): Promise<void> {
     const dir = await this.resolveAttemptDir(attemptIdOrDir, jobId);
     if (!dir) return;
@@ -328,6 +364,14 @@ export async function writeAttemptStatus(dataDir: string, attemptId: string, sta
 
 export async function writeHeartbeat(dataDir: string, attemptId: string, heartbeat: AntigravityHeartbeat, jobId?: string): Promise<void> {
   return new AntigravitySpool(dataDir).writeHeartbeat(attemptId, heartbeat, jobId);
+}
+
+export async function readAttemptProgress(progressOrAttemptPath: string): Promise<AntigravityStreamProgress | null> {
+  return new AntigravitySpool("").readProgress(progressOrAttemptPath);
+}
+
+export async function writeAttemptProgress(dataDir: string, attemptId: string, progress: AntigravityStreamProgress, jobId?: string): Promise<void> {
+  return new AntigravitySpool(dataDir).writeProgress(attemptId, progress, jobId);
 }
 
 export function isHeartbeatLive(heartbeat: AntigravityHeartbeat | null | undefined, ttlMs = ANTIGRAVITY_HEARTBEAT_TTL_MS): boolean {

@@ -53,6 +53,7 @@ export interface AntigravityAttemptManifest {
   statusPath: string;
   heartbeatPath: string;
   cancelPath: string;
+  progressPath?: string;
   createdAt: string;
   maxOutputBytes: number;
   fence?: number | null;
@@ -66,6 +67,16 @@ export interface AntigravityHeartbeat {
   updatedAt: number;
   timestamp: string;
   fence?: number | null;
+  lastProgressAt?: string | null;
+  progressRevision?: number | null;
+}
+
+export interface AntigravityStreamProgress {
+  attemptId: string;
+  lastProgressAt: string;
+  progressRevision: number;
+  fence?: number | null;
+  totalBytes: number;
 }
 
 export interface AntigravityAttemptStatus {
@@ -89,4 +100,11 @@ export interface AntigravityRecoveryClaim {
   claimedBy: string;
   claimedAt: string;
   jobId: string;
+}
+
+export interface SupervisorMetrics {
+  chunksReceived: number;
+  progressWritesAttempted: number;
+  progressWritesCompleted: number;
+  coalescedChunks: number;
 }

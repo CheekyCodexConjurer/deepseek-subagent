@@ -23,7 +23,7 @@ import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
 import { AntigravitySpool, isHeartbeatLive } from "./antigravity/spool.js";
 import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
-import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult } from "./antigravity/types.js";
+import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult, AntigravityStreamProgress } from "./antigravity/types.js";
 
 import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
@@ -142,6 +142,14 @@ function isBackpressureError(error: unknown): boolean {
 }
 
 export type DaemonLifecycleState = "starting" | "recovering" | "ready" | "degraded";
+
+export interface BridgeServiceMetrics {
+  sqliteProgressUpdates: number;
+  singleflightRunsStarted: number;
+  singleflightRunsSkipped: number;
+  activeTimersCount: number;
+  reconnectReconciledCount: number;
+}
 
 export interface ServiceStatus {
   state: DaemonLifecycleState;
@@ -322,11 +330,48 @@ export class BridgeService {
   private readonly wakeRetryTimers = new Map<string, NodeJS.Timeout>();
   private lastSseEventAt: number | null = null;
   private retentionTimer: NodeJS.Timeout | null = null;
+  private advisorySchedulerTimer: NodeJS.Timeout | null = null;
+  private readonly jobInactivityTimers = new Map<string, NodeJS.Timeout>();
+  private advisoryPassRunning = false;
+  private advisoryAbortController: AbortController | null = null;
+  private readonly metrics: BridgeServiceMetrics = {
+    sqliteProgressUpdates: 0,
+    singleflightRunsStarted: 0,
+    singleflightRunsSkipped: 0,
+    activeTimersCount: 0,
+    reconnectReconciledCount: 0,
+  };
   private retentionState: RetentionPolicyState | null = null;
   private lifecycleState: DaemonLifecycleState = "starting";
   private startupError: string | null = null;
   private targetCredits: number;
   private readonly successfulJobIds = new Set<string>();
+
+  getMetrics(): BridgeServiceMetrics {
+    return {
+      ...this.metrics,
+      activeTimersCount: this.jobInactivityTimers.size,
+    };
+  }
+
+  getActiveInactivityTimerCount(): number {
+    return this.jobInactivityTimers.size;
+  }
+
+  clearJobInactivityTimer(jobId: string): void {
+    const existing = this.jobInactivityTimers.get(jobId);
+    if (existing) {
+      clearTimeout(existing);
+      this.jobInactivityTimers.delete(jobId);
+    }
+  }
+
+  clearAllJobInactivityTimers(): void {
+    for (const timer of this.jobInactivityTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.jobInactivityTimers.clear();
+  }
 
   hasParkWaiter(parkId: string): boolean {
     return this.parkWaiters.has(parkId);
@@ -430,6 +475,7 @@ export class BridgeService {
       this.running = true;
       this.scheduleDrain();
       this.scheduleRetentionPolicy();
+      this.startAdvisoryScheduler();
     } catch (error) {
       this.lifecycleState = "degraded";
       this.running = false;
@@ -437,10 +483,12 @@ export class BridgeService {
     }
   }
 
-  async stop(): Promise<void> {
+  async stop(options?: { abortWorkers?: boolean }): Promise<void> {
+    const abortWorkers = options?.abortWorkers ?? true;
     this.running = false;
     this.lifecycleState = "starting";
     this.startupError = null;
+    this.stopAdvisoryScheduler();
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
@@ -467,13 +515,19 @@ export class BridgeService {
       }
     }
     this.followLifecycles.clear();
-    for (const controller of this.antigravityAbortControllers.values()) controller.abort();
-    this.antigravityAbortControllers.clear();
-    if (this.antigravityTasks.size > 0) {
-      await Promise.race([
-        Promise.allSettled([...this.antigravityTasks]),
-        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-      ]);
+    if (abortWorkers) {
+      for (const controller of this.antigravityAbortControllers.values()) controller.abort();
+      this.antigravityAbortControllers.clear();
+      if (this.antigravityTasks.size > 0) {
+        await Promise.race([
+          Promise.allSettled([...this.antigravityTasks]),
+          new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+        ]);
+        this.antigravityTasks.clear();
+        this.antigravityTasksByJob.clear();
+      }
+    } else {
+      this.antigravityAbortControllers.clear();
       this.antigravityTasks.clear();
       this.antigravityTasksByJob.clear();
     }
@@ -555,6 +609,165 @@ export class BridgeService {
     };
     this.retentionTimer = setInterval(runPass, RETENTION_INTERVAL_MS);
     this.retentionTimer.unref?.();
+  }
+
+  private startAdvisoryScheduler(): void {
+    if (this.advisorySchedulerTimer) return;
+    this.advisoryAbortController = new AbortController();
+    const intervalMs = this.config.advisoryCheckIntervalMs ?? 1000;
+    this.advisorySchedulerTimer = setInterval(() => {
+      void this.runAdvisoryCheckPass().catch((err) => {
+        this.lastStreamError = redactSecrets(String(err));
+      });
+    }, intervalMs);
+    this.advisorySchedulerTimer.unref?.();
+  }
+
+  private stopAdvisoryScheduler(): void {
+    if (this.advisoryAbortController) {
+      this.advisoryAbortController.abort();
+      this.advisoryAbortController = null;
+    }
+    if (this.advisorySchedulerTimer) {
+      clearInterval(this.advisorySchedulerTimer);
+      this.advisorySchedulerTimer = null;
+    }
+    this.clearAllJobInactivityTimers();
+  }
+
+  scheduleJobInactivityTimer(jobId: string): void {
+    const existing = this.jobInactivityTimers.get(jobId);
+    if (existing) clearTimeout(existing);
+
+    const job = this.store.getJob(jobId);
+    if (!job || TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") {
+      this.jobInactivityTimers.delete(jobId);
+      return;
+    }
+
+    const threshold = this.config.inactivityThresholdSeconds ?? 300;
+    const lastProgressTime = parseTimestamp(job.lastProgressAt)
+      ?? parseTimestamp(job.startedAt)
+      ?? parseTimestamp(job.createdAt)
+      ?? Date.now();
+    const elapsedMs = Math.max(0, Date.now() - lastProgressTime);
+    const remainingMs = Math.max(0, (threshold * 1000) - elapsedMs);
+
+    const timer = setTimeout(() => {
+      this.jobInactivityTimers.delete(jobId);
+      void this.onJobInactivityTimeout(jobId).catch(() => undefined);
+    }, remainingMs);
+    timer.unref?.();
+    this.jobInactivityTimers.set(jobId, timer);
+  }
+
+  private async onJobInactivityTimeout(jobId: string): Promise<void> {
+    try {
+      const job = this.store.getJob(jobId);
+      if (!job || TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") {
+        this.clearJobInactivityTimer(jobId);
+        return;
+      }
+      await this.syncJobStreamProgressFromSpool(job);
+      const updated = this.store.getJob(jobId);
+      if (updated && this.isJobWakeEligible(updated)) {
+        await this.evaluateParkWakes(updated.id);
+      }
+    } catch {}
+  }
+
+  private async syncJobStreamProgressFromSpool(job: JobRecord): Promise<void> {
+    try {
+      const spool = new AntigravitySpool(this.config.dataDir);
+      let attemptId = job.attempt ?? null;
+      let attemptFence = job.fence ?? 1;
+
+      // Exact known attempt path first: avoids directory scan every interval
+      let prog: AntigravityStreamProgress | null = null;
+      if (attemptId) {
+        prog = await spool.readProgress(attemptId, job.id);
+      }
+
+      // Bounded fallback ONLY if no attempt known on job
+      if (!prog && !attemptId) {
+        const latestAttempt = await spool.getLatestAttempt(job.id);
+        if (latestAttempt) {
+          attemptId = latestAttempt.attemptId;
+          attemptFence = latestAttempt.fence ?? job.fence ?? 1;
+          prog = await spool.readProgress(latestAttempt.attemptId, job.id);
+        }
+      }
+
+      if (prog && prog.attemptId === (attemptId ?? prog.attemptId)) {
+        if (
+          prog.progressRevision > (job.progressRevision ?? 0) ||
+          (prog.lastProgressAt && (!job.lastProgressAt || prog.lastProgressAt > job.lastProgressAt))
+        ) {
+          this.metrics.sqliteProgressUpdates++;
+          this.store.updateJobProgress(job.id, {
+            lastProgressAt: prog.lastProgressAt,
+            progressRevision: prog.progressRevision,
+            fence: attemptFence,
+          });
+          this.scheduleJobInactivityTimer(job.id);
+        }
+      }
+    } catch {}
+  }
+
+  private async runAdvisoryCheckPass(): Promise<void> {
+    if (this.lifecycleState !== "ready" && this.lifecycleState !== "recovering") return;
+    if (this.advisoryPassRunning) {
+      this.metrics.singleflightRunsSkipped++;
+      return;
+    }
+    this.advisoryPassRunning = true;
+    this.metrics.singleflightRunsStarted++;
+
+    const signal = this.advisoryAbortController?.signal;
+    if (signal?.aborted) {
+      this.advisoryPassRunning = false;
+      return;
+    }
+
+    try {
+      const armedBarriers = this.store.listArmedBarriers();
+      if (armedBarriers.length === 0) return;
+      if (this.lifecycleState !== "ready" && this.lifecycleState !== "recovering") return;
+      if (signal?.aborted) return;
+
+      // Dedup jobs across barriers per pass
+      const seenJobIds = new Set<string>();
+      for (const barrier of armedBarriers) {
+        const jobIds = this.store.getParkBarrierJobs(barrier.id);
+        for (const jobId of jobIds) {
+          seenJobIds.add(jobId);
+        }
+      }
+
+      for (const jobId of seenJobIds) {
+        if (this.lifecycleState !== "ready" && this.lifecycleState !== "recovering") return;
+        if (signal?.aborted) return;
+
+        const job = this.store.getJob(jobId);
+        if (!job || TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") {
+          this.clearJobInactivityTimer(jobId);
+          continue;
+        }
+
+        await this.syncJobStreamProgressFromSpool(job);
+
+        if (this.lifecycleState !== "ready" && this.lifecycleState !== "recovering") return;
+        if (signal?.aborted) return;
+
+        const updatedJob = this.store.getJob(jobId);
+        if (updatedJob && this.isJobWakeEligible(updatedJob)) {
+          await this.evaluateParkWakes(updatedJob.id);
+        }
+      }
+    } finally {
+      this.advisoryPassRunning = false;
+    }
   }
 
   async spawn(input: SpawnInput): Promise<AcceptedOperation> {
@@ -1000,6 +1213,7 @@ export class BridgeService {
   }
 
   private onJobSettled(jobId: string, batchId?: string | null): void {
+    this.clearJobInactivityTimer(jobId);
     this.releaseExclusiveResources(jobId);
     this.syncBatchStatus(batchId);
     this.scheduleDrain();
@@ -1619,7 +1833,13 @@ export class BridgeService {
     if (input.jobId && (!job || job.agentId !== agent.id)) {
       throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
     }
-    return this.progressSnapshot(agent, job, normalizeActivityLimit(input.activityLimit));
+    const snapshot = await this.progressSnapshot(agent, job, normalizeActivityLimit(input.activityLimit));
+    if (job && snapshot.semanticProgress?.isStalled) {
+      await this.evaluateParkWakes(job.id).catch((err) => {
+        this.lastStreamError = redactSecrets(String(err));
+      });
+    }
+    return snapshot;
   }
 
   async getAuthoritativeStatus(agentId: string, jobId?: string): Promise<AuthoritativeLivenessStatus> {
@@ -1960,6 +2180,9 @@ export class BridgeService {
     const nextAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
 
     if (armed) {
+      for (const j of jobs) {
+        this.scheduleJobInactivityTimer(j.id);
+      }
       await this.evaluateParkWakesForBarrier(barrier).catch((err) => {
         this.lastStreamError = redactSecrets(String(err));
       });
@@ -1986,6 +2209,64 @@ export class BridgeService {
     };
   }
 
+  isJobStalled(job: JobRecord): boolean {
+    if (TERMINAL_JOB_STATUSES.has(job.status) || job.status === "needs_approval") {
+      return false;
+    }
+
+    const threshold = this.config.inactivityThresholdSeconds ?? 300;
+    const lastProgressTime = parseTimestamp(job.lastProgressAt)
+      ?? parseTimestamp(job.startedAt)
+      ?? parseTimestamp(job.createdAt);
+    const lastActivityAgoSeconds = lastProgressTime
+      ? Math.max(0, Math.floor((Date.now() - lastProgressTime) / 1_000))
+      : 0;
+
+    if (job.escalationProposal) {
+      try {
+        const parsed = JSON.parse(job.escalationProposal) as EscalationProposal;
+        // Structured typed current attempt/fence provenance:
+        const attemptMismatch = Boolean(parsed.attempt && job.attempt && parsed.attempt !== job.attempt);
+        const fenceMismatch = Boolean(parsed.fence !== undefined && parsed.fence !== null && job.fence !== undefined && job.fence !== null && parsed.fence !== job.fence);
+        if (!attemptMismatch && !fenceMismatch) {
+          const alertedTime = parseTimestamp(parsed.alertedAt);
+          const hasNewProgress = Boolean(
+            (lastProgressTime && alertedTime && lastProgressTime > alertedTime) ||
+            (parsed.progressRevision !== undefined && parsed.progressRevision !== null && (job.progressRevision ?? 0) > parsed.progressRevision),
+          );
+          if (!hasNewProgress && lastActivityAgoSeconds > threshold) {
+            return true;
+          }
+        }
+      } catch {
+        // Stale or unparseable proposal: do not treat as sticky stall
+      }
+    }
+
+    if (lastActivityAgoSeconds > threshold) {
+      const diagnosticEvidence = `Inactivity warning: job ${job.id} has no observable activity for ${lastActivityAgoSeconds}s (threshold: ${threshold}s, fence: ${job.fence ?? 1}, attempt: ${job.attempt ?? "none"}). Advisory only, NOT an execution timeout.`;
+      const advisoryProposal: EscalationProposal = {
+        reason: diagnosticEvidence,
+        advisoryOnly: true,
+        suggestedAction: "inspect_worker_process",
+        diagnosticEvidence,
+        attempt: job.attempt ?? null,
+        fence: job.fence ?? null,
+        progressRevision: job.progressRevision ?? 0,
+        alertedAt: new Date().toISOString(),
+      };
+      try {
+        this.store.setJobEscalation(job.id, JSON.stringify(advisoryProposal), job.fence ?? null);
+      } catch {
+        // Stale fence error caught! Attempt or fence changed under us.
+        // Catch MUST NOT return eligible!
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
   isJobWakeEligible(job: JobRecord): boolean {
     if (job.status === "needs_approval") {
       return true;
@@ -1994,6 +2275,9 @@ export class BridgeService {
       return job.resultPath !== null;
     }
     if (["failed", "aborted", "timed_out"].includes(job.status)) {
+      return true;
+    }
+    if (this.isJobStalled(job)) {
       return true;
     }
     return false;
@@ -2019,7 +2303,7 @@ export class BridgeService {
       ["completed", "completed_partial", "delivered", "delivery_pending"].includes(j.status) && j.resultPath !== null;
 
     const isException = (j: JobRecord) =>
-      ["needs_approval", "failed", "aborted", "timed_out"].includes(j.status);
+      ["needs_approval", "failed", "aborted", "timed_out"].includes(j.status) || this.isJobStalled(j);
 
     const isTerminal = (j: JobRecord) =>
       ["completed", "completed_partial", "delivered", "delivery_pending", "failed", "aborted", "timed_out"].includes(j.status);
@@ -2084,6 +2368,38 @@ export class BridgeService {
       return;
     }
 
+    // Dedup across unchanged repark generations:
+    // If barrier was reparked (generation > 1) and the only reason to wake is stalled jobs (no non-stall exceptions and not normally satisfied)
+    if (barrier.generation > 1) {
+      const hasNonStallException = jobs.some((j) => ["needs_approval", "failed", "aborted", "timed_out"].includes(j.status));
+      let normallySatisfied = false;
+      if (pred === "ALL") normallySatisfied = (successfulCount === jobs.length && jobs.length > 0) || allTerminal;
+      else if (pred === "ANY") normallySatisfied = successfulCount >= 1 || allTerminal;
+      else if (pred === "QUORUM") normallySatisfied = successfulCount >= (barrier.quorumCount ?? jobs.length) || allTerminal;
+      else if (pred === "REQUIRED") normallySatisfied = ((barrier.requiredJobIds ?? []).length > 0 && (barrier.requiredJobIds ?? []).every((id) => successfulSet.has(id))) || allTerminal;
+
+      if (!hasNonStallException && !normallySatisfied) {
+        const priorOutboxes = this.store.listWakeOutboxesForPark(barrier.id).filter((o) => o.generation < barrier.generation);
+        if (priorOutboxes.length > 0) {
+          const stalledJobs = jobs.filter((j) => this.isJobStalled(j));
+          const allStalledUnchanged = stalledJobs.length > 0 && stalledJobs.every((sj) => {
+            const currentHash = createHash("sha256").update(sj.escalationProposal || sj.error || sj.permissionId || sj.status).digest("hex").slice(0, 16);
+            return priorOutboxes.some((po) => {
+              try {
+                const pPayload = JSON.parse(po.payloadJson) as WakeEnvelope;
+                return pPayload.readyJobIds.includes(sj.id) && pPayload.resultHashes?.[sj.id] === currentHash;
+              } catch {
+                return false;
+              }
+            });
+          });
+          if (allStalledUnchanged) {
+            return;
+          }
+        }
+      }
+    }
+
     const existingOutbox = this.store.getWakeOutbox(barrier.id, barrier.generation);
     if (existingOutbox && (existingOutbox.status === "pending" || existingOutbox.status === "deferred_active_writer" || existingOutbox.status === "waking" || existingOutbox.status === "delivered")) {
       return;
@@ -2110,15 +2426,16 @@ export class BridgeService {
           resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
         }
       } else {
-        resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+        resultHashes[rj.id] = createHash("sha256").update(rj.escalationProposal || rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
       }
     }
 
     const marker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=${barrier.id}:gen=${barrier.generation}] -->`;
+    const hasStalled = jobs.some((j) => this.isJobStalled(j));
     const envelope: WakeEnvelope = {
       parkId: barrier.id,
       generation: barrier.generation,
-      reason: barrier.reason || "subagents park wake",
+      reason: barrier.reason || (hasStalled ? "subagents park wake: worker inactivity exception" : "subagents park wake"),
       jobIds,
       readyJobIds,
       statuses,
@@ -3343,7 +3660,7 @@ export class BridgeService {
   }
 
   private async progressSnapshot(agent: AgentRecord, job: JobRecord | null, limit: number): Promise<ProgressSnapshot> {
-    const activities = this.store.listActivity(agent.id, limit);
+    const activities = this.store.listActivity(agent.id, limit, job?.id);
     let envelope: ResultEnvelope | null = null;
     if (job?.resultPath) {
       try {
@@ -3425,15 +3742,53 @@ export class BridgeService {
       signaledAt: job.earlyExitAt,
     } : undefined);
 
-    const escalation = envelope?.escalation ?? (job?.escalationProposal ? (() => {
-      try {
-        return JSON.parse(job.escalationProposal) as EscalationProposal;
-      } catch {
-        return { reason: job.escalationProposal, advisoryOnly: true as const };
-      }
-    })() : undefined);
+    const threshold = this.config.inactivityThresholdSeconds ?? 300;
+    const latestWorkerActivity = activities.find((a) => a.activityType !== "result");
+    const lastProgressTime = parseTimestamp(job?.lastProgressAt)
+      ?? (latestWorkerActivity ? parseTimestamp(latestWorkerActivity.createdAt) : null)
+      ?? (parseTimestamp(job?.startedAt) ?? parseTimestamp(job?.createdAt));
+    const lastActivityAgoSeconds = lastProgressTime
+      ? Math.max(0, Math.floor((Date.now() - lastProgressTime) / 1_000))
+      : null;
 
-    const lastActivityAgoSeconds = latest ? Math.max(0, Math.floor((Date.now() - (parseTimestamp(latest.createdAt) ?? Date.now())) / 1_000)) : null;
+    const isJobInactivityStalled = job ? this.isJobStalled(job) : false;
+
+    let diagnosticEvidence: string | null = null;
+    let escalation: EscalationProposal | undefined = envelope?.escalation;
+
+    if (job) {
+      if (job.escalationProposal) {
+        try {
+          const parsed = JSON.parse(job.escalationProposal) as EscalationProposal;
+          const attemptMismatch = Boolean(parsed.attempt && job.attempt && parsed.attempt !== job.attempt);
+          const fenceMismatch = Boolean(parsed.fence !== undefined && parsed.fence !== null && job.fence !== undefined && job.fence !== null && parsed.fence !== job.fence);
+          if (!attemptMismatch && !fenceMismatch) {
+            diagnosticEvidence = parsed.diagnosticEvidence ?? parsed.reason ?? null;
+            if (!escalation) {
+              escalation = parsed;
+            }
+          }
+        } catch {
+          diagnosticEvidence = job.escalationProposal;
+          if (!escalation) {
+            escalation = { reason: job.escalationProposal, advisoryOnly: true as const };
+          }
+        }
+      }
+      if (!diagnosticEvidence && isJobInactivityStalled) {
+        diagnosticEvidence = `Inactivity warning: job ${job.id} has no observable activity for ${lastActivityAgoSeconds ?? 0}s (threshold: ${threshold}s, fence: ${fence ?? 1}, attempt: ${attemptId ?? "none"}). Advisory only, NOT an execution timeout.`;
+      }
+      if (!escalation && isJobInactivityStalled && diagnosticEvidence) {
+        escalation = {
+          reason: diagnosticEvidence,
+          advisoryOnly: true as const,
+          suggestedAction: "inspect_worker_process",
+          diagnosticEvidence,
+          attempt: attemptId,
+          fence,
+        };
+      }
+    }
 
     const semanticProgress = deriveSemanticProgress(
       activities,
@@ -3443,6 +3798,8 @@ export class BridgeService {
       heartbeatAgoSeconds,
       lastActivityAgoSeconds,
       earlyExit,
+      diagnosticEvidence,
+      threshold,
     );
 
     return {
@@ -3473,6 +3830,7 @@ export class BridgeService {
       semanticProgress,
       ...(earlyExit ? { earlyExit } : {}),
       ...(escalation ? { escalation } : {}),
+      ...(diagnosticEvidence ? { diagnosticEvidence } : {}),
     };
   }
 
@@ -3651,6 +4009,7 @@ export class BridgeService {
     const capturedFence = manifest.fence ?? job.fence ?? 1;
     try {
       const onHeartbeat = (hb: AntigravityHeartbeat) => {
+        if (!this.running && this.lifecycleState !== "recovering") return;
         try {
           this.store.updateJobLiveness(job.id, {
             attempt: manifest.attemptId,
@@ -3660,9 +4019,22 @@ export class BridgeService {
           });
         } catch {}
       };
+      const onProgress = (prog: AntigravityStreamProgress) => {
+        if (!this.running && this.lifecycleState !== "recovering") return;
+        try {
+          this.metrics.sqliteProgressUpdates++;
+          this.store.updateJobProgress(job.id, {
+            lastProgressAt: prog.lastProgressAt,
+            progressRevision: prog.progressRevision,
+            fence: capturedFence,
+            attempt: manifest.attemptId,
+          });
+          this.scheduleJobInactivityTimer(job.id);
+        } catch {}
+      };
       let result: AntigravityRunResult;
       if (typeof (this.antigravity as any).runAttempt === "function") {
-        result = await (this.antigravity as any).runAttempt(manifest, controller.signal, onHeartbeat);
+        result = await (this.antigravity as any).runAttempt(manifest, controller.signal, onHeartbeat, onProgress);
       } else {
         result = await this.antigravity.runPrompt({
           prompt: manifest.promptPath && existsSync(manifest.promptPath) ? await readFile(manifest.promptPath, "utf8").catch(() => "") : "",
@@ -3671,8 +4043,10 @@ export class BridgeService {
           signal: controller.signal,
           attemptManifest: manifest,
           onHeartbeat,
+          onProgress,
         });
       }
+      if (!this.running && this.lifecycleState !== "recovering") return;
       const current = this.store.getJob(job.id);
       if (controller.signal.aborted || current?.status === "aborted") {
         this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
@@ -3724,11 +4098,17 @@ export class BridgeService {
       }
     } catch (error) {
       const message = redactSecrets(String(error));
-      const current = this.store.getJob(job.id);
+      let current: JobRecord | null = null;
+      try {
+        current = this.store.getJob(job.id);
+      } catch {}
       if (current?.status === "aborted" || controller.signal.aborted) {
-        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        try {
+          this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        } catch {}
         return;
       }
+      if (!this.running && this.lifecycleState !== "recovering") return;
       if (current?.resultPath || ["completed", "completed_partial", "delivery_pending", "delivered"].includes(current?.status ?? "")) {
         this.recordActivity(agent, current ?? job, "error", "Delivery failed for persisted Antigravity result: " + message);
         this.lastStreamError = message;
@@ -3764,6 +4144,7 @@ export class BridgeService {
         this.lastStreamError = redactSecrets(String(err));
       });
     } finally {
+      this.clearJobInactivityTimer(job.id);
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
   }
@@ -3792,6 +4173,7 @@ export class BridgeService {
           : this.effectiveWorkerTimeoutMs()
       );
       const onHeartbeat = (hb: AntigravityHeartbeat) => {
+        if (!this.running && this.lifecycleState !== "recovering") return;
         try {
           this.store.updateJobLiveness(job.id, {
             attempt: hb.attemptId ?? null,
@@ -3799,6 +4181,19 @@ export class BridgeService {
             heartbeatAt: hb.timestamp,
             fence: capturedFence,
           });
+        } catch {}
+      };
+      const onProgress = (prog: AntigravityStreamProgress) => {
+        if (!this.running && this.lifecycleState !== "recovering") return;
+        try {
+          this.metrics.sqliteProgressUpdates++;
+          this.store.updateJobProgress(job.id, {
+            lastProgressAt: prog.lastProgressAt,
+            progressRevision: prog.progressRevision,
+            fence: capturedFence,
+            attempt: prog.attemptId ?? null,
+          });
+          this.scheduleJobInactivityTimer(job.id);
         } catch {}
       };
       const result: AntigravityRunResult = await this.antigravity.runPrompt({
@@ -3813,7 +4208,9 @@ export class BridgeService {
         timeoutMs: effectiveTimeoutMs,
         fence: capturedFence,
         onHeartbeat,
+        onProgress,
       });
+      if (!this.running && this.lifecycleState !== "recovering") return;
       const current = this.store.getJob(job.id);
       if (controller.signal.aborted || current?.status === "aborted") {
         this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
@@ -3869,16 +4266,22 @@ export class BridgeService {
       }
     } catch (error) {
       const message = redactSecrets(String(error));
-      const current = this.store.getJob(job.id);
+      let current: JobRecord | null = null;
+      try {
+        current = this.store.getJob(job.id);
+      } catch {}
       // A cancellation is never a rejected dispatch: when the abort signal is
       // set, classify the outcome as an abort even if the job row has not been
       // marked aborted yet (abort() marks it immediately afterwards; a stop()
       // leaves the stranded job to startup recovery). The job/agent failure
       // guards below stay untouched for genuine dispatch rejections.
       if (current?.status === "aborted" || controller.signal.aborted) {
-        this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        try {
+          this.recordActivity(agent, current ?? job, "abort", "Antigravity process ended after the bridge abort signal");
+        } catch {}
         return;
       }
+      if (!this.running && this.lifecycleState !== "recovering") return;
       // If the result was already persisted or completed, never downgrade to failed.
       if (current?.resultPath || ["completed", "completed_partial", "delivery_pending", "delivered"].includes(current?.status ?? "")) {
         this.recordActivity(agent, current ?? job, "error", "Delivery failed for persisted Antigravity result: " + message);
@@ -3915,6 +4318,7 @@ export class BridgeService {
         this.lastStreamError = redactSecrets(String(err));
       });
     } finally {
+      this.clearJobInactivityTimer(job.id);
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
     }
   }
@@ -4442,6 +4846,7 @@ export class BridgeService {
       deliveryMethod: method,
     });
     if (delivery.status === "delivered") {
+      this.clearJobInactivityTimer(job.id);
       if (job.status === "delivery_pending") this.store.updateJobStatus(job.id, "delivered");
       return;
     }
@@ -4454,6 +4859,7 @@ export class BridgeService {
         this.store.setDeliveryMethod(delivery.id, "inbox");
       }
       this.store.updateDelivery(delivery.id, "delivered");
+      this.clearJobInactivityTimer(job.id);
       const current = this.store.getJob(job.id);
       if (current?.status === "delivery_pending") this.store.updateJobStatus(job.id, "delivered");
     } catch (error) {
@@ -4462,6 +4868,7 @@ export class BridgeService {
         await this.inbox.deliver(envelope, humanText);
         this.store.setDeliveryMethod(delivery.id, "inbox", message);
         this.store.updateDelivery(delivery.id, "delivered");
+        this.clearJobInactivityTimer(job.id);
         const current = this.store.getJob(job.id);
         if (current?.status === "delivery_pending") this.store.updateJobStatus(job.id, "delivered");
       } catch (fallbackError) {
@@ -4766,6 +5173,7 @@ export class BridgeService {
   private async markNeedsApproval(agent: AgentRecord, properties: Record<string, unknown> = {}): Promise<void> {
     const job = this.activeJob(agent.id);
     if (!job) return;
+    this.clearJobInactivityTimer(job.id);
     const currentAgent = this.store.getAgent(agent.id);
     const alreadyNeedsApproval = job.status === "needs_approval";
     const currentJob = this.store.getJob(job.id) ?? job;
@@ -5022,6 +5430,18 @@ export class BridgeService {
         heartbeatAt: heartbeat?.timestamp ?? new Date().toISOString(),
         fence: job.fence ?? 1,
       });
+      const prog = await spool.readProgress(latestAttempt.attemptId, job.id);
+      if (prog) {
+        this.metrics.sqliteProgressUpdates++;
+        this.store.updateJobProgress(job.id, {
+          lastProgressAt: prog.lastProgressAt,
+          progressRevision: prog.progressRevision,
+          attempt: latestAttempt.attemptId,
+          fence: latestAttempt.fence ?? job.fence ?? 1,
+        });
+      }
+      this.metrics.reconnectReconciledCount++;
+      this.scheduleJobInactivityTimer(job.id);
       if (["following", "finalizing"].includes(job.status)) {
         this.ensureFollowLifecycle(
           job,
@@ -5168,6 +5588,7 @@ export class BridgeService {
     try {
       const pollIntervalMs = 250;
       while (true) {
+        if (!this.running && this.lifecycleState !== "recovering") return;
         if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") {
           await spool.writeCancelSignal(manifest.attemptId, "Aborted by orchestrator");
           return;
@@ -5246,6 +5667,24 @@ export class BridgeService {
             });
           } catch {}
         }
+        const prog = await spool.readProgress(manifest.attemptId, job.id);
+        if (prog) {
+          const current = this.store.getJob(job.id);
+          if (
+            current &&
+            (prog.progressRevision > (current.progressRevision ?? 0) ||
+              (prog.lastProgressAt && (!current.lastProgressAt || prog.lastProgressAt > current.lastProgressAt)))
+          ) {
+            this.metrics.sqliteProgressUpdates++;
+            this.store.updateJobProgress(job.id, {
+              lastProgressAt: prog.lastProgressAt,
+              progressRevision: prog.progressRevision,
+              attempt: manifest.attemptId,
+              fence: manifest.fence ?? current.fence ?? 1,
+            });
+            this.scheduleJobInactivityTimer(job.id);
+          }
+        }
         const supervisorAlive = heartbeat?.supervisorPid ? isProcessAlive(heartbeat.supervisorPid) : false;
         const agyAlive = heartbeat?.agyPid ? isProcessAlive(heartbeat.agyPid) : false;
         const processAlive = supervisorAlive || agyAlive;
@@ -5257,6 +5696,7 @@ export class BridgeService {
         await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
       }
     } finally {
+      this.clearJobInactivityTimer(job.id);
       if (this.antigravityAbortControllers.get(job.id) === controller) {
         this.antigravityAbortControllers.delete(job.id);
       }
@@ -5513,11 +5953,13 @@ function deriveSemanticProgress(
   heartbeatAgoSeconds: number | null,
   lastActivityAgoSeconds: number | null,
   earlyExitSignal?: EarlyExitSignal,
+  diagnosticEvidence?: string | null,
+  inactivityThresholdSeconds = 300,
 ): SemanticProgress {
   const latest = activities[0];
   let stage: SemanticProgress["stage"] = "executing";
 
-  if (job?.status === "completed" || job?.status === "completed_partial") {
+  if (job && (TERMINAL_JOB_STATUSES.has(job.status) || job.resultPath !== null)) {
     stage = "completed";
   } else if (job?.status === "finalizing" || job?.gracefulFinalizeAttempted) {
     stage = "finalizing";
@@ -5531,23 +5973,29 @@ function deriveSemanticProgress(
       stage = "modifying";
     } else if (sum.includes("read") || sum.includes("inspect") || sum.includes("analyze") || sum.includes("grep") || sum.includes("search")) {
       stage = "analyzing";
-    } else if (sum.includes("idle") || sum.includes("complete")) {
-      stage = "completed";
     }
   }
 
-  // Contract: 900s is only a window/deadline, NEVER proof of death. A job is stalled only if not live and heartbeat/activity is stale.
-  const isStalled = !isLive && (heartbeatAgoSeconds !== null ? heartbeatAgoSeconds > 120 : (lastActivityAgoSeconds !== null ? lastActivityAgoSeconds > 300 : false));
+  // Contract: 900s is only a window/deadline, NEVER proof of death. A job is stalled only if not live and heartbeat/activity is stale, OR conservative inactivity threshold reached.
+  // Separate process liveness from observed current job progress, no heartbeat counts as work.
+  const isProcessDeadStall = !isLive && (heartbeatAgoSeconds !== null ? heartbeatAgoSeconds > 120 : (lastActivityAgoSeconds !== null ? lastActivityAgoSeconds > inactivityThresholdSeconds : false));
+  const isJobInactivityStall = Boolean(
+    job && !TERMINAL_JOB_STATUSES.has(job.status) && job.status !== "needs_approval"
+    && lastActivityAgoSeconds !== null && lastActivityAgoSeconds > inactivityThresholdSeconds,
+  );
+  const isStalled = isProcessDeadStall || isJobInactivityStall;
   if (isStalled && stage !== "completed" && stage !== "awaiting_approval") {
     stage = "stalled";
   }
 
   const milestones = activities
-    .filter((a) => a.activityType === "result" || a.activityType === "approval" || a.summary.toLowerCase().includes("milestone") || a.summary.toLowerCase().includes("completed"))
+    .filter((a) => a.activityType === "result" || a.activityType === "approval")
     .map((a) => a.summary)
     .slice(0, 5);
 
-  const lastActiveAt = heartbeatAt ?? (latest ? latest.createdAt : null);
+  // No heartbeat counts as work: lastActiveAt comes from latest observable job progress, not heartbeat
+  const latestWorker = activities.find((a) => a.activityType !== "result");
+  const lastActiveAt = job?.lastProgressAt ?? (latestWorker ? latestWorker.createdAt : (job?.startedAt ?? job?.createdAt ?? null));
 
   return {
     stage,
@@ -5556,6 +6004,8 @@ function deriveSemanticProgress(
     lastActiveAt,
     isStalled,
     earlyExitTriggered: Boolean(earlyExitSignal?.triggered),
+    ...(diagnosticEvidence ? { diagnosticEvidence } : {}),
+    ...(isStalled ? { suspected: true } : {}),
   };
 }
 

@@ -10,6 +10,8 @@ import type {
   AntigravityAttemptStatus,
   AntigravityHeartbeat,
   AntigravityRunResult,
+  AntigravityStreamProgress,
+  SupervisorMetrics,
 } from "./types.js";
 
 export interface AntigravityAdapterOptions {
@@ -37,11 +39,17 @@ export interface AntigravityRunOptions {
   jobId?: string | undefined;
   requestId?: string | undefined;
   onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
+  onProgress?: ((progress: AntigravityStreamProgress) => void | Promise<void>) | undefined;
 }
 
 export interface AntigravityProviderLike {
   runPrompt(options: AntigravityRunOptions): Promise<AntigravityRunResult>;
-  runAttempt?(manifest: AntigravityAttemptManifest, signal?: AbortSignal, onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>): Promise<AntigravityRunResult>;
+  runAttempt?(
+    manifest: AntigravityAttemptManifest,
+    signal?: AbortSignal,
+    onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>,
+    onProgress?: (progress: AntigravityStreamProgress) => void | Promise<void>,
+  ): Promise<AntigravityRunResult>;
   extendTimeout?(jobIdOrAttemptId: string, timeoutMs: number | null): boolean;
 }
 
@@ -71,6 +79,12 @@ export class AntigravityAdapter implements AntigravityProviderLike {
   readonly killTreeFn: ((pid: number) => Promise<void>) | undefined;
   readonly dataDir: string | undefined;
   private readonly activeSupervisors = new Map<string, AntigravitySupervisor>();
+  private readonly metrics: SupervisorMetrics = {
+    chunksReceived: 0,
+    progressWritesAttempted: 0,
+    progressWritesCompleted: 0,
+    coalescedChunks: 0,
+  };
 
   constructor(options: AntigravityAdapterOptions = {}) {
     this.command = options.command ?? AGY_COMMAND;
@@ -82,6 +96,18 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     this.spawnFn = options.spawnFn;
     this.killTreeFn = options.killTreeFn;
     this.dataDir = options.dataDir;
+  }
+
+  getMetrics(): SupervisorMetrics {
+    const total = { ...this.metrics };
+    for (const supervisor of new Set(this.activeSupervisors.values())) {
+      const m = supervisor.getMetrics();
+      total.chunksReceived += m.chunksReceived;
+      total.progressWritesAttempted += m.progressWritesAttempted;
+      total.progressWritesCompleted += m.progressWritesCompleted;
+      total.coalescedChunks += m.coalescedChunks;
+    }
+    return total;
   }
 
   extendTimeout(jobIdOrAttemptId: string, timeoutMs: number | null): boolean {
@@ -97,6 +123,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     manifest: AntigravityAttemptManifest,
     signal?: AbortSignal,
     onHeartbeat?: (heartbeat: AntigravityHeartbeat) => void | Promise<void>,
+    onProgress?: (progress: AntigravityStreamProgress) => void | Promise<void>,
   ): Promise<AntigravityRunResult> {
     const supervisor = new AntigravitySupervisor({
       spoolDir: manifest.attemptDir,
@@ -105,6 +132,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       ...(this.killTreeFn ? { killTreeFn: this.killTreeFn } : {}),
       ...(signal ? { signal } : {}),
       ...(onHeartbeat ? { onHeartbeat } : {}),
+      ...(onProgress ? { onProgress } : {}),
     });
     this.activeSupervisors.set(manifest.attemptId, supervisor);
     this.activeSupervisors.set(manifest.jobId, supervisor);
@@ -112,6 +140,11 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       const status = await supervisor.run();
       return this.mapAttemptStatusToResult(manifest, status);
     } finally {
+      const m = supervisor.getMetrics();
+      this.metrics.chunksReceived += m.chunksReceived;
+      this.metrics.progressWritesAttempted += m.progressWritesAttempted;
+      this.metrics.progressWritesCompleted += m.progressWritesCompleted;
+      this.metrics.coalescedChunks += m.coalescedChunks;
       this.activeSupervisors.delete(manifest.attemptId);
       this.activeSupervisors.delete(manifest.jobId);
     }
@@ -157,7 +190,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       );
     }
     if (options.attemptManifest) {
-      return await this.runAttempt(options.attemptManifest, options.signal, options.onHeartbeat);
+      return await this.runAttempt(options.attemptManifest, options.signal, options.onHeartbeat, options.onProgress);
     }
     const dataDir = options.dataDir ?? this.dataDir;
     if (dataDir && options.jobId && options.agentId && options.requestId) {
@@ -181,7 +214,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
         addDirs: this.addDirs,
         dangerouslySkipPermissions: this.dangerouslySkipPermissions,
       });
-      return await this.runAttempt(manifest, options.signal, options.onHeartbeat);
+      return await this.runAttempt(manifest, options.signal, options.onHeartbeat, options.onProgress);
     }
 
     const model = options.model ?? this.model;
