@@ -11,11 +11,11 @@ import { runMcp } from "./mcp.js";
 import { createLegacyPruneIndexes, evaluateRetentionPolicy, runRetentionPrune } from "./retention.js";
 import { BridgeService } from "./service.js";
 import { BridgeStore } from "./store.js";
-import { OpenCodeClient } from "./opencode/client.js";
 import { createBackup } from "./backup.js";
 import type { BackupResult, BridgeConfig, DoctorCheck, DoctorReport, RetentionMode, RouteStatusInfo } from "./types.js";
 
 export const DOCTOR_PROBE_TIMEOUT_MS = 10_000;
+const ACTIVE_DISPLAY_NAME = "Antigravity Sub-Agent";
 
 interface CliArgs {
   command: string;
@@ -46,6 +46,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     await runUninstall(parsed);
     return;
   }
+  if (parsed.command === "route" && parsed.rest[0] === "set" && parsed.rest[1] && isLegacyRouteName(parsed.rest[1])) {
+    throw new Error("Legacy model routes are unsupported; select an Antigravity/Gemini route. No route state was written.");
+  }
   const config = await ensureConfig(parsed.configPath);
   switch (parsed.command) {
     case "backup":
@@ -56,10 +59,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       await installInstructions(config);
       output(parsed.json, {
         installed: true,
-        displayName: "DeepSeek Sub-Agent",
+        displayName: ACTIVE_DISPLAY_NAME,
         configPath: config.configPath,
         dataDir: config.dataDir,
-      }, "DeepSeek Sub-Agent configuration is ready.");
+      }, ACTIVE_DISPLAY_NAME + " configuration is ready.");
       return;
     case "daemon":
       await runDaemon(config);
@@ -158,7 +161,7 @@ export async function acquireDaemonLock(dataDir: string, pid = process.pid): Pro
     }
 
     if (isProcessAlive(existingPid)) {
-      throw new Error(`DeepSeek Sub-Agent daemon is already running (PID ${existingPid}). Duplicate daemon instance prevented.`);
+      throw new Error(`${ACTIVE_DISPLAY_NAME} daemon is already running (PID ${existingPid}). Duplicate daemon instance prevented.`);
     }
 
     // Existing PID is dead (stale lock). Attempt atomic CAS takeover via atomic rename to a unique temp file.
@@ -181,7 +184,7 @@ export async function acquireDaemonLock(dataDir: string, pid = process.pid): Pro
         const claimedPid = Number.parseInt(claimedContent.trim(), 10);
         if (Number.isInteger(claimedPid) && claimedPid > 0 && isProcessAlive(claimedPid)) {
           await rename(staleClaimPath, pidPath).catch(() => undefined);
-          throw new Error(`DeepSeek Sub-Agent daemon is already running (PID ${claimedPid}). Duplicate daemon instance prevented.`);
+          throw new Error(`${ACTIVE_DISPLAY_NAME} daemon is already running (PID ${claimedPid}). Duplicate daemon instance prevented.`);
         }
       } finally {
         await unlink(staleClaimPath).catch(() => undefined);
@@ -232,7 +235,7 @@ async function runDaemon(config: BridgeConfig): Promise<void> {
     await releaseLock();
     throw error;
   }
-  console.error("DeepSeek Sub-Agent daemon listening on " + config.daemonHost + ":" + config.daemonPort);
+  console.error(ACTIVE_DISPLAY_NAME + " daemon listening on " + config.daemonHost + ":" + config.daemonPort);
   const shutdown = async () => {
     await http.stop();
     await service.stop();
@@ -250,7 +253,7 @@ async function startDaemon(config: BridgeConfig, json: boolean): Promise<void> {
   const client = new BridgeHttpClient(config);
   try {
     await client.health();
-    output(json, { running: true, alreadyRunning: true }, "DeepSeek Sub-Agent daemon is already running.");
+    output(json, { running: true, alreadyRunning: true }, ACTIVE_DISPLAY_NAME + " daemon is already running.");
     return;
   } catch {
     // Start below.
@@ -266,7 +269,7 @@ async function startDaemon(config: BridgeConfig, json: boolean): Promise<void> {
   });
   await logHandle.close();
   child.unref();
-  output(json, { running: "starting", pid: child.pid ?? null }, "DeepSeek Sub-Agent daemon is starting.");
+  output(json, { running: "starting", pid: child.pid ?? null }, ACTIVE_DISPLAY_NAME + " daemon is starting.");
 }
 
 async function stopDaemon(config: BridgeConfig, json: boolean): Promise<void> {
@@ -279,7 +282,7 @@ async function stopDaemon(config: BridgeConfig, json: boolean): Promise<void> {
     // No pid file.
   }
   if (!pid) {
-    output(json, { stopped: false, reason: "no_pid_file" }, "No DeepSeek Sub-Agent daemon pid file was found.");
+    output(json, { stopped: false, reason: "no_pid_file" }, "No " + ACTIVE_DISPLAY_NAME + " daemon pid file was found.");
     return;
   }
   if (process.platform === "win32") {
@@ -288,7 +291,7 @@ async function stopDaemon(config: BridgeConfig, json: boolean): Promise<void> {
     process.kill(pid, "SIGTERM");
   }
   await unlink(pidPath).catch(() => undefined);
-  output(json, { stopped: true }, "DeepSeek Sub-Agent daemon stopped.");
+  output(json, { stopped: true }, ACTIVE_DISPLAY_NAME + " daemon stopped.");
 }
 
 async function outputDoctor(config: BridgeConfig, json: boolean, full = false): Promise<void> {
@@ -307,44 +310,17 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
     status: await canRead(config.dataDir) ? "ok" : "warning",
     detail: config.dataDir,
   });
-  console.error(`[doctor] probing codex and opencode CLIs (each probe bounded to ${DOCTOR_PROBE_TIMEOUT_MS / 1000}s, probes run in parallel)`);
-  const [codexVersion, openCodeCommand] = await Promise.all([
-    runCodex(["--version"]),
-    resolveOpenCodeCommand(),
-  ]);
+  console.error("[doctor] checking active Antigravity/Gemini configuration; no provider process probes are started");
+  const activeRoute = config.modelRoutes.find((route) => route.name === config.defaultModelRoute);
   push({
-    name: "codex_installed",
-    status: codexVersion.ok ? "ok" : "warning",
-    detail: codexVersion.ok ? codexVersion.output.trim() : codexVersion.error,
-  });
-  const [openCodeVersion, authList, models, mcpList] = await Promise.all([
-    runCapture(openCodeCommand, ["--version"]),
-    runCapture(openCodeCommand, ["auth", "list"]),
-    runCapture(openCodeCommand, ["models"]),
-    runCodex(["mcp", "list"]),
-  ]);
-  push({
-    name: "opencode_installed",
-    status: openCodeVersion.ok ? "ok" : "warning",
-    detail: openCodeVersion.ok ? openCodeVersion.output.trim() : openCodeVersion.error,
+    name: "active_provider",
+    status: activeRoute?.providerId === "antigravity" ? "ok" : "error",
+    detail: activeRoute?.providerId ?? "no active route",
   });
   push({
-    name: "opencode_go_auth",
-    status: authList.ok && /opencode-go|opencode go/i.test(authList.output) ? "ok" : "warning",
-    detail: authList.ok ? "provider names inspected; secret values were not read" : authList.error,
-  });
-  const targetModel = /opencode-go[\/\\]deepseek-v4-flash/i.test(models.output);
-  push({
-    name: "deepseek_v4_flash",
-    status: targetModel ? "ok" : "warning",
-    detail: targetModel ? "configured model is listed by OpenCode" : "target model was not found in OpenCode model listing",
-  });
-  push({
-    name: "max_variant",
-    status: config.opencodeVariant === "max" ? "warning" : "unknown",
-    detail: config.opencodeVariant === "max"
-      ? "configured as max; live runtime smoke is the proof, not a static listing"
-      : "no max variant configured",
+    name: "active_model",
+    status: activeRoute?.modelId.startsWith("gemini-") ? "ok" : "error",
+    detail: activeRoute?.modelId ?? "no active route",
   });
   push({
     name: "async_execution",
@@ -352,9 +328,9 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
     detail: "spawn dispatches asynchronously and follow waits on internal events",
   });
   push({
-    name: "sse_completion_events",
+    name: "completion_events",
     status: "ok",
-    detail: "OpenCode SSE session.idle events are subscribed without job-status polling",
+    detail: "Antigravity completion events are persisted without job-status polling",
   });
   push({
     name: "progress_snapshots",
@@ -387,7 +363,7 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
     status: codexToolTimeout !== null && codexToolTimeout >= minimumToolTimeout ? "ok" : "warning",
     detail: codexToolTimeout === null
       ? `MISCONFIGURED: Codex MCP tool_timeout_sec was not found; required > ${FOLLOW_MAX_TOTAL_MINUTES} min, recommended ${DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC / 60} min`
-      : `DeepSeek follow max wait: ${FOLLOW_MAX_TOTAL_MINUTES} min; Codex MCP tool timeout: ${Math.floor(codexToolTimeout / 60)} min; Status: ${codexToolTimeout >= minimumToolTimeout ? "OK" : "MISCONFIGURED"}`,
+      : `SubAgents follow max wait: ${FOLLOW_MAX_TOTAL_MINUTES} min; Codex MCP tool timeout: ${Math.floor(codexToolTimeout / 60)} min; Status: ${codexToolTimeout >= minimumToolTimeout ? "OK" : "MISCONFIGURED"}`,
   });
   push({
     name: "same_chat_push",
@@ -403,8 +379,8 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
   });
   push({
     name: "mcp_registered",
-    status: /deepseek-subagent/i.test(mcpList.output) ? "ok" : "warning",
-    detail: mcpList.ok ? "deepseek-subagent registration was " + (/deepseek-subagent/i.test(mcpList.output) ? "found" : "not found") : mcpList.error,
+    status: "unknown",
+    detail: "MCP registration is checked by the host; doctor did not spawn a CLI process.",
   });
   push({
     name: "codex_delivery",
@@ -413,22 +389,6 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
       ? "Configured adapter is separate from Codex Desktop and requires a live correlation probe."
       : "Same-chat push is experimental and disabled; inbox fallback is expected.",
   });
-  if (config.opencodeMode === "attach" && config.opencodeUrl) {
-    try {
-      const client = new OpenCodeClient({
-        baseUrl: config.opencodeUrl,
-        username: config.opencodeUsername,
-        password: config.opencodePassword,
-      });
-      console.error("[doctor] probing opencode health (bounded to 5s)");
-      const health = await client.health();
-      push({ name: "opencode_health", status: health.healthy ? "ok" : "error", detail: health.version ?? "healthy" });
-    } catch (error) {
-      push({ name: "opencode_health", status: "error", detail: redactSecrets(String(error)) });
-    }
-  } else {
-    push({ name: "opencode_mode", status: "ok", detail: "managed loopback server; health is checked at daemon start" });
-  }
   console.error(`[doctor] probing bridge daemon health (headers/body bounded to ${DOCTOR_HEALTH_TIMEOUT_MS / 1000}s; TCP connect separately bounded to ${BRIDGE_CONNECT_TIMEOUT_MS / 1000}s)`);
   try {
     const health = await new BridgeHttpClient(config, createDoctorHealthDispatcher()).health();
@@ -453,7 +413,7 @@ async function outputDoctor(config: BridgeConfig, json: boolean, full = false): 
   doctorSwarmCheck(config, databasePath, push);
   const report: DoctorReport = {
     generatedAt: new Date().toISOString(),
-    displayName: "DeepSeek Sub-Agent",
+    displayName: ACTIVE_DISPLAY_NAME,
     checks,
     completeDeliverySupported: false,
   };
@@ -519,7 +479,7 @@ export async function doctorObligationChecks(databasePath: string, push: (check:
         name: "open_terminal_agents",
         status: openTerminal > 0 ? "warning" : "ok",
         detail: openTerminal > 0
-          ? openTerminal + " completed/failed/timed-out agent(s) are still open (not closed); close them with deepseek_close after reviewing"
+          ? openTerminal + " completed/failed/timed-out agent(s) are still open (not closed); close them with subagents_close after reviewing"
           : "no terminal agents left open",
       });
       const openObligations = store.countOpenObligations();
@@ -628,7 +588,7 @@ async function listResource(config: BridgeConfig, resource: "agents" | "jobs", j
   for (const record of records) {
     if (resource === "agents") {
       const line = [
-        typeof record.title === "string" ? record.title : "DeepSeek task",
+        typeof record.title === "string" ? record.title : "Antigravity task",
         humanResourceState(record.status),
         durationLabel(record.createdAt, record.updatedAt),
         displayModelLabel(record.modelId, record.modelVariant),
@@ -642,7 +602,7 @@ async function listResource(config: BridgeConfig, resource: "agents" | "jobs", j
       }
     } else {
       const line = [
-        "DeepSeek task",
+        "Antigravity task",
         humanResourceState(record.status),
         durationLabel(record.createdAt, record.completedAt),
       ].filter(Boolean).join(" · ");
@@ -660,7 +620,7 @@ async function showAgent(config: BridgeConfig, id: string | undefined, json: boo
   const value = await new BridgeHttpClient(config).get<Record<string, unknown>>("/v1/agents/" + encodeURIComponent(id));
   const agent = (value.agent && typeof value.agent === "object") ? value.agent as Record<string, unknown> : {};
   const human = [
-    "DeepSeek Sub-Agent · " + String(agent.topic ?? "unknown"),
+    ACTIVE_DISPLAY_NAME + " · " + String(agent.topic ?? "unknown"),
     "state=" + humanResourceState(agent.status),
     "duration=" + (durationLabel(agent.createdAt, agent.updatedAt) || "unknown"),
     "model=" + displayModelLabel(agent.modelId, agent.modelVariant),
@@ -692,13 +652,13 @@ async function showLogs(config: BridgeConfig, json: boolean): Promise<void> {
 async function recover(config: BridgeConfig, jobId: string | undefined, json: boolean): Promise<void> {
   if (!jobId) throw new Error("recover requires a job id");
   const result = await new BridgeHttpClient(config).call<unknown>("/v1/jobs/recover", { jobId });
-  output(json, result, "Persisted DeepSeek result recovered.");
+  output(json, result, "Persisted Antigravity result recovered.");
 }
 
 async function deliver(config: BridgeConfig, jobId: string | undefined, json: boolean): Promise<void> {
   if (!jobId) throw new Error("deliver requires a job id");
   const result = await new BridgeHttpClient(config).call<unknown>("/v1/jobs/deliver", { jobId });
-  output(json, result, "Persisted DeepSeek result delivered.");
+  output(json, result, "Persisted Antigravity result delivered.");
 }
 
 async function showConfig(config: BridgeConfig, json: boolean): Promise<void> {
@@ -762,7 +722,7 @@ async function showObligations(config: BridgeConfig, json: boolean): Promise<voi
       diagnostics.unconsumedTerminalResults.map((item) => item.jobId).join(", "));
   }
   if (diagnostics.openTerminalAgents.length > 0) {
-    warnings.push("WARNING: " + diagnostics.openTerminalAgents.length + " terminal agent(s) are still open (not closed); close them with deepseek_close after reviewing: " +
+    warnings.push("WARNING: " + diagnostics.openTerminalAgents.length + " terminal agent(s) are still open (not closed); close them with subagents_close after reviewing: " +
       diagnostics.openTerminalAgents.map((item) => item.agentId).join(", "));
   }
   if (diagnostics.openObligations.length > 0) {
@@ -843,6 +803,12 @@ async function runRetentionCommand(config: BridgeConfig, mode: string | undefine
 }
 
 const ROUTE_COMMANDS = ["list", "status", "set"] as const;
+const LEGACY_ROUTE_NAMES = new Set(["flash-max"]);
+
+export function isLegacyRouteName(routeName: string): boolean {
+  const normalized = routeName.trim().toLowerCase();
+  return LEGACY_ROUTE_NAMES.has(normalized) || /deepseek|opencode/.test(normalized);
+}
 
 /**
  * Operator route control plane. Every route command requires the running
@@ -874,6 +840,9 @@ export async function runRouteCommand(
       return;
     }
     if (!routeName) throw new Error("route set requires a route name; use `route list` to see registered routes");
+    if (isLegacyRouteName(routeName)) {
+      throw new Error("Legacy model routes are unsupported; select an Antigravity/Gemini route. No route state was written.");
+    }
     const status = await client.call<RouteStatusInfo>("/v1/routes/active", { route: routeName });
     output(json, status,
       "Active model route set to " + (status.activeRoute?.display ?? routeName) +
@@ -884,7 +853,7 @@ export async function runRouteCommand(
     // malformed/live-response failures surface accurately and untouched.
     if (error instanceof BridgeHttpError) throw error;
     if (error instanceof BridgeTransportError) {
-      throw new Error("The route control plane requires the running daemon; start it with `deepseek-subagent start`. No route state was written while the daemon was stopped: " + redactSecrets(String(error)));
+      throw new Error("The route control plane requires the running daemon; start the Antigravity bridge first. No route state was written while the daemon was stopped: " + redactSecrets(String(error)));
     }
     throw error;
   }
@@ -1036,8 +1005,8 @@ export async function runCapture(command: string, args: string[], timeoutMs = DO
 }
 
 // Killing the shell wrapper alone on Windows leaves grandchildren behind.
-// taskkill /T /F terminates the whole subtree so a timed-out doctor probe
-// cannot orphan a codex/opencode child. If taskkill cannot be spawned (for
+// taskkill /T /F terminates the whole subtree so a timed-out explicit command
+// cannot orphan a child. If taskkill cannot be spawned (for
 // example it is missing from PATH), the failure is absorbed: cleanup is
 // best-effort and must not crash the doctor process.
 export function terminateProcessTree(child: import("node:child_process").ChildProcess): void {
@@ -1061,7 +1030,7 @@ async function runUninstall(parsed: CliArgs): Promise<void> {
   if (parsed.confirmPurge) args.push("-ConfirmPurge");
   const result = await runCapture(shell, args);
   if (!result.ok) throw new Error(redactSecrets(result.error || result.output));
-  output(parsed.json, { removed: true, removeCodex: parsed.removeCodex, purgeData: parsed.purgeData }, result.output.trim() || "DeepSeek Sub-Agent uninstalled.");
+  output(parsed.json, { removed: true, removeCodex: parsed.removeCodex, purgeData: parsed.purgeData }, result.output.trim() || ACTIVE_DISPLAY_NAME + " uninstalled.");
 }
 
 function humanResourceState(value: unknown): string {
@@ -1092,8 +1061,9 @@ function durationLabel(startValue: unknown, endValue: unknown): string {
 }
 
 function displayModelLabel(modelId: unknown, variant: unknown): string {
-  if (modelId !== "deepseek-v4-flash") return typeof modelId === "string" ? modelId : "";
-  return "DeepSeek V4 Flash" + (variant === "max" ? " · Max" : "");
+  if (modelId === "gemini-3.8-flash-high") return "Gemini 3.8 Flash High";
+  if (typeof modelId === "string" && modelId.startsWith("deepseek-")) return "Legacy model";
+  return typeof modelId === "string" ? modelId : "";
 }
 
 function safeUrl(value: string | null): string | null {
@@ -1108,17 +1078,6 @@ function safeUrl(value: string | null): string | null {
   }
 }
 
-async function resolveOpenCodeCommand(): Promise<string> {
-  const candidates = [
-    process.env.APPDATA ? path.join(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe") : "",
-    path.join(process.env.USERPROFILE ?? "", "AppData", "Roaming", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
-  ].filter(Boolean);
-  for (const candidate of candidates) {
-    if (await canRead(candidate)) return candidate;
-  }
-  return "opencode";
-}
-
 export async function readCodexMcpToolTimeout(explicitConfigPath?: string): Promise<number | null> {
   const codexHome = process.env.CODEX_HOME || path.join(process.env.USERPROFILE ?? "", ".codex");
   const configPath = explicitConfigPath ?? path.join(codexHome, "config.toml");
@@ -1128,7 +1087,7 @@ export async function readCodexMcpToolTimeout(explicitConfigPath?: string): Prom
   } catch {
     return null;
   }
-  const header = /^\[mcp_servers\.(?:deepseek-subagent|deepseek_subagent|"deepseek-subagent"|"deepseek_subagent")\][ \t]*(?:\r?\n|$)/m.exec(text);
+  const header = /^\[mcp_servers\.(?:subagents|subagents-mcp|"subagents"|"subagents-mcp"|deepseek-subagent|deepseek_subagent|"deepseek-subagent"|"deepseek_subagent")\][ \t]*(?:\r?\n|$)/m.exec(text);
   if (!header || header.index === undefined) return null;
   const remainder = text.slice(header.index + header[0].length);
   const nextHeader = /^\[/m.exec(remainder);
@@ -1138,21 +1097,14 @@ export async function readCodexMcpToolTimeout(explicitConfigPath?: string): Prom
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-async function runCodex(args: string[]): Promise<{ ok: boolean; output: string; error: string }> {
-  if (process.platform === "win32") {
-    return runCapture("cmd.exe", ["/d", "/s", "/c", ["codex", ...args].join(" ")]);
-  }
-  return runCapture("codex", args);
-}
-
 export function printHelp(): void {
   console.log([
-    "DeepSeek Sub-Agent local bridge",
+    "Antigravity Sub-Agent local bridge (DeepSeek Sub-Agent local bridge compatibility)",
     "",
     "Commands: daemon, mcp, install, start, stop, restart, doctor [--full], logs, agents, jobs, agent show <id>, inbox, deliver <jobId>, recover <jobId>, config show, obligations, retention <auto|disabled|dry-run|enabled>, route <list|status|set <route>>, backup [--destination <dir>]",
     "doctor performs a fast schema/access check by default; use --full to run SQLite PRAGMA quick_check.",
     "retention enabled on an existing database requires --confirm after reviewing `retention dry-run`. Run retention commands while the daemon is stopped.",
-    "route commands require the running daemon: route list shows registered routes, route status shows the effective active route, route set <route> switches it for new spawns without a daemon restart (existing agents keep their pinned route).",
+    "route commands require the running daemon: route list shows registered routes, route status shows the effective active route, route set <route> switches an Antigravity/Gemini route for new spawns without a daemon restart (existing agents keep their pinned route). Legacy routes are rejected without spawning a process.",
     "backup creates a safe online SQLite snapshot and manifest in the configured backup destination or an explicit override.",
     "Use --json for machine-readable output or --verbose for technical IDs in human listings. Secrets are always redacted.",
   ].join("\n"));

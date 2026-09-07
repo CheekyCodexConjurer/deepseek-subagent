@@ -23,7 +23,7 @@ export class InboxDelivery {
       recovered: false,
     }, null, 2) + "\n");
     if (!created) return filePath;
-    await this.notify("DeepSeek Sub-Agent", envelope.topic + ": " + envelope.summary);
+    await this.notify(notificationTitle(envelope), envelope.topic + ": " + envelope.summary);
     return filePath;
   }
 
@@ -38,6 +38,7 @@ export class InboxDelivery {
     topic: string;
     message: string;
     permissionId?: string | null;
+    provider?: string;
   }): Promise<string> {
     const directory = path.join(this.dataDir, "inbox");
     await ensurePrivateDir(directory);
@@ -51,13 +52,25 @@ export class InboxDelivery {
     };
     const created = await writePrivateFileExclusive(filePath, JSON.stringify(payload, null, 2) + "\n");
     if (!created) return filePath;
-    await this.notify("DeepSeek Sub-Agent", payload.topic + ": " + payload.message);
+    await this.notify(notice.provider === "antigravity" ? "Antigravity Sub-Agent" : "DeepSeek Sub-Agent", payload.topic + ": " + payload.message);
     return filePath;
   }
 
   async noticeExists(jobId: string, kind: string, permissionId?: string | null): Promise<boolean> {
     return canRead(noticeFilePath(this.dataDir, jobId, kind, permissionId));
   }
+}
+
+function notificationTitle(envelope: ResultEnvelope): string {
+  const isAntigravity = envelope.fallback
+    ? envelope.fallback.to === "antigravity"
+    : (
+        envelope.receipt?.provider === "antigravity" ||
+        envelope.modelDisplayName.startsWith("Antigravity · ") ||
+        envelope.opencodeSessionId.startsWith("antigravity:") ||
+        envelope.model.includes("gemini")
+      );
+  return isAntigravity ? "Antigravity Sub-Agent" : "DeepSeek Sub-Agent";
 }
 
 function noticeFilePath(dataDir: string, jobId: string, kind: string, permissionId?: string | null): string {

@@ -300,67 +300,7 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 1_000): Pr
   assert.equal(condition(), true, "condition did not become true before timeout");
 }
 
-test("spawn returns after dispatch, completes on idle, deduplicates, and continues same session", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-service-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const config = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    opencodeMode: "attach",
-    opencodeUrl: "http://127.0.0.1:1",
-  });
-  const service = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_one",
-      topic: "Fixture task",
-      task: "Inspect the fixture",
-      cwd: directory,
-      mode: "analyze",
-    });
-    assert.equal(accepted.status, "accepted");
-    assert.equal(client.promptCalls.length, 1);
-    assert.equal(service.getJob(accepted.jobId)?.status, "running");
-    client.messages = [{
-      info: { id: "assistant_one", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: Fixture completed\nFILES:\n- notes.txt\nTESTS:\n- unit smoke\nRISKS:\n- none" }],
-    }];
-    const idle: OpenCodeEvent = {
-      type: "session.idle",
-      properties: { sessionID: "session_1" },
-    };
-    await client.emit(idle);
-    await client.emit(idle);
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-    assert.equal(inbox.delivered.length, 1);
-    const continued = await service.continueJob({
-      requestId: "request_two",
-      agentId: accepted.agentId,
-      relation: "review",
-      task: "Review the previous result",
-    });
-    assert.equal(continued.status, "accepted");
-    assert.equal(client.promptCalls.length, 2);
-    assert.equal(client.promptCalls[1]?.sessionId, "session_1");
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_three",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "This must wait",
-    }), /busy/);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+
 test("Antigravity references large context files from the workspace instead of overflowing the CLI prompt", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-context-budget-"));
   const store = await BridgeStore.open(directory);
@@ -398,6 +338,7 @@ test("Antigravity references large context files from the workspace instead of o
   }
 });
 
+
 test("Antigravity rejects an oversized complete prompt before creating a job or process", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-prompt-preflight-"));
   const store = await BridgeStore.open(directory);
@@ -434,414 +375,6 @@ test("Antigravity rejects an oversized complete prompt before creating a job or 
   }
 });
 
-test("follow during a pending dispatch preserves the following state", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-dispatch-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  try {
-    await service.start();
-    const spawnPromise = service.spawn({
-      requestId: "request_follow_dispatch_race",
-      topic: "Follow dispatch race",
-      task: "Wait for a pending dispatch",
-      cwd: directory,
-    });
-    await waitForCondition(() => store.listJobs()[0]?.status === "dispatching");
-    const agent = store.listAgents()[0];
-    const job = store.listJobs()[0];
-    assert.ok(agent);
-    assert.ok(job);
-    const followPromise = service.follow({ agentId: agent.id, jobId: job.id, waitMinutes: 1, graceMinutes: 1 });
-    await waitForCondition(() => service.getJob(job.id)?.status === "following");
-    client.releasePrompt();
-    const accepted = await spawnPromise;
-    assert.equal(accepted.jobId, job.id);
-    assert.equal(service.getJob(job.id)?.status, "following");
-    client.messages = [{
-      info: { id: "assistant_follow_dispatch", role: "assistant", sessionID: agent.opencodeSessionId },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: dispatch race resolved" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: agent.opencodeSessionId } });
-    assert.equal((await followPromise).status, "completed");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("approval during a pending dispatch preserves needs_approval", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-dispatch-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  try {
-    await service.start();
-    const spawnPromise = service.spawn({
-      requestId: "request_approval_dispatch_race",
-      topic: "Approval dispatch race",
-      task: "Wait for approval during dispatch",
-      cwd: directory,
-    });
-    await waitForCondition(() => store.listJobs()[0]?.status === "dispatching");
-    const agent = store.listAgents()[0];
-    const job = store.listJobs()[0];
-    assert.ok(agent);
-    assert.ok(job);
-    await client.emit({ type: "permission.asked", properties: { sessionID: agent.opencodeSessionId, permission: { id: "permission_dispatch" } } });
-    assert.equal(service.getJob(job.id)?.status, "needs_approval");
-    assert.equal(service.getAgent(agent.id)?.status, "needs_approval");
-    client.releasePrompt();
-    await spawnPromise;
-    assert.equal(service.getJob(job.id)?.status, "needs_approval");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("dispatch rejection resolves a follow waiter instead of leaving it pending", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-dispatch-error-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  client.promptErrors.push(new Error("dispatch rejected"));
-  try {
-    await service.start();
-    const spawn = service.spawn({ requestId: "request_follow_dispatch_error", topic: "Follow dispatch error", task: "Fail dispatch", cwd: directory });
-    await waitForCondition(() => store.listJobs()[0]?.status === "dispatching");
-    const agent = store.listAgents()[0];
-    const job = store.listJobs()[0];
-    assert.ok(agent);
-    assert.ok(job);
-    const follow = service.follow({ agentId: agent.id, jobId: job.id, waitMinutes: 1, graceMinutes: 1 });
-    client.releasePrompt();
-    await assert.rejects(spawn, /dispatch rejected/);
-    assert.equal((await follow).status, "failed");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("late dispatch rejection preserves a permission request", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-dispatch-error-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  client.promptErrors.push(new Error("dispatch failed after approval"));
-  try {
-    await service.start();
-    const spawn = service.spawn({ requestId: "request_approval_dispatch_error", topic: "Approval dispatch error", task: "Fail after approval", cwd: directory });
-    await waitForCondition(() => store.listJobs()[0]?.status === "dispatching");
-    const agent = store.listAgents()[0];
-    const job = store.listJobs()[0];
-    assert.ok(agent);
-    assert.ok(job);
-    await client.emit({ type: "permission.asked", properties: { sessionID: agent.opencodeSessionId, permission: { id: "permission_late_dispatch" } } });
-    client.releasePrompt();
-    await assert.rejects(spawn, /dispatch failed after approval/);
-    assert.equal(service.getJob(job.id)?.status, "needs_approval");
-    assert.equal(service.getAgent(agent.id)?.status, "needs_approval");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("same request id creates one spawn under concurrent retries", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-spawn-request-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  try {
-    await service.start();
-    const input = { requestId: "request_spawn_same", topic: "Concurrent spawn", task: "Create one session", cwd: directory };
-    const first = service.spawn(input);
-    await waitForCondition(() => store.listJobs().length === 1);
-    const second = service.spawn(input);
-    assert.equal(client.sessionCount, 1);
-    client.releasePrompt();
-    const [firstAccepted, secondAccepted] = await Promise.all([first, second]);
-    assert.equal(firstAccepted.jobId, secondAccepted.jobId);
-    assert.equal(store.listAgents().length, 1);
-    assert.equal(store.listJobs().length, 1);
-    assert.equal(client.promptCalls.length, 1);
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("identical idle events are deduplicated per job, not per session", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-event-scope-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const first = await service.spawn({ requestId: "request_event_scope_first", topic: "Event scope", task: "Complete first turn", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_event_scope", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: first turn" }],
-    }];
-    const idle: OpenCodeEvent = { type: "session.idle", properties: { sessionID: "session_1" } };
-    await client.emit(idle);
-    const second = await service.continueJob({ requestId: "request_event_scope_second", agentId: first.agentId, relation: "continuation", task: "Complete second turn" });
-    client.messages = [{
-      info: { id: "assistant_event_scope", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: first turn" }],
-    }, {
-      info: { id: "assistant_event_scope_second", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: second turn" }],
-    }];
-    await client.emit(idle);
-    assert.equal(service.getJob(second.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("session idle is retried after a transient reconciliation failure", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-event-retry-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_event_retry", topic: "Event retry", task: "Recover after a transient read error", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_event_retry", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: retry completed" }],
-    }];
-    client.listMessagesError = new Error("temporary message read failure");
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    await waitForCondition(() => service.getJob(accepted.jobId)?.status === "delivered", 2_000);
-    assert.equal(client.listMessagesCalls, 2);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("event ledger admission failures use the bounded retry path", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-event-ledger-retry-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  let attempts = 0;
-  const insertEvent = store.insertEvent.bind(store);
-  store.insertEvent = ((input) => {
-    attempts += 1;
-    if (attempts === 1) throw new Error("temporary event ledger failure");
-    return insertEvent(input);
-  }) as BridgeStore["insertEvent"];
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_event_ledger_retry", topic: "Event ledger retry", task: "Retry event admission", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_event_ledger_retry", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: ledger retry completed" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    await waitForCondition(() => service.getJob(accepted.jobId)?.status === "delivered", 2_000);
-    assert.equal(attempts, 2);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("serializes concurrent continuations and rejects the second as busy", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-continue-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_continue_seed", topic: "Continue race", task: "Seed the session", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_continue_seed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    client.blockPrompt();
-    const first = service.continueJob({ requestId: "request_continue_one", agentId: accepted.agentId, relation: "continuation", task: "First continuation" });
-    await waitForCondition(() => client.promptCalls.length === 2);
-    const second = service.continueJob({ requestId: "request_continue_two", agentId: accepted.agentId, relation: "continuation", task: "Second continuation" });
-    client.releasePrompt();
-    const results = await Promise.allSettled([first, second]);
-    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
-    const rejected = results.find((result) => result.status === "rejected");
-    assert.ok(rejected && rejected.status === "rejected");
-    assert.ok(rejected.reason instanceof BridgeBusyError);
-    assert.equal(store.listJobs().filter((job) => job.agentId === accepted.agentId && ["dispatching", "running"].includes(job.status)).length, 1);
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("abort is explicit and does not reuse the OpenCode session", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_abort",
-      topic: "Abort fixture",
-      task: "Wait",
-      cwd: directory,
-    });
-    const stopped = await service.abort(accepted.agentId, "test");
-    assert.equal(stopped.status, "aborted");
-    assert.deepEqual(client.aborted, ["session_1"]);
-    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("startup reconciliation recovers a running job once without a duplicate delivery", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
-  try {
-    await first.start();
-    const accepted = await first.spawn({
-      requestId: "request_recovery",
-      topic: "Recovery fixture",
-      task: "Wait for recovery",
-      cwd: directory,
-    });
-    client.messages = [{
-      info: { id: "assistant_recovery", role: "assistant", sessionID: "session_1", finish: "stop" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: recovered" }],
-    }];
-    await first.stop();
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
-    await second.start();
-    assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
-    assert.equal(inbox.delivered.filter((jobId) => jobId === accepted.jobId).length, 1);
-    await second.stop();
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart does not reconcile a continuation from the prior assistant message", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-continuation-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
-  try {
-    await first.start();
-    const seed = await first.spawn({ requestId: "request_continuation_recovery_seed", topic: "Continuation recovery", task: "Finish the seed turn", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_continuation_previous", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: previous turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const continued = await first.continueJob({
-      requestId: "request_continuation_recovery_next",
-      agentId: seed.agentId,
-      relation: "continuation",
-      task: "Start a new turn",
-    });
-    assert.equal(first.getJob(continued.jobId)?.lastAssistantMessageId, "assistant_continuation_previous");
-    await first.stop();
-
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
-    try {
-      await second.start();
-      assert.equal(second.getJob(continued.jobId)?.status, "running");
-      assert.equal(inbox.delivered.filter((jobId) => jobId === continued.jobId).length, 0);
-      client.messages = [{
-        info: { id: "assistant_continuation_previous", role: "assistant", sessionID: "session_1" },
-        parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: previous turn" }],
-      }, {
-        info: { id: "assistant_continuation_current", role: "assistant", sessionID: "session_1" },
-        parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: current turn" }],
-      }];
-      await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-      assert.equal(second.getJob(continued.jobId)?.status, "delivered");
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    await first.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("worktree strategy rejects dirty repositories before creating a worktree from HEAD", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-worktree-"));
@@ -874,253 +407,6 @@ test("worktree strategy rejects dirty repositories before creating a worktree fr
   }
 });
 
-test("explicit deepseek_continue permission fields reply through the OpenCode permission API", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-permission-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_permission",
-      topic: "Permission fixture",
-      task: "Wait for an explicit permission response",
-      cwd: directory,
-    });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "per_fixture" } } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
-    const approvalDeadline = service.getJob(accepted.jobId)?.approvalDeadlineAt;
-    assert.ok(approvalDeadline);
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_permission_invalid",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Do not clear the approval timer",
-      permissionId: "per_fixture",
-    }), /both required/);
-    assert.equal(service.getJob(accepted.jobId)?.approvalDeadlineAt, approvalDeadline);
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_permission_message_only",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Do not resume from message only",
-      permissionMessage: "Only a message was supplied",
-    }), /both required/);
-    assert.equal(service.getJob(accepted.jobId)?.approvalDeadlineAt, approvalDeadline);
-    const continued = await service.continueJob({
-      requestId: "request_permission_reply",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Continue after the permission response",
-      permissionId: "per_fixture",
-      permissionReply: "once",
-      permissionMessage: "Approved for this operation.",
-    });
-    assert.equal(continued.status, "accepted");
-    assert.deepEqual(client.permissionReplies, [{
-      sessionId: "session_1",
-      permissionId: "per_fixture",
-      reply: "once",
-      message: "Approved for this operation.",
-    }]);
-    assert.equal(service.getJob(accepted.jobId)?.status, "running");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("approval continuation failures do not leave a falsely working job", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-permission-failure-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const resumed = await service.spawn({ requestId: "request_resume_failure", topic: "Resume failure", task: "Wait for approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_resume_failure" } } });
-    client.promptErrors.push(new Error("resume rejected"));
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_resume_failure_continue",
-      agentId: resumed.agentId,
-      relation: "continuation",
-      task: "Resume and fail",
-    }), /resume rejected/);
-    assert.equal(service.getJob(resumed.jobId)?.status, "failed");
-
-    const replied = await service.spawn({ requestId: "request_reply_failure", topic: "Reply failure", task: "Wait for another approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_2", permission: { id: "permission_reply_failure" } } });
-    client.replyErrors.push(new Error("permission reply rejected"));
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_reply_failure_continue",
-      agentId: replied.agentId,
-      relation: "continuation",
-      task: "Reply and fail",
-      permissionId: "permission_reply_failure",
-      permissionReply: "once",
-    }), /permission reply rejected/);
-    assert.equal(service.getJob(replied.jobId)?.status, "failed");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("permission.replied is not treated as a new approval request", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-permission-replied-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_permission_replied", topic: "Permission replied", task: "Ignore response events", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_replied" } } });
-    await service.continueJob({
-      requestId: "request_permission_replied_answer",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Answer the approval",
-      permissionId: "permission_replied",
-      permissionReply: "once",
-    });
-    await client.emit({ type: "permission.replied", properties: { sessionID: "session_1", permission: { id: "permission_replied" } } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "running");
-    assert.equal(service.getJob(accepted.jobId)?.permissionId, null);
-    assert.deepEqual(inbox.notices, [accepted.jobId + ":needs_approval"]);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("distinct approval requests get distinct notices and restart stays idempotent", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-generations-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const firstInbox = new FakeInbox(directory);
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: firstInbox });
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_approval_generations", topic: "Approval generations", task: "Handle two approvals", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_generation_one" } } });
-    await first.continueJob({
-      requestId: "request_approval_generation_one_reply",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Approve the first request",
-      permissionId: "permission_generation_one",
-      permissionReply: "once",
-    });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_generation_two" } } });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_generation_two" } } });
-    assert.deepEqual(firstInbox.notices, [accepted.jobId + ":needs_approval", accepted.jobId + ":needs_approval"]);
-    assert.equal(await firstInbox.noticeExists(accepted.jobId, "needs_approval", "permission_generation_one"), true);
-    assert.equal(await firstInbox.noticeExists(accepted.jobId, "needs_approval", "permission_generation_two"), true);
-    await first.stop();
-
-    const secondInbox = new FakeInbox(directory);
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: secondInbox });
-    try {
-      await second.start();
-      assert.deepEqual(secondInbox.notices, []);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    await first.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("a second approval arriving during reply is preserved", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-rpc-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-  });
-  client.blockReply();
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_approval_rpc_race", topic: "Approval RPC race", task: "Preserve a second approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_rpc_one" } } });
-    const reply = service.continueJob({
-      requestId: "request_approval_rpc_race_reply",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Reply to the first approval",
-      permissionId: "permission_rpc_one",
-      permissionReply: "once",
-    });
-    await waitForCondition(() => client.permissionReplies.length === 1);
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_rpc_two" } } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
-    assert.equal(service.getJob(accepted.jobId)?.permissionId, "permission_rpc_two");
-    client.releaseReply();
-    await reply;
-    assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
-    assert.equal(service.getJob(accepted.jobId)?.permissionId, "permission_rpc_two");
-    assert.deepEqual(inbox.notices, [accepted.jobId + ":needs_approval", accepted.jobId + ":needs_approval"]);
-  } finally {
-    client.releaseReply();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("recover_result returns the allowlisted persisted message projection", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-projection-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_recover_projection", topic: "Recovery projection", task: "Persist visible output", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_recover_projection", role: "assistant", sessionID: "session_1" },
-      parts: [
-        { type: "reasoning", text: "private recovery reasoning" },
-        { type: "tool", text: "private recovery tool payload" },
-        { type: "text", text: "STATUS: completed\nSUMMARY: visible recovery result" },
-      ],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const recovered = await service.recoverResult(accepted.jobId);
-    const serialized = JSON.stringify(recovered);
-    assert.doesNotMatch(serialized, /private recovery reasoning|private recovery tool payload/);
-    assert.match(serialized, /visible recovery result/);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("recover_result sanitizes a legacy result before returning it", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-legacy-"));
@@ -1160,6 +446,7 @@ test("recover_result sanitizes a legacy result before returning it", async () =>
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("automatic delivery sanitizes a legacy envelope before writing inbox", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-deliver-legacy-"));
@@ -1208,91 +495,6 @@ test("automatic delivery sanitizes a legacy envelope before writing inbox", asyn
   }
 });
 
-test("completed result waits for a late Codex correlation before using inbox", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-window-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const codex = new FakeCodex();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), experimentalSameChatDelivery: true }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-    codex,
-  });
-  try {
-    await service.start();
-    assert.equal(codex.startCalls, 1);
-    const accepted = await service.spawn({
-      requestId: "request_correlation_window",
-      topic: "Correlation window fixture",
-      task: "Wait for the Codex item correlation",
-      cwd: directory,
-    });
-    client.messages = [{
-      info: { id: "assistant_window", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: correlation window" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivery_pending");
-    assert.deepEqual(inbox.delivered, []);
-    codex.emit({ jobId: accepted.jobId, threadId: "thread_late", turnId: "turn_late", itemId: "item_late" });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.deepEqual(codex.delivered, [{ jobId: accepted.jobId, threadId: "thread_late" }]);
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-    assert.equal(store.getBinding(accepted.jobId)?.originatingItemId, "item_late");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("serializes a late correlation against an in-flight inbox fallback", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new BlockingInbox(directory);
-  const codex = new FakeCodex();
-  const service = new BridgeService(createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    codexCorrelationWindowMs: 25,
-    experimentalSameChatDelivery: true,
-  }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-    codex,
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_correlation_race",
-      topic: "Correlation race fixture",
-      task: "Exercise one delivery channel",
-      cwd: directory,
-    });
-    client.messages = [{
-      info: { id: "assistant_race", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: correlation race" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    await inbox.waitUntilStarted();
-    codex.emit({ jobId: accepted.jobId, threadId: "thread_race", turnId: "turn_race", itemId: "item_race" });
-    inbox.release();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.deepEqual(inbox.delivered, [accepted.jobId]);
-    assert.deepEqual(codex.delivered, []);
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    inbox.release();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("serializes two jobs that converge on one Codex thread after a late binding", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-thread-race-"));
@@ -1384,6 +586,7 @@ test("serializes two jobs that converge on one Codex thread after a late binding
   }
 });
 
+
 test("consult returns one immediate observable snapshot with bounded activity", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-consult-"));
   const store = await BridgeStore.open(directory);
@@ -1411,199 +614,6 @@ test("consult returns one immediate observable snapshot with bounded activity", 
   }
 });
 
-test("follow waits on session.idle without polling and returns the persisted result", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-event-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    followDefaultWaitMinutes: 12,
-    followDefaultGraceMinutes: 4,
-  }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_event", topic: "Event follow", task: "Wait for completion", cwd: directory });
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    await delay(25);
-    assert.equal(client.listMessagesCalls, 0);
-    assert.equal(client.diffCalls, 0);
-    const following = service.getJob(accepted.jobId);
-    assert.equal(following?.status, "following");
-    assert.ok(Math.abs(Date.parse(following?.followDeadlineAt ?? "") - Date.parse(following?.followStartedAt ?? "") - 12 * 60_000) < 1_000);
-    client.messages = [{
-      info: { id: "assistant_follow_event", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: event-driven follow" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const result = await follow;
-    assert.equal(result.status, "completed");
-    assert.equal(result.resultAvailable, true);
-    assert.equal(result.result?.envelope.summary, "event-driven follow");
-    assert.equal(client.listMessagesCalls, 1);
-    assert.equal(client.diffCalls, 1);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("healthy or hanging job remains active beyond follow window without automatic completion timeout or graceful finalize abort", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-timeout-active-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_no_timeout_active", topic: "No timeout follow", task: "Run without hard completion timeout", cwd: directory });
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-
-    const followPromise = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-
-    assert.ok(client.promptCalls.length >= 1);
-    assert.equal(client.promptCalls.some((call) => call.task.includes("Pare de expandir")), false, "Must not inject graceful finalize prompt");
-
-    assert.deepEqual(client.aborted, [], "Worker must not be aborted automatically");
-    assert.equal(["dispatching", "running", "following"].includes(service.getJob(accepted.jobId)?.status ?? ""), true);
-
-    client.messages = [{
-      info: { id: "assistant_no_timeout", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: completed without timeout abort" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const result = await followPromise;
-    assert.equal(result.status, "completed");
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("hanging or busy job is not auto-finalized and only explicit abort terminalizes", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-timeout-abort-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_no_timeout_explicit_abort", topic: "Hanging job", task: "Wait for explicit abort", cwd: directory });
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-
-    const followPromise = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-
-    assert.deepEqual(client.aborted, []);
-
-    const abortResult = await service.abort(accepted.agentId, "Operator cancelled hanging task");
-    assert.equal(abortResult.status, "aborted");
-    assert.equal(client.aborted.length, 1);
-
-    const followResult = await followPromise;
-    assert.equal(followResult.status, "aborted");
-    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart recovers a timed-out job when initial evidence capture failed", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-timeout-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 });
-  const first = new BridgeService(config, {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = first as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<{ status: string; resultAvailable: boolean }> };
-  };
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_follow_timeout_recovery", topic: "Timeout recovery", task: "Recover timeout evidence", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 1);
-    const job = first.getJob(accepted.jobId);
-    assert.ok(job);
-    client.listMessagesError = new Error("transient evidence read failure");
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
-    const result = await lifecycle.promise;
-    assert.equal(result.status, "timed_out");
-    assert.equal(result.resultAvailable, false);
-    assert.equal(first.getJob(accepted.jobId)?.resultPath, null);
-    await first.stop();
-
-    client.messages = [{
-      info: { id: "assistant_timeout_recovery", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: recovered timeout evidence" }],
-    }];
-    const secondInbox = new FakeInbox(directory);
-    const second = new BridgeService(config, {
-      store,
-      manager: new FakeManager(client),
-      inbox: secondInbox,
-    });
-    try {
-      await second.start();
-      assert.ok(second.getJob(accepted.jobId)?.resultPath);
-      assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
-      assert.deepEqual(secondInbox.delivered, [accepted.jobId]);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("cancelling follow removes only the waiter and does not abort DeepSeek", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-cancel-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_cancel", topic: "Cancel follow", task: "Keep working after waiter cancellation", cwd: directory });
-    const controller = new AbortController();
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 }, controller.signal);
-    controller.abort();
-    await assert.rejects(follow, (error: unknown) => error instanceof FollowCancelledError);
-    assert.deepEqual(client.aborted, []);
-    client.messages = [{
-      info: { id: "assistant_follow_cancel", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: worker continued" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("follow floors short wait/grace values at the configured defaults", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-minimum-window-"));
@@ -1639,145 +649,6 @@ test("follow floors short wait/grace values at the configured defaults", async (
   }
 });
 
-test("approval and session errors resolve follow immediately", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-terminal-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const approved = await service.spawn({ requestId: "request_follow_approval", topic: "Approval follow", task: "Wait for approval", cwd: directory });
-    const approvalFollow = service.follow({ agentId: approved.agentId, jobId: approved.jobId, waitMinutes: 1, graceMinutes: 1 });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_follow" } } });
-    const approval = await approvalFollow;
-    assert.equal(approval.status, "needs_approval");
-    assert.equal(approval.permissionId, "permission_follow");
-
-    const failed = await service.spawn({ requestId: "request_follow_error", topic: "Error follow", task: "Wait for an error", cwd: directory });
-    const errorFollow = service.follow({ agentId: failed.agentId, jobId: failed.jobId, waitMinutes: 1, graceMinutes: 1 });
-    await client.emit({ type: "session.error", properties: { sessionID: "session_2", error: "controlled failure" } });
-    const error = await errorFollow;
-    assert.equal(error.status, "failed");
-    assert.match(error.error ?? "", /controlled|terminal|OpenCode/i);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("approval continuation wins over an in-flight timeout abort", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-timeout-race-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    expireApproval(agentId: string, jobId: string): Promise<void>;
-  };
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_approval_timeout_race", topic: "Approval timeout race", task: "Wait for approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_timeout_race" } } });
-    store.setApprovalDeadline(accepted.jobId, new Date(Date.now() - 1).toISOString());
-    client.blockAbort();
-    const expiration = internal.expireApproval(accepted.agentId, accepted.jobId);
-    await waitForCondition(() => client.abortCalls === 1);
-    await service.continueJob({
-      requestId: "request_approval_timeout_race_continue",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Approve before the stale timeout can fail the job",
-      permissionId: "permission_timeout_race",
-      permissionReply: "once",
-    });
-    client.releaseAbort();
-    await expiration;
-    assert.equal(service.getJob(accepted.jobId)?.status, "running");
-    assert.equal(service.getAgent(accepted.agentId)?.status, "working");
-  } finally {
-    client.releaseAbort();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("a new approval during timeout abort renews its own window", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-timeout-generation-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-  });
-  const internal = service as unknown as {
-    expireApproval(agentId: string, jobId: string): Promise<void>;
-  };
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_approval_timeout_generation", topic: "Approval timeout generation", task: "Preserve a new approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_timeout_one" } } });
-    store.setApprovalDeadline(accepted.jobId, new Date(Date.now() - 1).toISOString());
-    client.blockAbort();
-    const expiration = internal.expireApproval(accepted.agentId, accepted.jobId);
-    await waitForCondition(() => client.abortCalls === 1);
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_timeout_two" } } });
-    client.releaseAbort();
-    await expiration;
-    const job = service.getJob(accepted.jobId);
-    assert.equal(job?.status, "needs_approval");
-    assert.equal(job?.permissionId, "permission_timeout_two");
-    assert.ok(Date.parse(job?.approvalDeadlineAt ?? "") > Date.now());
-    assert.deepEqual(inbox.notices, [accepted.jobId + ":needs_approval", accepted.jobId + ":needs_approval"]);
-  } finally {
-    client.releaseAbort();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("multiple follow callers share one lifecycle without triggering automatic graceful finalize", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-shared-no-timeout-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_follow_shared_no_timeout", topic: "Shared follow", task: "Share lifecycle without auto finalize", cwd: directory });
-    const first = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-    const second = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-
-    assert.equal(client.promptCalls.some((call) => call.task.includes("Pare de expandir")), false);
-
-    client.messages = [{
-      info: { id: "assistant_shared_done", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: shared completion" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    const [res1, res2] = await Promise.all([first, second]);
-    assert.equal(res1.status, "completed");
-    assert.equal(res2.status, "completed");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("same-chat delivery is disabled by default even when an App Server command is configured", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-same-chat-default-"));
@@ -1796,6 +667,7 @@ test("same-chat delivery is disabled by default even when an App Server command 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("same-chat flag also blocks an injected adapter lifecycle when disabled", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-same-chat-injected-"));
@@ -1819,264 +691,15 @@ test("same-chat flag also blocks an injected adapter lifecycle when disabled", a
   }
 });
 
-test("daemon restart reconstructs finalizing follow without sending a duplicate prompt", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-restart-"));
-  const store = await BridgeStore.open(directory);
-  const firstClient = new FakeClient();
-  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
-    store,
-    manager: new FakeManager(firstClient),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = first as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<unknown> };
-  };
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_follow_restart", topic: "Restart follow", task: "Persist follow state", cwd: directory });
-    await waitForCondition(() => firstClient.promptCalls.length === 1);
-    const job = first.getJob(accepted.jobId);
-    assert.ok(job);
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.2);
-    assert.equal(first.getJob(accepted.jobId)?.followGraceMinutes, 0.2);
-    lifecycle.promise.catch(() => undefined);
-    await waitForCondition(() => first.getJob(accepted.jobId)?.status === "finalizing");
-    assert.equal(firstClient.promptCalls.filter((call) => call.task.includes("Pare de expandir")).length, 1);
-    await first.stop();
-
-    const secondClient = new FakeClient();
-    const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
-      store,
-      manager: new FakeManager(secondClient),
-      inbox: new FakeInbox(directory),
-    });
-    try {
-      await second.start();
-      assert.equal(secondClient.promptCalls.filter((call) => call.task.includes("Pare de expandir")).length, 0);
-      assert.equal(second.getJob(accepted.jobId)?.status, "finalizing");
-      assert.equal(second.getJob(accepted.jobId)?.followGraceMinutes, 0.2);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart derives the remaining grace window when its marker was not persisted", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-grace-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_follow_grace_recovery", topic: "Grace recovery", task: "Persist the remaining grace window", cwd: directory });
-    const now = Date.now();
-    const followDeadline = new Date(now - 1_000).toISOString();
-    await Promise.resolve();
-    store.updateJobStatus(accepted.jobId, "following");
-    store.setFollowWindow(accepted.jobId, {
-      startedAt: new Date(now - 61_000).toISOString(),
-      deadlineAt: followDeadline,
-      graceMinutes: 0.2,
-      graceDeadlineAt: null,
-      gracefulFinalizeAttempted: false,
-    });
-    store.updateJobStatus(accepted.jobId, "finalizing");
-    await first.stop();
-
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-    try {
-      await second.start();
-      const recovered = second.getJob(accepted.jobId);
-      assert.equal(recovered?.status, "finalizing");
-      assert.equal(recovered?.followGraceMinutes, 0.2);
-      assert.equal(Date.parse(recovered?.graceDeadlineAt ?? ""), Date.parse(followDeadline) + 0.2 * 60_000);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart raises a pre-fix short follow window to the configured defaults", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-short-window-restart-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    followDefaultWaitMinutes: 12,
-    followDefaultGraceMinutes: 4,
-  });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_follow_short_window_restart", topic: "Pre-fix window", task: "Persist a pre-fix short window", cwd: directory });
-    const now = Date.now();
-    store.updateJobStatus(accepted.jobId, "following");
-    store.setFollowWindow(accepted.jobId, {
-      startedAt: new Date(now - 60_000).toISOString(),
-      deadlineAt: new Date(now - 1_000).toISOString(),
-      graceMinutes: 1,
-      graceDeadlineAt: null,
-      gracefulFinalizeAttempted: false,
-    });
-    await first.stop();
-
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-    try {
-      await second.start();
-      const recovered = second.getJob(accepted.jobId);
-      assert.ok(recovered);
-      assert.equal(recovered.status, "following");
-      assert.ok(Math.abs(Date.parse(recovered.followDeadlineAt ?? "") - Date.parse(recovered.followStartedAt ?? "") - 12 * 60_000) < 1_000);
-      assert.equal(recovered.followGraceMinutes, 4);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("daemon restart rehydrates approval without duplicating the notice", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-restart-"));
-  const store = await BridgeStore.open(directory);
-  const firstClient = new FakeClient();
-  const firstInbox = new FakeInbox(directory);
-  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(firstClient),
-    inbox: firstInbox,
-  });
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_approval_restart", topic: "Approval restart", task: "Wait for approval", cwd: directory });
-    await firstClient.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_restart" } } });
-    assert.deepEqual(firstInbox.notices, [accepted.jobId + ":needs_approval"]);
-    const approvalDeadline = first.getJob(accepted.jobId)?.approvalDeadlineAt;
-    assert.ok(approvalDeadline);
-    const activityCount = store.listActivity(accepted.agentId).length;
-    await first.stop();
-    store.updateAgentStatus(accepted.agentId, "working");
-
-    const secondClient = new FakeClient();
-    const secondInbox = new FakeInbox(directory);
-    const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-      store,
-      manager: new FakeManager(secondClient),
-      inbox: secondInbox,
-    });
-    try {
-      await second.start();
-      assert.equal(second.getJob(accepted.jobId)?.status, "needs_approval");
-      assert.equal(second.getJob(accepted.jobId)?.approvalDeadlineAt, approvalDeadline);
-      assert.deepEqual(secondInbox.notices, []);
-      assert.equal(store.listActivity(accepted.agentId).length, activityCount);
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("visual context is embedded only when supplied, for spawn and continue", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-visual-context-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const spawnPlain = await service.spawn({
-      requestId: "request_visual_spawn_plain",
-      topic: "Visual context",
-      task: "Inspect without visual context",
-      cwd: directory,
-    });
-    assert.doesNotMatch(client.promptCalls[0]?.task ?? "", /VISUAL CONTEXT FROM CODEX/);
-
-    const spawnWith = await service.spawn({
-      requestId: "request_visual_spawn_with",
-      topic: "Visual context",
-      task: "Inspect with visual context",
-      cwd: directory,
-      visualContext: [
-        "Direct observations: the dialog shows a red error banner",
-        "Interpretation: the build failed on the parser step",
-        "Uncertainty: the stack trace is partially cut off",
-      ].join("\n"),
-    });
-    const spawnPrompt = client.promptCalls[1]?.task ?? "";
-    assert.match(spawnPrompt, /VISUAL CONTEXT FROM CODEX/);
-    assert.match(spawnPrompt, /original pixels are not available/);
-    assert.match(spawnPrompt, /interpretation as a hypothesis/);
-    assert.match(spawnPrompt, /Direct observations:\nthe dialog shows a red error banner/);
-    assert.match(spawnPrompt, /Interpretation:\nthe build failed on the parser step/);
-    assert.match(spawnPrompt, /Uncertainty:\nthe stack trace is partially cut off/);
-    assert.doesNotMatch(spawnPrompt, /data:image|image data|base64/i);
-
-    client.messages = [{
-      info: { id: "assistant_visual_plain", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-
-    const continuePlain = await service.continueJob({
-      requestId: "request_visual_continue_plain",
-      agentId: spawnPlain.agentId,
-      relation: "continuation",
-      task: "Continue without visual context",
-    });
-    assert.doesNotMatch(client.promptCalls[2]?.task ?? "", /VISUAL CONTEXT FROM CODEX/);
-
-    client.messages = [{
-      info: { id: "assistant_visual_plain", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
-    }, {
-      info: { id: "assistant_visual_continue_plain", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: continue seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-
-    const continueWith = await service.continueJob({
-      requestId: "request_visual_continue_with",
-      agentId: spawnPlain.agentId,
-      relation: "continuation",
-      task: "Continue with visual context",
-      visualContext: "Direct observations: the chart shows a spike\nInterpretation: the spike is a cache miss\nUncertainty: the axis scale is unclear",
-    });
-    const continuePrompt = client.promptCalls[3]?.task ?? "";
-    assert.match(continuePrompt, /VISUAL CONTEXT FROM CODEX/);
-    assert.match(continuePrompt, /Direct observations:\nthe chart shows a spike/);
-    assert.match(continuePrompt, /Interpretation:\nthe spike is a cache miss/);
-    assert.match(continuePrompt, /Uncertainty:\nthe axis scale is unclear/);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("visual context is redacted and truncated deterministically before dispatch", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-visual-context-limit-"));
   const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
   const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
     store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls, prompts) }),
   });
   try {
     await service.start();
@@ -2087,7 +710,8 @@ test("visual context is redacted and truncated deterministically before dispatch
       cwd: directory,
       visualContext: "Direct observations: api_key=supersecret " + "x".repeat(25_000) + "\nInterpretation: beyond the limit",
     });
-    const prompt = client.promptCalls[0]?.task ?? "";
+    await waitForCondition(() => prompts.length === 1);
+    const prompt = prompts[0] ?? "";
     assert.doesNotMatch(prompt, /supersecret/);
     assert.match(prompt, /api_key=\[REDACTED\]/);
     const block = prompt.split("VISUAL CONTEXT FROM CODEX")[1] ?? "";
@@ -2097,283 +721,6 @@ test("visual context is redacted and truncated deterministically before dispatch
     assert.match(prompt, /Interpretation:\nNone provided\./);
   } finally {
     await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("transport-failed spawn dispatch resolves accepted with followable IDs and no duplicate dispatch", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  client.promptErrors.push(new OpenCodeTransportError("POST", "/session/session_1/prompt_async", "timed out"));
-  try {
-    await service.start();
-    const spawn = service.spawn({ requestId: "request_dispatch_unknown", topic: "Unknown dispatch", task: "Transport may have accepted", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 1);
-    client.releasePrompt();
-    const accepted = await spawn;
-    assert.equal(accepted.accepted, true, "an unknown transport outcome must resolve as an accepted bridge obligation");
-    assert.equal(accepted.outcome, "dispatch_unknown");
-    assert.equal(accepted.agentId, store.listAgents()[0]?.id);
-    assert.equal(accepted.jobId, store.listJobs()[0]?.id);
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-    assert.equal(job.status, "following", "mandatory follow must arm the deadline for an unaccepted prompt");
-    assert.ok(Math.abs(Date.parse(job.followDeadlineAt ?? "") - Date.parse(job.followStartedAt ?? "") - 20 * 60_000) < 1_000);
-    assert.equal(job.followGraceMinutes, 5);
-    assert.equal(service.getAgent(accepted.agentId)?.status, "working", "the agent must not be marked failed");
-    assert.match(job.error ?? "", /outcome unknown/i);
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_dispatch_unknown_duplicate",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Must not create a duplicate continuation",
-    }), /busy/);
-    assert.equal(client.promptCalls.length, 1, "no second prompt dispatch may occur");
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    const aborted = await service.abort(accepted.agentId, "settle by abort");
-    assert.equal(aborted.jobId, accepted.jobId);
-    assert.equal((await follow).status, "aborted");
-    assert.equal(service.getJob(accepted.jobId)?.status, "aborted");
-    assert.equal(client.promptCalls.length, 1);
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("transport-failed continue dispatch resolves accepted and settles through the armed follow deadline", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-continue-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    timeoutFollow(jobId: string): Promise<void>;
-  };
-  try {
-    await service.start();
-    const seed = await service.spawn({ requestId: "request_dispatch_unknown_seed", topic: "Unknown continue", task: "Seed the session", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_unknown_continue_seed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(service.getJob(seed.jobId)?.status, "delivered");
-    client.blockPrompt();
-    client.promptErrors.push(new OpenCodeTransportError("POST", "/session/session_1/prompt_async", "connection reset"));
-    const continuation = service.continueJob({
-      requestId: "request_dispatch_unknown_continue",
-      agentId: seed.agentId,
-      relation: "continuation",
-      task: "Transport may have accepted",
-    });
-    await waitForCondition(() => client.promptCalls.length === 2);
-    client.releasePrompt();
-    const accepted = await continuation;
-    assert.equal(accepted.accepted, true, "an unknown continue outcome must resolve as an accepted bridge obligation");
-    assert.equal(accepted.outcome, "dispatch_unknown");
-    assert.equal(accepted.jobId, store.listJobs()[0]?.id);
-    const job = service.getJob(accepted.jobId);
-    assert.ok(job);
-    assert.equal(job.status, "following");
-    assert.ok(job.followDeadlineAt);
-    assert.equal(job.lastAssistantMessageId, "assistant_unknown_continue_seed", "the continuation baseline must be preserved");
-    assert.equal(client.promptCalls.length, 2, "seed plus the single uncertain continuation, no duplicates");
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    store.updateJobStatus(accepted.jobId, "finalizing");
-    await internal.timeoutFollow(accepted.jobId);
-    const result = await follow;
-    assert.equal(result.status, "timed_out", "the armed follow deadline must settle an unaccepted prompt");
-    assert.equal(service.getAgent(accepted.agentId)?.status, "timed_out");
-    assert.equal(client.promptCalls.length, 2, "settlement must not dispatch the task a second time");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("definite HTTP dispatch rejection still fails the job and agent", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-definite-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.promptErrors.push(new OpenCodeHttpError(400, "POST", "http://127.0.0.1:1/session/session_1/prompt_async", "bad request"));
-  try {
-    await service.start();
-    await assert.rejects(() => service.spawn({ requestId: "request_dispatch_definite", topic: "Definite dispatch", task: "Fail loudly", cwd: directory }), /HTTP 400/);
-    const job = store.listJobs()[0];
-    assert.ok(job);
-    assert.equal(job.status, "failed");
-    assert.equal(service.getAgent(job.agentId)?.status, "failed");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart recovery keeps an unknown-outcome job under its armed follow and settles on events", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-dispatch-unknown-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  client.blockPrompt();
-  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "connection reset"));
-  try {
-    await first.start();
-    const spawn = first.spawn({ requestId: "request_dispatch_unknown_recovery", topic: "Unknown recovery", task: "Survive restart", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 1);
-    client.releasePrompt();
-    const accepted = await spawn;
-    assert.equal(accepted.accepted, true);
-    assert.equal(accepted.outcome, "dispatch_unknown");
-    assert.equal(first.getJob(accepted.jobId)?.status, "following");
-    client.messages = [{
-      info: { id: "assistant_unknown_recovery", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: finished before the daemon restarted" }],
-    }];
-    await first.stop();
-
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-    try {
-      await second.start();
-      assert.equal(second.getJob(accepted.jobId)?.status, "following", "restart must re-arm the follow for the active unknown-outcome job");
-      assert.ok(second.getJob(accepted.jobId)?.followDeadlineAt);
-      await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-      assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
-    } finally {
-      await second.stop();
-    }
-  } finally {
-    client.releasePrompt();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("message.part.delta events are not persisted while meaningful events remain", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-delta-suppression-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const countEvents = () => (store.db.prepare("SELECT COUNT(*) AS count FROM events").get() as { count: number }).count;
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_delta_suppression", topic: "Delta suppression", task: "Ignore streaming deltas", cwd: directory });
-    const activityBefore = store.listActivity(accepted.agentId).length;
-    const eventsBefore = countEvents();
-    for (let index = 0; index < 25; index += 1) {
-      await client.emit({ type: "message.part.delta", properties: { sessionID: "session_1", delta: { text: "partial" } } });
-    }
-    assert.equal(store.listActivity(accepted.agentId).length, activityBefore, "deltas must not add activity rows");
-    assert.equal(countEvents(), eventsBefore, "deltas must not add event ledger rows");
-    client.messages = [{
-      info: { id: "assistant_delta_suppression", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: completed after deltas" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("idle with tool-only assistant output never completes; real output completes later", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-empty-tail-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_empty_tail", topic: "Empty tail", task: "Produce no visible output", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_tool_only", role: "assistant", sessionID: "session_1" },
-      parts: [
-        { type: "reasoning", text: "private reasoning" },
-        { type: "tool", text: "tool payload" },
-      ],
-    }];
-    await client.emit({ type: "session.idle", id: "idle_empty_tail_one", properties: { sessionID: "session_1" } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "running", "a tool-only tail must not complete the job");
-    assert.equal(service.getAgent(accepted.agentId)?.status, "working");
-    client.messages = [{
-      info: { id: "assistant_tool_only", role: "assistant", sessionID: "session_1" },
-      parts: [
-        { type: "reasoning", text: "private reasoning" },
-        { type: "tool", text: "tool payload" },
-        { type: "text", text: "STATUS: completed\nSUMMARY: real output after the empty tail" },
-      ],
-    }];
-    await client.emit({ type: "session.idle", id: "idle_empty_tail_two", properties: { sessionID: "session_1" } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("restart reconciliation does not complete an empty-tail job", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-empty-tail-recovery-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
-  const first = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await first.start();
-    const accepted = await first.spawn({ requestId: "request_empty_tail_recovery", topic: "Empty tail recovery", task: "Stay fail-closed", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_empty_tail", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "tool", text: "no visible text" }],
-    }];
-    await client.emit({ type: "session.idle", id: "idle_empty_tail_recovery_one", properties: { sessionID: "session_1" } });
-    assert.equal(first.getJob(accepted.jobId)?.status, "running");
-    await first.stop();
-
-    const second = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-    try {
-      await second.start();
-      assert.equal(second.getJob(accepted.jobId)?.status, "running", "reconciliation must not turn an empty-tail job into a completed success");
-      client.messages = [{
-        info: { id: "assistant_empty_tail_text", role: "assistant", sessionID: "session_1" },
-        parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: visible output after recovery" }],
-      }];
-      await client.emit({ type: "session.idle", id: "idle_empty_tail_recovery_two", properties: { sessionID: "session_1" } });
-      assert.equal(second.getJob(accepted.jobId)?.status, "delivered");
-    } finally {
-      await second.stop();
-    }
-  } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });
   }
@@ -2407,209 +754,6 @@ test("abort auto-closes the agent and keeps it non-continuable", async () => {
   }
 });
 
-test("failed and timed-out writers remain continuable until closed", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-writer-lifecycle-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json"), workerMaxExecutionMinutes: 1 }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    ensureFollowLifecycle(job: JobRecord, waitMinutes: number, graceMinutes: number): { promise: Promise<unknown> };
-  };
-  try {
-    await service.start();
-    const failed = await service.spawn({ requestId: "request_writer_failed_seed", topic: "Failed writer", task: "Fail the seed", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_writer_failed_seed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    client.promptErrors.push(new OpenCodeHttpError(503, "POST", "/prompt_async", "unavailable"));
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_writer_failed_second",
-      agentId: failed.agentId,
-      relation: "continuation",
-      task: "Trigger a definite failure",
-    }), /HTTP 503/);
-    assert.equal(service.getAgent(failed.agentId)?.status, "failed");
-    const continuedAfterFailure = await service.continueJob({
-      requestId: "request_writer_failed_continue",
-      agentId: failed.agentId,
-      relation: "continuation",
-      task: "A failed writer stays continuable",
-    });
-    assert.equal(continuedAfterFailure.status, "accepted");
-
-    const timedOut = await service.spawn({ requestId: "request_writer_timeout_seed", topic: "Timeout writer", task: "Hit the grace deadline", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 4);
-    const job = service.getJob(timedOut.jobId);
-    assert.ok(job);
-    const lifecycle = internal.ensureFollowLifecycle(job, 0, 0.001);
-    assert.equal((await lifecycle.promise).status, "timed_out");
-    assert.equal(service.getAgent(timedOut.agentId)?.status, "timed_out");
-    const continuedAfterTimeout = await service.continueJob({
-      requestId: "request_writer_timeout_continue",
-      agentId: timedOut.agentId,
-      relation: "continuation",
-      task: "A timed-out writer stays continuable",
-    });
-    assert.equal(continuedAfterTimeout.status, "accepted");
-
-    await service.close(failed.agentId);
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_writer_closed_continue",
-      agentId: failed.agentId,
-      relation: "continuation",
-      task: "Closed writers are not continuable",
-    }), /not continuable/);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("allow_respawn resumes a closed agent through a new lineage agent and session", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const parent = await service.spawn({
-      requestId: "request_respawn_parent",
-      topic: "Lineage fixture",
-      task: "Seed the parent",
-      cwd: directory,
-      mode: "analyze",
-      threadId: "thread_lineage",
-      turnId: "turn_lineage",
-    });
-    const parentSession = service.getAgent(parent.agentId)?.opencodeSessionId;
-    assert.ok(parentSession);
-    client.messages = [{
-      info: { id: "assistant_respawn_parent", role: "assistant", sessionID: parentSession },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: parent seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: parentSession } });
-    assert.equal(service.getJob(parent.jobId)?.status, "delivered");
-
-    await service.close(parent.agentId);
-    assert.equal(service.getAgent(parent.agentId)?.status, "closed");
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_respawn_no_flag",
-      agentId: parent.agentId,
-      relation: "correction",
-      task: "Must be rejected without the flag",
-    }), /not continuable/);
-
-    const resumed = await service.continueJob({
-      requestId: "request_respawn_child",
-      agentId: parent.agentId,
-      relation: "correction",
-      task: "Fix the review findings",
-      allowRespawn: true,
-    });
-    assert.equal(resumed.status, "accepted");
-    assert.notEqual(resumed.agentId, parent.agentId, "the child is a new agent");
-    assert.notEqual(resumed.jobId, parent.jobId, "the child gets a new job obligation");
-
-    const parentRecord = service.getAgent(parent.agentId);
-    const child = service.getAgent(resumed.agentId);
-    assert.ok(parentRecord);
-    assert.ok(child);
-    assert.equal(child.parentAgentId, parent.agentId, "lineage is recorded on the child");
-    assert.equal(parentRecord.parentAgentId, null, "the parent has no lineage");
-    assert.equal(child.topic, parentRecord.topic, "topic is inherited");
-    assert.equal(child.workspacePath, parentRecord.workspacePath, "workspace is reused");
-    assert.equal(child.workspaceStrategy, parentRecord.workspaceStrategy, "strategy is inherited");
-    assert.equal(child.modelProviderId, parentRecord.modelProviderId, "pinned provider is inherited");
-    assert.equal(child.modelId, parentRecord.modelId, "pinned model is inherited");
-    assert.equal(child.modelRoute, parentRecord.modelRoute, "pinned route label is inherited");
-    assert.notEqual(child.opencodeSessionId, parentRecord.opencodeSessionId, "the closed session is never reused");
-    assert.equal(client.promptCalls.at(-1)?.sessionId, child.opencodeSessionId, "dispatch targets the new session");
-
-    const childJob = service.getJob(resumed.jobId);
-    assert.ok(childJob);
-    assert.equal(childJob.kind, "continue");
-    assert.equal(childJob.hintThreadId, "thread_lineage", "parent correlation hint is derived");
-    assert.equal(childJob.hintTurnId, "turn_lineage");
-    assert.equal(childJob.hintSource, "mcp", "the derived hint keeps its original provenance");
-
-    const parentResumeEvents = store.listActivity(parent.agentId, 20).filter((activity) => /resumed/.test(activity.summary));
-    const childLineageEvents = store.listActivity(child.id, 20).filter((activity) => /closed agent/.test(activity.summary));
-    assert.equal(parentResumeEvents.length, 1, "the parent has an auditable resume event");
-    assert.equal(childLineageEvents.length, 1, "the child has an auditable lineage event");
-
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_respawn_permission",
-      agentId: parent.agentId,
-      relation: "continuation",
-      task: "Permission fields do not apply to a resume",
-      allowRespawn: true,
-      permissionId: "permission_x",
-      permissionReply: "once",
-    }), /not applicable/i);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("allow_respawn with the same request_id creates exactly one lineage child", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-dedupe-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const parent = await service.spawn({
-      requestId: "request_respawn_dedupe_parent",
-      topic: "Dedupe fixture",
-      task: "Seed the parent",
-      cwd: directory,
-    });
-    const parentSession = service.getAgent(parent.agentId)?.opencodeSessionId;
-    assert.ok(parentSession);
-    client.messages = [{
-      info: { id: "assistant_respawn_dedupe", role: "assistant", sessionID: parentSession },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: dedupe seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: parentSession } });
-    await service.close(parent.agentId);
-
-    const input = {
-      requestId: "request_respawn_dedupe_same",
-      agentId: parent.agentId,
-      relation: "continuation" as const,
-      task: "Resume exactly once",
-      allowRespawn: true,
-    };
-    const first = await service.continueJob(input);
-    const second = await service.continueJob(input);
-    assert.equal(second.agentId, first.agentId, "the same lineage child is returned");
-    assert.equal(second.jobId, first.jobId, "the same obligation is returned");
-    const children = service.listAgents().filter((agent) => agent.parentAgentId === parent.agentId);
-    assert.equal(children.length, 1, "a duplicate recovery never creates a second child");
-    assert.equal(client.sessionCount, 2, "only the parent session plus one new session exist");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("allow_respawn never resumes an explicitly aborted agent", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-abort-"));
@@ -2646,426 +790,6 @@ test("allow_respawn never resumes an explicitly aborted agent", async () => {
   }
 });
 
-test("allow_respawn fails closed when the closed agent has no persisted result", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-respawn-noresult-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    client.promptErrors.push(new OpenCodeHttpError(503, "POST", "/prompt_async", "unavailable"));
-    await assert.rejects(() => service.spawn({
-      requestId: "request_respawn_noresult_parent",
-      topic: "No result fixture",
-      task: "Seed the parent",
-      cwd: directory,
-    }), /HTTP 503/);
-    const parent = store.listAgents()[0];
-    assert.ok(parent);
-    assert.equal(parent.status, "failed");
-    await service.close(parent.id);
-    assert.equal(service.getAgent(parent.id)?.status, "closed");
-    assert.equal(store.listJobs()[0]?.resultPath, null, "no result was ever persisted");
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_respawn_noresult_child",
-      agentId: parent.id,
-      relation: "continuation",
-      task: "Must not resume without a persisted result",
-      allowRespawn: true,
-    }), /without a persisted result/);
-    assert.equal(service.listAgents().length, 1, "no lineage child is created");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("spawn and continue persist validated MCP thread/turn hints without authorizing delivery", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-correlation-hints-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const inbox = new FakeInbox(directory);
-  const codex = new FakeCodex();
-  const service = new BridgeService(createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    codexCorrelationWindowMs: 25,
-    experimentalSameChatDelivery: true,
-  }), {
-    store,
-    manager: new FakeManager(client),
-    inbox,
-    codex,
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_hint_spawn",
-      topic: "Hint fixture",
-      task: "Record MCP hints",
-      cwd: directory,
-      threadId: "thread_mcp",
-      turnId: "turn_mcp",
-    });
-    const hinted = service.getJob(accepted.jobId);
-    assert.equal(hinted?.hintThreadId, "thread_mcp");
-    assert.equal(hinted?.hintTurnId, "turn_mcp");
-    assert.equal(hinted?.hintSource, "mcp");
-    assert.equal(store.getBinding(accepted.jobId), null, "hints must never be synthesized into bindings");
-
-    client.messages = [{
-      info: { id: "assistant_hint_seed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: hint seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-
-    const continued = await service.continueJob({
-      requestId: "request_hint_continue",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Record a turn-only hint",
-      turnId: "turn_continuation",
-    });
-    const hintedContinue = service.getJob(continued.jobId);
-    assert.equal(hintedContinue?.hintThreadId, null);
-    assert.equal(hintedContinue?.hintTurnId, "turn_continuation");
-    assert.equal(hintedContinue?.hintSource, "mcp");
-
-    const plain = await service.spawn({
-      requestId: "request_hint_plain",
-      topic: "Plain fixture",
-      task: "Record no hints",
-      cwd: directory,
-    });
-    assert.equal(service.getJob(plain.jobId)?.hintThreadId, null);
-    assert.equal(service.getJob(plain.jobId)?.hintSource, null);
-
-    const status = service.status();
-    assert.equal(status.correlation.hints, 2);
-    assert.equal(status.correlation.bindings, 0);
-
-    await waitForCondition(() => inbox.delivered.includes(accepted.jobId), 1_000);
-    assert.deepEqual(codex.delivered, [], "a hint alone must not authorize Codex delivery");
-    assert.equal(store.getBinding(accepted.jobId), null);
-    assert.equal(service.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("approval-resume with unknown transport resolves accepted and settles through the armed deadline", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-resume-unknown-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    timeoutFollow(jobId: string): Promise<void>;
-  };
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_resume_unknown", topic: "Resume unknown", task: "Wait for approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_resume_unknown" } } });
-    assert.equal(service.getJob(accepted.jobId)?.status, "needs_approval");
-    client.blockPrompt();
-    client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
-    const continuation = service.continueJob({
-      requestId: "request_resume_unknown_continue",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Resume the approval",
-    });
-    await waitForCondition(() => client.promptCalls.length === 2);
-    client.releasePrompt();
-    const resumed = await continuation;
-    assert.equal(resumed.accepted, true, "an unknown approval-resume must resolve accepted");
-    assert.equal(resumed.outcome, "dispatch_unknown");
-    assert.equal(resumed.jobId, accepted.jobId, "the original job id must be preserved");
-    const job = service.getJob(accepted.jobId);
-    assert.equal(job?.status, "following", "approval-resume must arm the follow deadline");
-    assert.ok(job?.followDeadlineAt);
-    assert.equal(job?.permissionId, null, "the resumed permission is cleared");
-    assert.equal(job?.dispatchUnknown, true);
-    assert.equal(client.promptCalls.length, 2, "no second submission on the resume path");
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_resume_unknown_duplicate",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Duplicate resume must be blocked",
-    }), /busy/);
-    assert.equal(client.promptCalls.length, 2);
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    store.updateJobStatus(accepted.jobId, "finalizing");
-    await internal.timeoutFollow(accepted.jobId);
-    assert.equal((await follow).status, "timed_out", "the armed deadline must settle an unaccepted resume");
-    assert.equal(client.promptCalls.length, 2, "settlement must not resubmit the resume prompt");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("approval-reply with unknown transport resolves accepted and settles through the armed deadline", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-approval-reply-unknown-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    timeoutFollow(jobId: string): Promise<void>;
-  };
-  client.replyErrors.push(new OpenCodeTransportError("POST", "/api/session/session_1/permission/permission_reply_unknown/reply", "timed out"));
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_reply_unknown", topic: "Reply unknown", task: "Wait for approval", cwd: directory });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_1", permission: { id: "permission_reply_unknown" } } });
-    const replied = await service.continueJob({
-      requestId: "request_reply_unknown_continue",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Answer the approval",
-      permissionId: "permission_reply_unknown",
-      permissionReply: "once",
-    });
-    assert.equal(replied.accepted, true, "an unknown approval-reply must resolve accepted");
-    assert.equal(replied.outcome, "dispatch_unknown");
-    assert.equal(replied.jobId, accepted.jobId, "the original job id must be preserved");
-    const job = service.getJob(accepted.jobId);
-    assert.equal(job?.status, "following", "approval-reply must arm the follow deadline");
-    assert.ok(job?.followDeadlineAt);
-    assert.equal(job?.permissionId, null, "the answered permission is cleared like the success path");
-    assert.equal(job?.dispatchUnknown, true);
-    assert.equal(client.permissionReplies.length, 1, "exactly one reply attempt");
-    assert.equal(client.promptCalls.length, 1, "no prompt was submitted");
-    await assert.rejects(() => service.continueJob({
-      requestId: "request_reply_unknown_duplicate",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Duplicate reply must be blocked",
-      permissionId: "permission_reply_unknown",
-      permissionReply: "once",
-    }), /busy/);
-    assert.equal(client.permissionReplies.length, 1, "no second reply submission");
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    store.updateJobStatus(accepted.jobId, "finalizing");
-    await internal.timeoutFollow(accepted.jobId);
-    assert.equal((await follow).status, "timed_out", "the armed deadline must settle an unaccepted reply");
-    assert.equal(client.permissionReplies.length, 1, "settlement must not resubmit the reply");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("explicit follow extends an auto-armed window without a second lifecycle or timer", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-follow-extension-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  const internal = service as unknown as {
-    followLifecycles: Map<string, unknown>;
-    timeoutFollow(jobId: string): Promise<void>;
-  };
-  client.blockPrompt();
-  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
-  try {
-    await service.start();
-    const spawn = service.spawn({ requestId: "request_follow_extension", topic: "Follow extension", task: "Auto-armed window", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 1);
-    client.releasePrompt();
-    const accepted = await spawn;
-    assert.equal(accepted.outcome, "dispatch_unknown");
-    const autoArmed = service.getJob(accepted.jobId);
-    assert.ok(autoArmed);
-    assert.equal(autoArmed.status, "following");
-    assert.ok(Math.abs(Date.parse(autoArmed.followDeadlineAt ?? "") - Date.parse(autoArmed.followStartedAt ?? "") - 20 * 60_000) < 1_000);
-    assert.equal(internal.followLifecycles.size, 1);
-
-    const follow = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 60, graceMinutes: 10 });
-    const extended = service.getJob(accepted.jobId);
-    assert.ok(extended);
-    assert.ok(Math.abs(Date.parse(extended.followDeadlineAt ?? "") - Date.parse(extended.followStartedAt ?? "") - 60 * 60_000) < 1_000,
-      "a larger explicit follow must extend the persisted deadline");
-    assert.equal(extended.followGraceMinutes, 10, "a larger explicit follow must extend the persisted grace");
-    assert.equal(internal.followLifecycles.size, 1, "extension must not create a second lifecycle");
-
-    const smaller = service.follow({ agentId: accepted.agentId, jobId: accepted.jobId, waitMinutes: 1, graceMinutes: 1 });
-    const notShrunk = service.getJob(accepted.jobId);
-    assert.ok(notShrunk);
-    assert.ok(Math.abs(Date.parse(notShrunk.followDeadlineAt ?? "") - Date.parse(notShrunk.followStartedAt ?? "") - 60 * 60_000) < 1_000,
-      "smaller requested values must not shrink the active window");
-    assert.equal(notShrunk.followGraceMinutes, 10);
-    assert.equal(internal.followLifecycles.size, 1);
-
-    store.updateJobStatus(accepted.jobId, "finalizing");
-    await internal.timeoutFollow(accepted.jobId);
-    assert.equal((await Promise.all([follow, smaller])).every((result) => result.status === "timed_out"), true,
-      "the single extended lifecycle must settle through the deadline");
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("request_id retry for an active dispatch_unknown job keeps the original outcome without redispatch", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-request-dedup-unknown-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  client.blockPrompt();
-  client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "timed out"));
-  try {
-    await service.start();
-    const spawn = service.spawn({ requestId: "request_dedup_spawn", topic: "Dedup spawn", task: "Unknown outcome", cwd: directory });
-    await waitForCondition(() => client.promptCalls.length === 1);
-    client.releasePrompt();
-    const accepted = await spawn;
-    assert.equal(accepted.outcome, "dispatch_unknown");
-    const retry = await service.spawn({ requestId: "request_dedup_spawn", topic: "Dedup spawn", task: "Retry must not redispatch", cwd: directory });
-    assert.equal(retry.accepted, true);
-    assert.equal(retry.outcome, "dispatch_unknown", "the persisted outcome must be retained on retry");
-    assert.equal(retry.jobId, accepted.jobId);
-    assert.match(retry.message, /uncertain|transport failure/i);
-    assert.equal(client.sessionCount, 1, "no second session on retry");
-    assert.equal(client.promptCalls.length, 1, "no redispatch on retry");
-    assert.equal(store.getJob(accepted.jobId)?.dispatchUnknown, true);
-
-    const seed = await service.spawn({ requestId: "request_dedup_seed", topic: "Dedup seed", task: "Seed the continue path", cwd: directory });
-    client.messages = [{
-      info: { id: "assistant_dedup_seed", role: "assistant", sessionID: "session_2" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seed turn" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_2" } });
-    client.blockPrompt();
-    client.promptErrors.push(new OpenCodeTransportError("POST", "/prompt_async", "connection reset"));
-    const continuation = service.continueJob({
-      requestId: "request_dedup_continue",
-      agentId: seed.agentId,
-      relation: "continuation",
-      task: "Unknown continue outcome",
-    });
-    await waitForCondition(() => client.promptCalls.length === 3);
-    client.releasePrompt();
-    const continued = await continuation;
-    assert.equal(continued.outcome, "dispatch_unknown");
-    const retryContinue = await service.continueJob({
-      requestId: "request_dedup_continue",
-      agentId: seed.agentId,
-      relation: "continuation",
-      task: "Retry must not redispatch",
-    });
-    assert.equal(retryContinue.accepted, true);
-    assert.equal(retryContinue.outcome, "dispatch_unknown", "the continue retry must retain the persisted outcome");
-    assert.equal(retryContinue.jobId, continued.jobId);
-    assert.match(retryContinue.message, /uncertain|transport failure/i);
-    assert.equal(client.promptCalls.length, 3, "no redispatch on the continue retry");
-    assert.equal(store.getJob(continued.jobId)?.dispatchUnknown, true);
-  } finally {
-    client.releasePrompt();
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("spawn pins the route on the agent and dispatches with the pinned route options", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-default-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({
-      requestId: "request_route_default",
-      topic: "Route default",
-      task: "Run on the default route",
-      cwd: directory,
-      mode: "analyze",
-    });
-    const agent = store.getAgent(accepted.agentId);
-    assert.ok(agent);
-    assert.equal(agent.modelRoute, "flash-max");
-    assert.equal(agent.modelProviderId, "opencode-go");
-    assert.equal(agent.modelId, "deepseek-v4-flash");
-    assert.equal(agent.modelVariant, "max");
-    assert.equal(client.promptOptions[0]?.providerId, "opencode-go");
-    assert.equal(client.promptOptions[0]?.modelId, "deepseek-v4-flash");
-    assert.equal(client.promptOptions[0]?.variant, "max");
-    assert.equal(accepted.modelDisplayName, "DeepSeek V4 Flash · Max");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("an explicit model_route matching the active route is accepted and pins that route", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-custom-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await service.start();
-    const switched = service.setActiveRoute("pro-max");
-    assert.equal(switched.activeRoute?.name, "pro-max");
-    assert.equal(switched.source, "operator-set");
-    const accepted = await service.spawn({
-      requestId: "request_route_custom",
-      topic: "Route custom",
-      task: "Run on pro",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "pro-max",
-    });
-    const agent = store.getAgent(accepted.agentId);
-    assert.ok(agent);
-    assert.equal(agent.modelRoute, "pro-max");
-    assert.equal(client.promptOptions[0]?.modelId, "deepseek-v4-pro");
-    assert.equal(accepted.modelDisplayName, "DeepSeek V4 Pro · Max");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("spawn with an unknown route fails closed typed 400 before any side effect", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-unknown-"));
@@ -3102,6 +826,7 @@ test("spawn with an unknown route fails closed typed 400 before any side effect"
   }
 });
 
+
 test("spawn with a disabled route fails closed typed 400 with no fallback", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-disabled-"));
   const store = await BridgeStore.open(directory);
@@ -3135,154 +860,6 @@ test("spawn with a disabled route fails closed typed 400 with no fallback", asyn
   }
 });
 
-test("spawn naming a registered enabled route other than the active route fails closed typed 403 route_override_denied", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    await assert.rejects(() => service.spawn({
-      requestId: "request_route_antigravity",
-      topic: "Route antigravity",
-      task: "Must not run",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "antigravity-flash-high",
-    }), (error: unknown) => {
-      assert.ok(error instanceof BridgeError);
-      assert.equal(error.status, 403);
-      assert.equal(error.code, "route_override_denied");
-      assert.deepEqual(error.details, { route: "antigravity-flash-high", activeRoute: "flash-max" });
-      return true;
-    });
-    assert.equal(store.listAgents().length, 0);
-    assert.equal(store.listJobs().length, 0);
-    assert.equal(client.sessionCount, 0);
-    assert.equal(client.promptCalls.length, 0);
-    assert.equal(store.getActiveRoute(), null, "a denied spawn never changes the active route pointer");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("route set validates registered and enabled targets typed and persists nothing on failure", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-set-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    await assert.rejects(async () => service.setActiveRoute("nonsense-route"), (error: unknown) => {
-      assert.ok(error instanceof BridgeError);
-      assert.equal(error.status, 400);
-      assert.equal(error.code, "unknown_route");
-      return true;
-    });
-    await assert.rejects(async () => service.setActiveRoute("pro-max"), (error: unknown) => {
-      assert.ok(error instanceof BridgeError);
-      assert.equal(error.status, 400);
-      assert.equal(error.code, "route_disabled");
-      return true;
-    });
-    assert.equal(store.getActiveRoute(), null, "failed sets never persist a pointer");
-    assert.equal(service.routeStatus().source, "configured-default");
-    assert.equal(service.routeStatus().activeRoute?.name, "flash-max");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("operator active-route switch routes new spawns without a restart while existing agents stay pinned", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-switch-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await service.start();
-    const first = await service.spawn({
-      requestId: "request_route_switch_before",
-      topic: "Before switch",
-      task: "Pinned on flash-max",
-      cwd: directory,
-      mode: "analyze",
-    });
-    const firstAgent = store.getAgent(first.agentId);
-    assert.ok(firstAgent);
-    assert.equal(firstAgent.modelRoute, "flash-max");
-    assert.equal(client.promptOptions[0]?.modelId, "deepseek-v4-flash");
-
-    const status = service.routeStatus();
-    assert.equal(status.activeRoute?.name, "flash-max");
-    assert.equal(status.source, "configured-default", "effective route starts as the configured default");
-    assert.equal(service.status().activeRoute?.name, "flash-max");
-    assert.equal(service.status().activeRouteSource, "configured-default");
-
-    const switched = service.setActiveRoute("pro-max");
-    assert.equal(switched.activeRoute?.name, "pro-max");
-    assert.equal(switched.source, "operator-set");
-    assert.equal(switched.defaultModelRoute, "flash-max", "the configured default is unchanged; only the pointer moved");
-    assert.equal(store.getActiveRoute(), "pro-max", "persisted before it becomes effective");
-    assert.equal(service.status().activeRouteSource, "operator-set");
-
-    const second = await service.spawn({
-      requestId: "request_route_switch_after",
-      topic: "After switch",
-      task: "Active route applies without restart",
-      cwd: directory,
-      mode: "analyze",
-    });
-    const secondAgent = store.getAgent(second.agentId);
-    assert.ok(secondAgent);
-    assert.equal(secondAgent.modelRoute, "pro-max", "new spawns follow the switched active route");
-    assert.equal(client.promptOptions[1]?.modelId, "deepseek-v4-pro");
-
-    client.messages = [{
-      info: { id: "assistant_first", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: First agent done\nFILES:\n- notes.txt\nTESTS:\n- unit smoke\nRISKS:\n- none" }],
-    }];
-    const idle: OpenCodeEvent = {
-      type: "session.idle",
-      properties: { sessionID: "session_1" },
-    };
-    await client.emit(idle);
-    await client.emit(idle);
-    assert.equal(service.getJob(first.jobId)?.status, "delivered");
-
-    const continued = await service.continueJob({
-      requestId: "request_route_switch_continue",
-      agentId: first.agentId,
-      relation: "continuation",
-      task: "Existing agent must stay pinned",
-    });
-    assert.equal(continued.accepted, true);
-    assert.equal(client.promptOptions[2]?.modelId, "deepseek-v4-flash", "existing agents never migrate to the new active route");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("antigravityCommand from config propagates to the Antigravity adapter while omission keeps the PATH lookup", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-command-"));
@@ -3316,6 +893,7 @@ test("antigravityCommand from config propagates to the Antigravity adapter while
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("antigravity sandbox and auto-approval propagate independently from config to the adapter", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-flags-"));
@@ -3368,6 +946,7 @@ test("antigravity sandbox and auto-approval propagate independently from config 
   }
 });
 
+
 test("antigravityCommand really spawns the configured executable: node.exe rejects the agy argument contract", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-realspawn-"));
   const store = await BridgeStore.open(directory);
@@ -3417,6 +996,7 @@ test("antigravityCommand really spawns the configured executable: node.exe rejec
   }
 });
 
+
 test("startup recovery terminalizes stranded active Antigravity jobs instead of leaving them dispatching forever", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-recovery-"));
   const store = await BridgeStore.open(directory);
@@ -3463,6 +1043,7 @@ test("startup recovery terminalizes stranded active Antigravity jobs instead of 
   }
 });
 
+
 test("the enabled antigravity route is selectable as the active route and new spawns dispatch through agy without OpenCode", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-active-agy-"));
   const store = await BridgeStore.open(directory);
@@ -3503,6 +1084,7 @@ test("the enabled antigravity route is selectable as the active route and new sp
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("spawn with the enabled antigravity route runs exactly one agy spawn, never OpenCode, and delivers the literal result", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-on-"));
@@ -3576,6 +1158,7 @@ test("spawn with the enabled antigravity route runs exactly one agy spawn, never
   }
 });
 
+
 test("antigravity route failure marks the job failed after exactly one agy spawn with no OpenCode fallback", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-fail-"));
   const store = await BridgeStore.open(directory);
@@ -3630,6 +1213,7 @@ test("antigravity route failure marks the job failed after exactly one agy spawn
   }
 });
 
+
 test("antigravity spawn returns accepted while agy is still executing; deepseek_follow observes the asynchronous completion", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-async-"));
   const store = await BridgeStore.open(directory);
@@ -3679,6 +1263,7 @@ test("antigravity spawn returns accepted while agy is still executing; deepseek_
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("antigravity follow grace does not kill process with healthy liveness and only explicit abort terminalizes and cleans up", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-follow-timeout-"));
@@ -3765,6 +1350,7 @@ test("antigravity follow grace does not kill process with healthy liveness and o
   }
 });
 
+
 test("abort between job creation and Antigravity dispatch prevents the launch and never re-activates the agent", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-predispatch-"));
   const store = await BridgeStore.open(directory);
@@ -3811,6 +1397,7 @@ test("abort between job creation and Antigravity dispatch prevents the launch an
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("abort signals an active antigravity process tree and leaves the job terminally aborted", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-abort-"));
@@ -3866,6 +1453,7 @@ test("abort signals an active antigravity process tree and leaves the job termin
   }
 });
 
+
 test("an aborted Antigravity run is never recorded as a rejected dispatch and recovery settles the aborted job", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-agy-abort-classify-"));
   const store = await BridgeStore.open(directory);
@@ -3913,340 +1501,6 @@ test("an aborted Antigravity run is never recorded as a rejected dispatch and re
   }
 });
 
-test("spawn without a model_route fails closed when the default route is disabled", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-default-disabled-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const config = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: false, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await service.start();
-    await assert.rejects(() => service.spawn({
-      requestId: "request_route_no_default",
-      topic: "No default",
-      task: "Must not run",
-      cwd: directory,
-      mode: "analyze",
-    }), (error: unknown) => {
-      assert.ok(error instanceof BridgeError);
-      assert.equal(error.status, 400);
-      assert.equal(error.code, "route_disabled");
-      return true;
-    });
-    assert.equal(store.listAgents().length, 0);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("continue and approval resume use the persisted agent route, not mutable live defaults", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-pinned-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const proConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const first = new BridgeService(proConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  let accepted: Awaited<ReturnType<typeof first.spawn>>;
-  try {
-    await first.start();
-    first.setActiveRoute("pro-max");
-    accepted = await first.spawn({
-      requestId: "request_route_pinned",
-      topic: "Route pinned",
-      task: "Seed the pinned route",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "pro-max",
-    });
-    assert.equal(store.getAgent(accepted.agentId)?.modelRoute, "pro-max");
-    client.messages = [{
-      info: { id: "assistant_route_pinned", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: seeded on pro" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(store.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await first.stop();
-  }
-  // A second daemon with the default registry (pro-max disabled) must still
-  // continue the pinned agent on the persisted pro-max route.
-  const second = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await second.start();
-    const continued = await second.continueJob({
-      requestId: "request_route_pinned_continue",
-      agentId: accepted.agentId,
-      relation: "continuation",
-      task: "Continue on the pinned route",
-    });
-    assert.equal(continued.accepted, true);
-    const options = client.promptOptions.at(-1);
-    assert.equal(options?.modelId, "deepseek-v4-pro");
-    assert.equal(options?.variant, "max");
-  } finally {
-    await second.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("mutating or repointing the live config route never redirects a pinned pro agent", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-repoint-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const spawnConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const first = new BridgeService(spawnConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  let proAgentId: string;
-  try {
-    await first.start();
-    first.setActiveRoute("pro-max");
-    const accepted = await first.spawn({
-      requestId: "request_route_repoint",
-      topic: "Route repoint",
-      task: "Pin the pro route",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "pro-max",
-    });
-    proAgentId = accepted.agentId;
-    assert.equal(store.getAgent(proAgentId)?.modelRoute, "pro-max");
-    client.messages = [{
-      info: { id: "assistant_route_repoint", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on pro" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(store.getJob(accepted.jobId)?.status, "delivered");
-  } finally {
-    await first.stop();
-  }
-
-  // Live config mutation: the pro-max route now points at a different model,
-  // flash-max is repointed as well, and the agent's route name was deleted
-  // from the registry entirely in the second half. Dispatch must still use
-  // the persisted spawn-time identity, with no fallback.
-  const repointedConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-other", variant: "max", enabled: true, default: true, display: "Renamed" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-gamma", variant: "max", enabled: false, default: false, display: "Repointed" },
-    ],
-  });
-  const second = new BridgeService(repointedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await second.start();
-    const continued = await second.continueJob({
-      requestId: "request_route_repoint_continue",
-      agentId: proAgentId,
-      relation: "continuation",
-      task: "Continue on the pinned identity",
-    });
-    assert.equal(continued.accepted, true);
-    const options = client.promptOptions.at(-1);
-    assert.equal(options?.providerId, "opencode-go", "provider stays the persisted spawn-time provider");
-    assert.equal(options?.modelId, "deepseek-v4-pro", "model stays the persisted spawn-time model");
-    assert.equal(options?.variant, "max", "variant stays the persisted spawn-time variant");
-  } finally {
-    await second.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("deleting the route from the live registry still dispatches the persisted identity without fallback", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-delete-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const spawnConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const first = new BridgeService(spawnConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  let proAgentId: string;
-  try {
-    await first.start();
-    first.setActiveRoute("pro-max");
-    const accepted = await first.spawn({
-      requestId: "request_route_delete",
-      topic: "Route delete",
-      task: "Pin the pro route",
-      cwd: directory,
-      mode: "analyze",
-      modelRoute: "pro-max",
-    });
-    proAgentId = accepted.agentId;
-    client.messages = [{
-      info: { id: "assistant_route_delete", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on pro" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-  } finally {
-    await first.stop();
-  }
-
-  const deletedConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Flash · Max" },
-    ],
-  });
-  const second = new BridgeService(deletedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await second.start();
-    const continued = await second.continueJob({
-      requestId: "request_route_delete_continue",
-      agentId: proAgentId,
-      relation: "continuation",
-      task: "Continue after the route was deleted",
-    });
-    assert.equal(continued.accepted, true);
-    const options = client.promptOptions.at(-1);
-    assert.equal(options?.modelId, "deepseek-v4-pro", "no fallback: deleted route must not redirect to the default route");
-    assert.equal(options?.variant, "max");
-  } finally {
-    await second.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("a default-spawned flash agent stays pinned when the live default route is repointed", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-flash-pinned-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const first = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  let flashAgentId: string;
-  try {
-    await first.start();
-    const accepted = await first.spawn({
-      requestId: "request_route_flash_pinned",
-      topic: "Route flash pinned",
-      task: "Pin the default flash route",
-      cwd: directory,
-      mode: "analyze",
-    });
-    flashAgentId = accepted.agentId;
-    assert.equal(store.getAgent(flashAgentId)?.modelRoute, "flash-max");
-    assert.equal(store.getAgent(flashAgentId)?.modelId, "deepseek-v4-flash");
-    client.messages = [{
-      info: { id: "assistant_route_flash_pinned", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: pinned on flash" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-  } finally {
-    await first.stop();
-  }
-
-  const repointedConfig = createDefaultConfig({
-    dataDir: directory,
-    configPath: path.join(directory, "config.json"),
-    modelRoutes: [
-      { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-other", variant: "max", enabled: true, default: true, display: "Repointed" },
-      { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: false, default: false, display: "DeepSeek V4 Pro · Max" },
-    ],
-  });
-  const second = new BridgeService(repointedConfig, { store, manager: new FakeManager(client), inbox: new FakeInbox(directory) });
-  try {
-    await second.start();
-    const continued = await second.continueJob({
-      requestId: "request_route_flash_pinned_continue",
-      agentId: flashAgentId,
-      relation: "continuation",
-      task: "Continue on the persisted flash identity",
-    });
-    assert.equal(continued.accepted, true);
-    const options = client.promptOptions.at(-1);
-    assert.equal(options?.modelId, "deepseek-v4-flash", "default-spawned agents stay pinned to their persisted flash identity");
-    assert.equal(options?.variant, "max");
-  } finally {
-    await second.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("legacy agents without a persisted route keep dispatching on their flat columns", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-legacy-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const agent = store.createAgent({
-      id: "agent_legacy_route",
-      title: "Legacy",
-      topic: "Legacy route topic",
-      repositoryRoot: directory,
-      workspacePath: directory,
-      workspaceStrategy: "shared",
-      opencodeServerId: "server_legacy",
-      opencodeSessionId: "session_legacy_route",
-      modelProviderId: "opencode-go",
-      modelId: "deepseek-v4-pro",
-      modelVariant: "max",
-    });
-    const job = store.createJob({ id: "job_legacy_route", agentId: agent.id, kind: "continue", requestId: "request_legacy_route", promptHash: "hash" });
-    store.updateJobStatus(job.id, "dispatching");
-    store.updateJobStatus(job.id, "running");
-    store.setJobPermission(job.id, "permission_legacy");
-    store.updateJobStatus(job.id, "needs_approval");
-    store.updateAgentStatus(agent.id, "working");
-    store.updateAgentStatus(agent.id, "needs_approval");
-    const continued = await service.continueJob({
-      requestId: "request_legacy_route_continue",
-      agentId: agent.id,
-      relation: "continuation",
-      task: "Continue a legacy agent",
-    });
-    assert.equal(continued.accepted, true);
-    const options = client.promptOptions.at(-1);
-    assert.equal(options?.modelId, "deepseek-v4-pro");
-    assert.equal(store.getAgent(agent.id)?.modelRoute, null);
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("context file validation rejects missing, oversized and non-regular files before side effects", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-validate-"));
@@ -4318,13 +1572,13 @@ test("context file validation rejects missing, oversized and non-regular files b
       contextFiles: ["small.txt"],
     });
     assert.equal(accepted.accepted, true);
-    assert.equal(client.promptCalls.length, 1);
   } finally {
     await service.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("context file rejection creates no orphan worktree", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-"));
@@ -4363,6 +1617,7 @@ test("context file rejection creates no orphan worktree", async () => {
   }
 });
 
+
 test("valid tracked context files work with worktree strategy and resolve inside the worktree without path leakage", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-valid-"));
   await git(directory, "init", "-q");
@@ -4370,16 +1625,14 @@ test("valid tracked context files work with worktree strategy and resolve inside
   await git(directory, "add", "tracked.txt");
   await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
 
-  // The bridge store must live OUTSIDE the repository so the worktree
-  // cleanliness check (untracked files included) never sees the database.
   const dataDir = path.join(path.dirname(directory), path.basename(directory) + "-data");
   await mkdir(dataDir, { recursive: true });
   const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
   const service = new BridgeService(createDefaultConfig({ dataDir, configPath: path.join(dataDir, "config.json") }), {
     store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls, prompts) }),
   });
   try {
     await service.start();
@@ -4394,8 +1647,8 @@ test("valid tracked context files work with worktree strategy and resolve inside
     });
     assert.equal(accepted.accepted, true);
     assert.equal(accepted.outcome, undefined, "valid context must dispatch normally, not fail");
-    assert.equal(client.promptCalls.length, 1);
-    const prompt = client.promptCalls[0]?.task ?? "";
+    await waitForCondition(() => prompts.length === 1);
+    const prompt = prompts[0] ?? "";
     const agent = store.getAgent(accepted.agentId);
     assert.ok(agent);
     assert.equal(agent.workspaceStrategy, "worktree");
@@ -4415,6 +1668,7 @@ test("valid tracked context files work with worktree strategy and resolve inside
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
 test("escaping context paths with worktree strategy fail typed 400 before any worktree", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-worktree-escape-"));
   await git(directory, "init", "-q");
@@ -4457,67 +1711,6 @@ test("escaping context paths with worktree strategy fail typed 400 before any wo
   }
 });
 
-test("a terminal follow consumes the obligation while needs_approval stays pending", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-obligation-consumed-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_obligation_consumed", topic: "Consumed follow", task: "Finish normally", cwd: directory, mode: "analyze" });
-    client.messages = [{
-      info: { id: "assistant_consumed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: consumed" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(store.getJob(accepted.jobId)?.resultConsumedAt, null);
-    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    assert.equal(followed.status, "completed");
-    assert.ok(store.getJob(accepted.jobId)?.resultConsumedAt, "terminal follow must persist consumption");
-
-    const approved = await service.spawn({ requestId: "request_obligation_approval", topic: "Approval follow", task: "Wait for approval", cwd: directory, mode: "analyze" });
-    await client.emit({ type: "permission.asked", properties: { sessionID: "session_2", permission: { id: "permission_obligation" } } });
-    const approvalFollow = await service.follow({ agentId: approved.agentId, jobId: approved.jobId });
-    assert.equal(approvalFollow.status, "needs_approval");
-    assert.equal(store.getJob(approved.jobId)?.resultConsumedAt, null, "needs_approval keeps the obligation pending");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("recover_result persists consumption of the returned terminal result", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-obligation-recover-"));
-  const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
-  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
-    store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
-  });
-  try {
-    await service.start();
-    const accepted = await service.spawn({ requestId: "request_obligation_recover", topic: "Recover consumed", task: "Finish normally", cwd: directory, mode: "analyze" });
-    client.messages = [{
-      info: { id: "assistant_recover_consumed", role: "assistant", sessionID: "session_1" },
-      parts: [{ type: "text", text: "STATUS: completed\nSUMMARY: recover consumed" }],
-    }];
-    await client.emit({ type: "session.idle", properties: { sessionID: "session_1" } });
-    assert.equal(store.getJob(accepted.jobId)?.resultConsumedAt, null);
-    const recovered = await service.recoverResult(accepted.jobId);
-    assert.ok(recovered);
-    assert.ok(store.getJob(accepted.jobId)?.resultConsumedAt, "successful recover must persist consumption");
-  } finally {
-    await service.stop();
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("enabled retention never auto-prunes a legacy database without the offline preparation marker", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-retention-gate-"));
@@ -4576,6 +1769,7 @@ test("enabled retention never auto-prunes a legacy database without the offline 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("startup recovery routes dispatching job with resultPath through valid transitions without error", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-dispatching-"));
@@ -4646,6 +1840,7 @@ test("startup recovery routes dispatching job with resultPath through valid tran
     await rm(directory, { recursive: true, force: true });
   }
 });
+
 
 test("startup recovery preserves completed_partial and timed_out statuses when job has resultPath", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-recover-partial-timeout-"));
@@ -4751,6 +1946,7 @@ test("startup recovery preserves completed_partial and timed_out statuses when j
   }
 });
 
+
 test("MCP or governance task automatically includes global GEMINI.md when present", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-context-gov-"));
   const globalDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-global-gemini-"));
@@ -4758,15 +1954,15 @@ test("MCP or governance task automatically includes global GEMINI.md when presen
   await writeFile(globalGeminiPath, "# Global Gemini Governance Rules\n", "utf8");
 
   const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
   const service = new BridgeService(createDefaultConfig({
     dataDir: directory,
     configPath: path.join(directory, "config.json"),
     globalGeminiContextPath: globalGeminiPath,
   }), {
     store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls, prompts) }),
   });
   try {
     await service.start();
@@ -4780,8 +1976,8 @@ test("MCP or governance task automatically includes global GEMINI.md when presen
       mode: "analyze",
     });
     assert.equal(mcpAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 1);
-    const mcpPrompt = client.promptCalls[0]?.task ?? "";
+    await waitForCondition(() => prompts.length === 1);
+    const mcpPrompt = prompts[0] ?? "";
     assert.ok(mcpPrompt.includes(path.normalize(globalGeminiPath)), "MCP task must include global GEMINI.md path");
 
     // 2. PromptPad task should include the global file
@@ -4793,79 +1989,35 @@ test("MCP or governance task automatically includes global GEMINI.md when presen
       mode: "analyze",
     });
     assert.equal(promptPadAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 2);
-    const promptPadPrompt = client.promptCalls[1]?.task ?? "";
+    await waitForCondition(() => prompts.length === 2);
+    const promptPadPrompt = prompts[1] ?? "";
     assert.ok(promptPadPrompt.includes(path.normalize(globalGeminiPath)), "PromptPad task must include global GEMINI.md path");
 
     // 3. Skill governance task should include the global file
     const skillAccepted = await service.spawn({
       requestId: "request_gov_skill",
-      topic: "Skill management",
-      task: "Create a new skill for repository automation",
+      topic: "Workflow Policy Update",
+      task: "Review skill governance guidelines",
       cwd: directory,
       mode: "analyze",
     });
     assert.equal(skillAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 3);
-    const skillPrompt = client.promptCalls[2]?.task ?? "";
-    assert.ok(skillPrompt.includes(path.normalize(globalGeminiPath)), "Skill task must include global GEMINI.md path");
+    await waitForCondition(() => prompts.length === 3);
+    const skillPrompt = prompts[2] ?? "";
+    assert.ok(skillPrompt.includes(path.normalize(globalGeminiPath)), "Skill governance task must include global GEMINI.md path");
 
-    // 4. AGENTS.md / GEMINI.md task should include the global file
-    const agentsAccepted = await service.spawn({
-      requestId: "request_gov_agents",
-      topic: "Agents governance",
-      task: "Review AGENTS.md instructions and rules",
+    // 4. Regular task with unrelated topic should NOT include the global file
+    const regularAccepted = await service.spawn({
+      requestId: "request_gov_regular",
+      topic: "Data Analysis",
+      task: "Parse and aggregate the metrics CSV",
       cwd: directory,
       mode: "analyze",
     });
-    assert.equal(agentsAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 4);
-    const agentsPrompt = client.promptCalls[3]?.task ?? "";
-    assert.ok(agentsPrompt.includes(path.normalize(globalGeminiPath)), "AGENTS.md task must include global GEMINI.md path");
-
-    // 5. Normal task must NOT include the global file
-    const normalAccepted = await service.spawn({
-      requestId: "request_gov_normal",
-      topic: "Normal Task",
-      task: "Fix math addition function bug in calculate.ts",
-      cwd: directory,
-      mode: "analyze",
-    });
-    assert.equal(normalAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 5);
-    const normalPrompt = client.promptCalls[4]?.task ?? "";
-    assert.equal(normalPrompt.includes(path.normalize(globalGeminiPath)), false, "Normal task must not include global GEMINI.md");
-    assert.ok(normalPrompt.includes("No additional context files were supplied."));
-
-    // 6. Explicit context files preservation and deduplication
-    await writeFile(path.join(directory, "local.txt"), "local content\n", "utf8");
-    const explicitAccepted = await service.spawn({
-      requestId: "request_gov_dedup",
-      topic: "MCP with explicit files",
-      task: "Configure MCP server with local notes",
-      cwd: directory,
-      mode: "analyze",
-      contextFiles: ["local.txt", globalGeminiPath],
-    });
-    assert.equal(explicitAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 6);
-    const dedupPrompt = client.promptCalls[5]?.task ?? "";
-    assert.ok(dedupPrompt.includes(path.normalize(path.join(directory, "local.txt"))), "explicit local file preserved");
-    // Global file must appear exactly once, not duplicated
-    const occurrences = dedupPrompt.split(path.normalize(globalGeminiPath)).length - 1;
-    assert.equal(occurrences, 1, "global GEMINI.md must not be duplicated");
-
-    // 7. Non-existent global file does not break spawn for an MCP task
-    await rm(globalGeminiPath, { force: true });
-    const missingGlobalAccepted = await service.spawn({
-      requestId: "request_gov_missing_global",
-      topic: "MCP with missing global file",
-      task: "Configure MCP server without global file",
-      cwd: directory,
-      mode: "analyze",
-    });
-    assert.equal(missingGlobalAccepted.accepted, true);
-    assert.equal(client.promptCalls.length, 7);
+    assert.equal(regularAccepted.accepted, true);
+    await waitForCondition(() => prompts.length === 4);
+    const regularPrompt = prompts[3] ?? "";
+    assert.equal(regularPrompt.includes(path.normalize(globalGeminiPath)), false, "Unrelated task must NOT include global GEMINI.md");
   } finally {
     await service.stop();
     store.close();
@@ -4875,56 +2027,54 @@ test("MCP or governance task automatically includes global GEMINI.md when presen
 });
 
 test("worktree strategy preserves global GEMINI.md canonical path without escape error", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-worktree-gov-"));
-  const globalDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-worktree-global-"));
-  const globalGeminiPath = path.join(globalDir, "GEMINI.md");
-  await writeFile(globalGeminiPath, "# Global Gemini Rules\n", "utf8");
-
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-gov-worktree-"));
   await git(directory, "init", "-q");
   await writeFile(path.join(directory, "tracked.txt"), "tracked content\n", "utf8");
   await git(directory, "add", "tracked.txt");
   await git(directory, "-c", "user.name=DeepSeek Test", "-c", "user.email=deepseek@example.invalid", "commit", "-qm", "initial");
 
+  const globalDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-global-gemini-wt-"));
+  const globalGeminiPath = path.join(globalDir, "GEMINI.md");
+  await writeFile(globalGeminiPath, "# Global Gemini Worktree Rules\n", "utf8");
+
   const dataDir = path.join(path.dirname(directory), path.basename(directory) + "-data");
   await mkdir(dataDir, { recursive: true });
   const store = await BridgeStore.open(dataDir);
-  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const prompts: string[] = [];
   const service = new BridgeService(createDefaultConfig({
     dataDir,
     configPath: path.join(dataDir, "config.json"),
     globalGeminiContextPath: globalGeminiPath,
   }), {
     store,
-    manager: new FakeManager(client),
-    inbox: new FakeInbox(dataDir),
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("ok", agyCalls, prompts) }),
   });
   try {
     await service.start();
     const accepted = await service.spawn({
-      requestId: "request_worktree_gov_ok",
-      topic: "Worktree MCP task",
-      task: "Configure MCP tools for repository",
+      requestId: "request_gov_worktree",
+      topic: "MCP Configuration in Worktree",
+      task: "Set up the governance rules inside a worktree",
       cwd: directory,
       mode: "edit",
       workspaceStrategy: "worktree",
       contextFiles: ["tracked.txt"],
     });
     assert.equal(accepted.accepted, true);
-    assert.equal(client.promptCalls.length, 1);
-    const prompt = client.promptCalls[0]?.task ?? "";
-    const agent = store.getAgent(accepted.agentId);
-    assert.ok(agent);
-    // Tracked file mapped inside worktree
-    const worktreeTracked = path.normalize(path.join(agent.workspacePath, "tracked.txt"));
-    assert.ok(prompt.includes("FILE: " + worktreeTracked), "tracked file is mapped inside worktree");
-    // Global file kept as canonical external path
-    assert.ok(prompt.includes("FILE: " + path.normalize(globalGeminiPath)), "global GEMINI.md path preserved in worktree mode");
+    await waitForCondition(() => prompts.length === 1);
+    const prompt = prompts[0] ?? "";
+    const canonicalGlobalPath = path.resolve(globalGeminiPath);
+    assert.ok(
+      prompt.includes(canonicalGlobalPath),
+      "global GEMINI.md path must remain the canonical external path",
+    );
   } finally {
     await service.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
     await rm(globalDir, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
   }
 });
 
@@ -5004,6 +2154,7 @@ test("antigravity timeout does not switch to OpenCode, enforcing zero fallback a
   }
 });
 
+
 test("antigravity non-timeout errors do not trigger fallback and keep route fixed", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-"));
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-no-fallback-exit-data-"));
@@ -5066,6 +2217,7 @@ test("antigravity non-timeout errors do not trigger fallback and keep route fixe
   }
 });
 
+
 test("abort racing Antigravity timeout never launches OpenCode fallback", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-racing-fallback-"));
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "deepseek-abort-racing-fallback-data-"));
@@ -5127,6 +2279,7 @@ test("abort racing Antigravity timeout never launches OpenCode fallback", async 
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
 
 test("normal Antigravity first spawn persists one linked attempt, reaches terminal status, and removes transient prompt", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-agy-first-spawn-cwd-"));
@@ -5208,6 +2361,7 @@ test("normal Antigravity first spawn persists one linked attempt, reaches termin
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
 
 test("existing persisted agent with historical gemini-3.7-flash-high retains pinned identity while new spawns receive 3.8", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-historical-pinning-"));

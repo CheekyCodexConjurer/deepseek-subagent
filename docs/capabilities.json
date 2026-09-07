@@ -6,76 +6,87 @@
     "subagents-mcp",
     "deepseek-subagent"
   ],
+  "serverAliasesStatus": "protocol compatibility aliases only if required by host; OpenCode/DeepSeek is not an active provider",
   "tools": [
     "subagents_spawn",
+    "subagents_spawn_batch",
     "subagents_continue",
     "subagents_status",
     "subagents_follow",
+    "subagents_park",
     "subagents_abort",
     "subagents_close",
     "subagents_recover_result"
   ],
   "toolAliases": [
     "deepseek_spawn",
+    "deepseek_spawn_batch",
     "deepseek_continue",
     "deepseek_consult",
     "deepseek_follow",
+    "deepseek_park",
     "deepseek_abort",
     "deepseek_close",
     "deepseek_recover_result"
   ],
+  "toolAliasesStatus": "protocol compatibility aliases only if required by host; all route to canonical Antigravity+Gemini execution",
   "defaultModel": {
-    "provider": "opencode-go",
-    "model": "deepseek-v4-flash",
-    "variant": "max",
-    "display": "DeepSeek V4 Flash · Max"
+    "provider": "antigravity",
+    "model": "gemini-3.8-flash-high",
+    "variant": null,
+    "display": "Antigravity · Gemini 3.8 Flash High"
+  },
+  "packaging": {
+    "canonicalBins": [
+      "subagents-mcp",
+      "subagents"
+    ],
+    "legacyBins": [
+      "deepseek-subagent",
+      "codex-opencode-bridge"
+    ],
+    "packageName": "codex-opencode-bridge",
+    "packageNameStatus": "historical compatibility identifier; unchanged because package-lock.json is outside this ownership"
   },
   "routes": {
     "registry": [
-      {
-        "name": "flash-max",
-        "provider": "opencode-go",
-        "model": "deepseek-v4-flash",
-        "variant": "max",
-        "enabled": true,
-        "default": true,
-        "display": "DeepSeek V4 Flash · Max"
-      },
-      {
-        "name": "pro-max",
-        "provider": "opencode-go",
-        "model": "deepseek-v4-pro",
-        "variant": "max",
-        "enabled": false,
-        "default": false,
-        "display": "DeepSeek V4 Pro · Max"
-      },
       {
         "name": "antigravity-flash-high",
         "provider": "antigravity",
         "model": "gemini-3.8-flash-high",
         "variant": null,
         "enabled": true,
-        "default": false,
+        "default": true,
         "display": "Antigravity · Gemini 3.8 Flash High"
       }
     ],
+    "rejectedLegacyRoutes": [
+      "flash-max",
+      "pro-max"
+    ],
     "activeRoute": {
-      "pointer": "the operator-set active model route is persisted in the bridge SQLite store (route_state table), additively; config.json is never rewritten while a daemon is live",
-      "effective": "the stored pointer when set, otherwise the configured defaultModelRoute; initial default is flash-max",
-      "operatorControl": "route list / route status / route set <route> via the authenticated loopback daemon and CLI; requires the daemon running",
-      "noRestart": "route set applies to new spawns immediately, without a daemon restart",
-      "offlineBehavior": "route commands fail closed when the daemon is not running; the CLI never writes the route pointer outside the daemon process (no concurrent DB write)",
-      "noOverride": "the MCP subagents_spawn tool (alias deepseek_spawn) never exposes or forwards model_route; it always uses the active route, while legacy/direct HTTP callers still fail closed on a conflicting override",
-      "noFallback": "external MCP orchestration lifecycle remains fallback=forbidden and manual route overrides fail closed; distinct from bridge-internal opt-in timeout failover V1"
+      "pointer": "the route_state pointer is additive compatibility state and must resolve only to antigravity-flash-high",
+      "effective": "antigravity-flash-high",
+      "operatorControl": "route list / route status / route set antigravity-flash-high via the authenticated loopback daemon",
+      "noRestart": "route state changes do not require an Antigravity restart",
+      "offlineBehavior": "route commands fail closed when the daemon is not ready and never write a competing pointer",
+      "noOverride": "MCP spawn does not accept a provider/model override; stale or conflicting legacy values are rejected before side effects",
+      "noFallback": "there is no provider, model, route, or timeout fallback"
     },
-    "modelRouteOnSpawn": "not available on the MCP spawn tool; it always uses the active route. The legacy/direct HTTP contract still validates an explicitly named route with typed unknown_route, route_disabled or route_override_denied failures and never falls back",
-    "pinnedPerAgent": "the chosen route is persisted on the agent; continue, approval resume/reply, graceful finalization, recovery and reconciliation always use the persisted route, never mutable live defaults, and never the mutable active-route pointer",
-    "legacyCompatibility": "agents without a pinned route keep dispatching on their persisted flat provider/model/variant columns"
+    "modelRouteOnSpawn": "not caller-selectable; every new spawn uses the active antigravity-flash-high route",
+    "pinnedPerAgent": "the selected Antigravity/Gemini route is persisted on new agents; in-flight agents do not change identity",
+    "legacyCompatibility": "old agents may retain historical flat provider/model fields and route labels for read-only history/recovery; those values never select a new provider and OpenCode/DeepSeek is not an active provider"
   },
   "errors": {
     "typed": true,
-    "statusCodes": ["400", "401", "403", "404", "409", "500"],
+    "statusCodes": [
+      "400",
+      "401",
+      "403",
+      "404",
+      "409",
+      "500"
+    ],
     "propagation": "stable machine-readable codes flow through HTTP bodies and MCP structuredContent without text sniffing",
     "codes": [
       "invalid_request",
@@ -97,51 +108,93 @@
     ]
   },
   "contextFiles": {
-    "prevalidation": "containment, existence, regular readable file and bounded size are validated before any workspace/worktree/session/job side effect; rejected input returns a typed 400 and never creates an orphan worktree",
-    "oversizedInput": "rejected, never silently truncated",
+    "prevalidation": "containment, existence, regular readable file, and bounded size are validated before any workspace/process/job side effect",
+    "oversizedInput": "rejected, never silently truncated or sent through another provider",
     "maxContextFileBytes": 1000000
   },
   "visualContext": {
-    "semantics": "textual only; optional string on spawn and continue, no default. The orchestrator inspects visuals itself and sends three labeled parts ('Direct observations:', 'Interpretation:', 'Uncertainty:'). DeepSeek never receives pixels; direct observations are evidence, interpretation is a hypothesis, and details absent from the context must not be invented"
+    "semantics": "textual only; the orchestrator inspects visuals and sends direct observations, interpretation, and uncertainty; execution never receives untrusted pixels"
   },
   "antigravity": {
-    "asyncContract": "subagents_spawn (alias deepseek_spawn) returns an accepted pending obligation immediately after job creation; agy runs asynchronously and subagents_follow (alias deepseek_follow) observes completion/failure/abort; abort between job creation and dispatch prevents the launch and never re-activates a closed/aborted agent; external orchestration lifecycle remains fallback=forbidden",
-    "timeoutFailoverV1": "opt-in, bridge-internal, persisted, one-hop timeout failover from Antigravity to configured OpenCode DeepSeek for analyze-mode tasks only upon confirmed timeout. Hard exclusions: edit/test modes, cancellation/abort, unconfirmed process termination, partial/invalid output, disabled target route. Visible in activity audit and result metadata; no daemon restart or automatic process cleanup",
-    "sandbox": "antigravitySandbox (boolean, default false) enables agy --sandbox; never implied by other flags",
-    "command": "antigravityCommand (string, default null): per-bridge override for the agy executable, a bare command name (PATH lookup) or an absolute path to a trusted local executable; null keeps the default agy.exe/agy PATH lookup; a single executable, never a shell command line; whitespace-containing non-absolute values are rejected at config load, while absolute executable paths with spaces remain allowed; avoids global PATH changes",
-    "addDirs": "antigravityAddDirs (absolute string paths, default []) mounts explicit writable directories into the sandbox; relative entries are dropped at load",
-    "autoApprove": "antigravityAutoApprovePermissions (boolean, default false) passes --dangerously-skip-permissions so agy never blocks on interactive permission prompts; independent of antigravitySandbox (an unsandboxed run can carry auto-approval and a sandboxed run can omit it) and never broadens the sandbox",
-    "recovery": "antigravity runs live inside the daemon process; after a daemon loss, stranded active antigravity jobs (dispatching/running/following/finalizing) are terminalized as failed with a clear reason at startup recovery, never left dispatching/working; an orphaned child process is not controllable; in-process follow/abort semantics are unchanged",
-    "secrets": "the bridge never reads, writes or exposes Antigravity credentials or secrets"
+    "asyncContract": "subagents_spawn returns an accepted pending obligation after job creation; agy runs asynchronously and subagents_follow observes completion, failure, approval, or abort",
+    "fallback": {
+      "enabled": false,
+      "policy": "timeouts, transport errors, unavailable executables, and invalid/ambiguous output remain terminal failures"
+    },
+    "sandbox": "antigravitySandbox is explicit and defaults to false",
+    "command": "antigravityCommand is one trusted executable name or absolute path; it is never a shell command line",
+    "addDirs": "only explicit absolute writable directories are accepted",
+    "autoApprove": "antigravityAutoApprovePermissions is explicit and independent of sandboxing",
+    "recovery": "after daemon loss, stranded active Antigravity jobs are terminalized with a clear failure reason; an orphaned child is not adopted",
+    "secrets": "the bridge never reads, writes, or exposes Antigravity credentials"
   },
   "obligations": {
-    "consumption": "terminal results become consumed when follow/recover returns a usable final result (persisted per job); needs_approval stays pending",
+    "consumption": "terminal results become consumed when follow/recover returns a usable final result",
     "agentCloseSeparate": "closing the agent is separate from consuming the obligation",
-    "respawn": "subagents_continue (alias deepseek_continue) accepts allow_respawn (optional boolean, default false) as the explicit closed-agent recovery: only when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted does it automatically create a NEW agent and NEW OpenCode session with persisted lineage (parent_agent_id), reusing only the parent's topic, workspace path, workspace strategy and pinned model route; thread/turn correlation hints are preserved or derived; auditable activity is recorded on both agents; the response returns the NEW agentId/jobId; the closed agent is never reopened",
-    "respawnFailClosed": ["flag absent on a closed agent (409 not_continuable)", "explicit abort (409 not_continuable)", "no persisted result (409 not_continuable)", "busy agent", "permission-field answers (400)", "any scope change", "no provider fallback", "no live-config route"],
+    "legacyContinuation": "compatibility aliases continue to the same pinned Antigravity/Gemini identity and never reopen a historical provider",
     "doctorWarnings": [
       "unconsumed terminal results",
       "terminal agents still open",
       "open obligations",
-      "genuine stale follow windows only (no false positives for fresh or auto-armed jobs; no auto-close)"
+      "genuine stale follow windows only"
     ]
   },
+  "doctor": {
+    "readOnly": true,
+    "buildsArtifacts": false,
+    "powershellScript": "scripts/doctor.ps1",
+    "cliCommand": "node dist/cli.js doctor --json"
+  },
+  "installer": {
+    "idempotent": true,
+    "powershellScript": "scripts/install.ps1",
+    "processLifecycle": "does not start or stop processes in this patch",
+    "profileParameter": "safe (default fast check) or full (deep quick_check)"
+  },
+  "history": {
+    "dataDirectory": "%LOCALAPPDATA%\\DeepSeek Sub-Agent",
+    "providerStatus": "OpenCode/DeepSeek is not an active provider; historical records are strictly read-only",
+    "preservation": "SQLite, WAL/SHM, results, deliveries, inbox, spool, backups, logs, and old identifiers are preserved by default in read-only mode",
+    "legacyProviderLabels": [
+      "opencode-go",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro"
+    ],
+    "migration": "explicit only: prove quiescence, preserve the source, create and verify a size/SHA-256 manifest, validate restore, then change configuration",
+    "malformedRecords": "partial, private, malformed, or ambiguous historical records fail closed and are never remapped into a new execution",
+    "purge": "never implicit; requires -PurgeData -ConfirmPurge"
+  },
   "retention": {
-    "modes": ["auto", "disabled", "dry-run", "enabled"],
+    "modes": [
+      "auto",
+      "disabled",
+      "dry-run",
+      "enabled"
+    ],
     "default": "disabled",
-    "autoGate": "auto only enables pruning on a provably empty database",
-    "intrinsicGate": "online pruning on a non-empty legacy database requires the in-database offline-preparation marker written by `retention dry-run` or `retention enabled --confirm`; a hand-edited retentionMode=enabled alone never arms pruning",
-    "prunesOnly": ["events", "agent_activity"],
-    "neverPrunes": ["agents", "jobs", "results", "deliveries", "bindings", "inbox"],
-    "protections": ["active jobs", "open obligations", "unconsumed results", "undelivered results", "fresh rows", "activity floor of 50 newest rows per agent"],
-    "metrics": "dry-run and real passes report accurate protected counts (rows never eligible for pruning); doctor never claims zero protected when protected rows exist",
-    "safety": ["chunked", "time-bounded", "idempotent", "PASSIVE WAL checkpoint only, never an online VACUUM", "legacy prune indexes created only by the offline CLI path"]
+    "neverPrunes": [
+      "agents",
+      "jobs",
+      "results",
+      "deliveries",
+      "bindings",
+      "inbox"
+    ],
+    "safety": [
+      "chunked",
+      "time-bounded",
+      "idempotent",
+      "no online VACUUM"
+    ]
   },
   "delivery": {
     "primary": "event-driven-follow-and-persistence",
     "fallback": "private-inbox",
     "polling": false,
-    "configuredTransports": ["stdio", "loopback-ws"],
+    "configuredTransports": [
+      "stdio",
+      "loopback-ws"
+    ],
     "desktopWindowsProven": false,
     "sameChat": "experimental-disabled-by-default",
     "follow": {

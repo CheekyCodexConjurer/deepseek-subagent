@@ -1,55 +1,137 @@
 # Installation
 
-## Safe local setup
+SubAgents MCP configures one local execution path: Antigravity (`agy`)
+running Gemini 3.8 Flash High via MCP. OpenCode and DeepSeek are not active
+providers. Any legacy names, bins, or `deepseek_*` aliases exist strictly for
+protocol compatibility if required by the host. Historical data is preserved
+as read-only.
 
-From PowerShell:
+## Prerequisites
 
-    npm install
-    npm run build
-    .\scripts\install.ps1 -Profile safe
+- Windows PowerShell and Node.js 24 or newer.
+- An authenticated Antigravity installation with `agy` available on `PATH`,
+  or an explicit trusted executable path in the bridge configuration.
+- A Codex CLI installation when `-RegisterCodex` is used.
 
-The default configuration is stored below the current user’s local application data directory. It contains a random daemon bearer token and model settings. Secrets are redacted from doctor, config and error output.
+The bridge does not import, copy, or expose provider credentials. Authentication
+stays with the local Antigravity installation.
 
-## Register with Codex
+## Install
 
-Registration is opt-in because it changes the user’s Codex MCP configuration:
+From the repository root, run:
 
-    .\scripts\install.ps1 -Profile safe -RegisterCodex
+```powershell
+.\scripts\install.ps1 -RegisterCodex
+```
 
-The script makes a timestamped backup before invoking codex mcp add. The MCP process is stdio-only; logs go to stderr so stdout remains protocol-clean.
+The installer:
 
-Registration exposes the DeepSeek tools but does not by itself make them the default delegation route. To route unqualified delegation requests to DeepSeek Sub-Agent, merge the canonical routing block from docs/orchestrator-instructions.md into `%USERPROFILE%\.codex\AGENTS.md`.
+1. installs dependencies without running arbitrary scripts and without rewriting
+   `package-lock.json`;
+2. builds the bridge TypeScript files into `dist/`;
+3. runs the local bridge configuration and doctor checks;
+4. when `-RegisterCodex` is supplied, backs up the Codex configuration, removes
+   any preexisting canonical registration, and registers `[mcp_servers.subagents]`;
+5. sets `tool_timeout_sec = 4500` on the canonical section (and preserves
+   existing compatibility sections);
+6. optionally registers the bridge daemon at logon with `-InstallScheduledTask`.
 
-## Start the daemon
+### Diagnostic Profile parameter
 
-Foreground:
+The optional `-Profile` parameter controls diagnostic verification depth:
+- `safe` (default): runs standard fast doctor diagnostics without running
+  blocking SQLite PRAGMA quick_check.
+- `full`: runs comprehensive doctor diagnostics with `--full` (executes SQLite
+  integrity quick_check).
 
-    node .\dist\cli.js daemon
+Example:
 
-Detached:
+```powershell
+.\scripts\install.ps1 -Profile safe -RegisterCodex
+```
 
-    node .\dist\cli.js start
+### Process lifecycle safety
 
-The registered MCP now starts the detached local daemon automatically when it connects and the daemon is offline, then waits for the bridge health endpoint before exposing tools. `-StartDaemon` is still available to prewarm it after installation. Managed mode starts OpenCode on loopback and injects only a bridge-owned local server credential into that child process. The managed `serve` also sets `OPENCODE_PERMISSION={"*":"allow"}`, the headless configuration equivalent of `--auto`, so the dedicated sub-agent session never asks for approval. Attach mode can be selected in config for an already running loopback OpenCode server.
+Installation is idempotent and does not start, stop, or kill background
+processes in this patch. To run the daemon after installation, start it
+explicitly via:
 
-The installer configures `tool_timeout_sec = 4500` (75 minutes) in the `deepseek-subagent` Codex MCP section, preserving the other options and creating a timestamped backup before registration. This is longer than the maximum `deepseek_follow` window of 60 minutes plus 10 minutes of graceful finalization.
+```powershell
+npm start
+# or: node .\dist\cli.js daemon
+```
 
-## Optional Codex App Server endpoint
+Installation never starts Antigravity, kills a process, rewrites active routes,
+or selects a fallback provider.
 
-The bridge can connect to an explicitly configured local Codex WebSocket endpoint:
+The installer keeps the historical `%LOCALAPPDATA%\DeepSeek Sub-Agent`
+configuration and data location so existing SQLite, results, inbox, spool, and
+backups remain addressable in read-only mode.
 
-    "codexAppServerSocket": "ws://127.0.0.1:PORT"
+## Codex registration and compatibility
 
-This requires a separately launched App Server (`codex app-server --listen ws://127.0.0.1:PORT`). It does not attach to the current Windows Desktop App Server automatically; leave this field `null` to keep the inbox fallback.
+New registrations use the neutral server name `subagents`. Existing
+`subagents-mcp`, `deepseek-subagent`, or `deepseek_subagent` sections are
+legacy compatibility entries and are not removed automatically. They must be
+reviewed after the runtime cutover; a stale or conflicting entry must fail
+closed rather than silently redirecting work.
 
-Same-chat push is experimental and disabled by default. Enable `experimentalSameChatDelivery` only for development with an explicitly configured and live-tested App Server correlation. Normal spawn, consult, follow, persistence and inbox recovery do not depend on it.
+The package exposes the canonical `subagents-mcp` and `subagents` bins while
+retaining `deepseek-subagent` and `codex-opencode-bridge` as CLI aliases. The
+historical npm package name is retained because the lockfile and existing
+installations are outside this ownership slice.
+
+## Scheduled task
+
+`-InstallScheduledTask` registers `SubAgents MCP Daemon`. If the old scheduled
+task name is present, the installer removes that scheduler registration before
+creating the canonical registration; it does not stop an already running
+process and does not touch data. This prevents two logon registrations from
+starting the same bridge after migration.
 
 ## Uninstall
 
-    .\scripts\uninstall.ps1
+```powershell
+.\scripts\uninstall.ps1
+```
 
-Uninstall preserves the SQLite database, result files and inbox by default. Data removal requires both -PurgeData and -ConfirmPurge and is limited to the exact DeepSeek Sub-Agent data directory.
+Uninstall removes the canonical scheduled-task registration and, when
+`-RemoveCodex` is supplied, the canonical Codex MCP registration. It never
+stops the daemon, kills a process, restarts Antigravity, or deletes history.
+The legacy Codex aliases remain by default for compatibility. To remove those
+registrations as a separate explicit choice, use:
 
-To remove the opt-in Codex registration, use `-RemoveCodex`; the script creates a timestamped Codex config backup before changing it:
+```powershell
+.\scripts\uninstall.ps1 -RemoveCodex -RemoveLegacyCodex
+```
 
-    .\scripts\uninstall.ps1 -RemoveCodex
+Data removal is a separate destructive operation and requires both switches:
+
+```powershell
+.\scripts\uninstall.ps1 -PurgeData -ConfirmPurge
+```
+
+The purge is restricted to the verified historical data directory and is not
+part of normal uninstall. Do not purge while a daemon, job, or database writer
+is active; prove quiescence and retain a verified backup first.
+
+## Doctor
+
+```powershell
+.\scripts\doctor.ps1
+```
+
+Doctor (`scripts/doctor.ps1`) is strictly read-only: it runs `doctor --json`
+without compiling or generating build artifacts in `dist/`. It is a diagnostic
+check: it does not alter Codex registration, purge data, kill a process, or
+restart Antigravity. Runtime readiness and a real Antigravity / Gemini canary
+must still be proven separately on the exact reviewed artifact.
+
+## External integration boundary
+
+This repository does not edit the user's global `%USERPROFILE%\.codex\AGENTS.md`,
+`GEMINI.md`, or existing external daemon/configuration in this slice. After
+reviewing the runtime owner's changes, apply the canonical routing block from
+`docs/orchestrator-instructions.md` through the separately authorized
+configuration owner. Do not treat a source change or a successful local build
+as proof that an already running daemon has switched providers.

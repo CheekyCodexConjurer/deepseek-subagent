@@ -13,7 +13,7 @@ const MODE_RULES: Record<AgentMode, string> = {
 export interface PromptBuildOptions {
   maxLength: number;
   /**
-   * Inline context is useful for OpenCode sessions. The Antigravity CLI gets
+   * Inline context is useful for small managed sessions. The Antigravity CLI gets
    * its prompt via argv, so it receives workspace-local file references and
    * reads their contents itself instead of risking a command-line overflow.
    */
@@ -76,12 +76,12 @@ export async function buildWorkerPrompt(
   const operatingRuleLines = mode
     ? ["Operating rule: " + MODE_RULES[mode]]
     : [
-        "Operating rule: Continue under the operating mode already established in this OpenCode session.",
+        "Operating rule: Continue under the operating mode already established in this Antigravity session.",
         "Any prior GRACEFUL_FINALIZE_PROMPT stop was scoped to the expired job; this accepted continuation authorizes the current task without broadening the session's original permissions.",
       ];
 
   const prompt = [
-    "You are a local DeepSeek sub-agent orchestrated by Codex.",
+    "You are a local Antigravity sub-agent running Gemini, orchestrated by Codex.",
     "This is a bounded task. Follow the requested scope and do not invent follow-up work.",
     "Never reveal private chain-of-thought or hidden reasoning. Report concise evidence and conclusions.",
     "Workspace: " + workspacePath,

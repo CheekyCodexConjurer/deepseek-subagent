@@ -5,16 +5,182 @@ import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../../src/store.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeService, type ManagedOpenCodeLike } from "../../src/service.js";
+import { BridgeService as BaseBridgeService, type ManagedOpenCodeLike } from "../../src/service.js";
 import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage } from "../../src/types.js";
+import type { AntigravityRunResult } from "../../src/antigravity/types.js";
 
 let globalSessionCounter = 0;
 
+class MockAntigravity {
+  isMock = true;
+  promptCalls: Array<{ sessionId: string; task: string; prompt: string }> = [];
+  promptErrors: Array<Error | null> = [];
+  activeSessions = new Set<string>();
+  pendingRuns = new Map<string, {
+    resolve: (res: AntigravityRunResult) => void;
+    reject: (err: any) => void;
+    agentId: string;
+    jobId: string;
+    workspace: string;
+  }>();
+
+  constructor(public client?: FakeOpenCodeClient) {}
+
+  async runPrompt(options: {
+    prompt: string;
+    cwd: string;
+    model: string;
+    signal?: AbortSignal;
+    dataDir: string;
+    agentId: string;
+    jobId: string;
+    requestId?: string;
+    timeoutMs?: number | null;
+    fence?: number;
+    onHeartbeat?: any;
+    onProgress?: any;
+  }): Promise<AntigravityRunResult> {
+    const call = {
+      sessionId: options.agentId,
+      task: options.prompt,
+      prompt: options.prompt,
+    };
+    this.promptCalls.push(call);
+    this.activeSessions.add(options.jobId);
+    this.activeSessions.add(options.agentId);
+
+    if (this.client) {
+      this.client.promptCalls.push({ sessionId: options.agentId, task: options.prompt });
+      this.client.activeSessions.add(options.agentId);
+      this.client.activeSessions.add(options.jobId);
+      const clientErr = this.client.promptErrors.shift();
+      if (clientErr) {
+        this.activeSessions.delete(options.jobId);
+        this.activeSessions.delete(options.agentId);
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+        throw clientErr;
+      }
+    }
+
+    const err = this.promptErrors.shift();
+    if (err) {
+      this.activeSessions.delete(options.jobId);
+      this.activeSessions.delete(options.agentId);
+      if (this.client) {
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+      }
+      throw err;
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        resolve: (res: AntigravityRunResult) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          resolve(res);
+        },
+        reject: (error: any) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          reject(error);
+        },
+        agentId: options.agentId,
+        jobId: options.jobId,
+        workspace: options.cwd,
+      };
+
+      this.pendingRuns.set(options.jobId, entry);
+      this.pendingRuns.set(options.agentId, entry);
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          entry.reject(new Error("aborted"));
+          return;
+        }
+        options.signal.addEventListener("abort", () => {
+          entry.reject(new Error("aborted"));
+        });
+      }
+    });
+  }
+
+  async completeActive(target: { id: string; workspacePath?: string }) {
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(target.id)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(target.id);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: target.workspacePath ?? entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  async completeSession(sessionId: string) {
+    const agentId = sessionId.startsWith("antigravity:") ? sessionId.slice("antigravity:".length) : sessionId;
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(agentId) || this.pendingRuns.has(sessionId)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(agentId) ?? this.pendingRuns.get(sessionId);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+}
+
 class FakeOpenCodeClient implements OpenCodeClientLike {
   promptCalls: Array<{ sessionId: string; task: string }> = [];
+  promptErrors: Array<Error | null> = [];
   messages: OpenCodeMessage[] = [];
   activeSessions = new Set<string>();
+  antigravity: MockAntigravity;
   private onEvent?: (event: OpenCodeEvent) => Promise<void> | void;
+
+  constructor() {
+    this.antigravity = new MockAntigravity(this);
+  }
 
   async health() {
     return { healthy: true, version: "fake" };
@@ -27,6 +193,8 @@ class FakeOpenCodeClient implements OpenCodeClientLike {
   }
   async promptAsync(sessionId: string, task: string) {
     this.promptCalls.push({ sessionId, task });
+    const err = this.promptErrors.shift();
+    if (err) throw err;
   }
   async listMessages() {
     return this.messages;
@@ -36,13 +204,51 @@ class FakeOpenCodeClient implements OpenCodeClientLike {
   }
   async abort(sessionId: string) {
     this.activeSessions.delete(sessionId);
+    this.antigravity.activeSessions.delete(sessionId);
   }
   async replyPermission() {}
   async subscribe(onEvent: (event: OpenCodeEvent) => Promise<void> | void) {
     this.onEvent = onEvent;
   }
   async emit(event: OpenCodeEvent) {
+    if (event.type === "session.idle") {
+      const sessId = (event.properties as any)?.sessionID ?? (event.properties as any)?.sessionId;
+      if (sessId) {
+        await this.antigravity.completeSession(sessId);
+      }
+    }
     await this.onEvent?.(event);
+  }
+}
+
+class BridgeService extends BaseBridgeService {
+  constructor(config: any, dependencies: any = {}) {
+    const antigravity = dependencies.antigravity ?? dependencies.manager?.client?.antigravity ?? new MockAntigravity();
+    super(config, {
+      ...dependencies,
+      antigravity,
+    });
+  }
+
+  async completeActive(agent: any) {
+    if ((this.antigravity as any)?.completeActive) {
+      await (this.antigravity as any).completeActive(agent);
+    }
+    for (let i = 0; i < 50; i++) {
+      const j = this.store.listJobs().find((job: any) => job.agentId === agent.id && job.status === "running");
+      if (!j) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  async markNeedsApproval(agent: any, properties: any = {}) {
+    const jobs = this.store.listJobs().filter((j: any) => j.agentId === agent.id && ["running", "dispatching"].includes(j.status));
+    const job = jobs[0];
+    if (!job) return;
+    const permissionId = (properties.permissionId as string) ?? job.permissionId;
+    this.store.updateJobStatus(job.id, "needs_approval");
+    if (permissionId) this.store.setJobPermission(job.id, permissionId);
+    this.store.updateAgentStatus(agent.id, "needs_approval");
   }
 }
 
@@ -83,6 +289,17 @@ async function setupCompletedAgent(
   });
   const agent = store.getAgent(spawnResult.agentId)!;
   await (service as any).completeActive(agent);
+  const respawnableStatuses = new Set(["completed", "completed_partial", "delivered", "timed_out"]);
+  for (let i = 0; i < 500; i++) {
+    const job = store.getJob(spawnResult.jobId);
+    const currentAgent = store.getAgent(agent.id);
+    if (job?.resultPath && respawnableStatuses.has(job.status) && currentAgent?.status === "completed" && store.getActiveJobCount() === 0) break;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  const completedJob = store.getJob(spawnResult.jobId);
+  assert.ok(completedJob?.resultPath, "Completed fixture job must persist its result before the agent is closed");
+  assert.ok(respawnableStatuses.has(completedJob.status), "Completed fixture job must be respawnable before the agent is closed");
+  assert.equal(store.getAgent(agent.id)?.status, "completed", "Completed fixture agent must settle before it is closed");
   assert.equal(store.getActiveJobCount(), 0, "Active job count must be 0 after completion");
   return agent;
 }

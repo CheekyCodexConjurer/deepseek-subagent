@@ -8,20 +8,186 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { BridgeStore } from "../../src/store.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeService, type ManagedOpenCodeLike } from "../../src/service.js";
+import { BridgeService as BaseBridgeService, type ManagedOpenCodeLike } from "../../src/service.js";
 import { hashPrompt } from "../../src/security.js";
 import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage } from "../../src/types.js";
+import type { AntigravityRunResult } from "../../src/antigravity/types.js";
 
 const execFileAsync = promisify(execFile);
 
 let globalSessionCounter = 0;
 
+class MockAntigravity {
+  isMock = true;
+  promptCalls: Array<{ sessionId: string; task: string; prompt: string }> = [];
+  promptErrors: Array<Error | null> = [];
+  activeSessions = new Set<string>();
+  pendingRuns = new Map<string, {
+    resolve: (res: AntigravityRunResult) => void;
+    reject: (err: any) => void;
+    agentId: string;
+    jobId: string;
+    workspace: string;
+  }>();
+
+  constructor(public client?: FakeOpenCodeClient) {}
+
+  async runPrompt(options: {
+    prompt: string;
+    cwd: string;
+    model: string;
+    signal?: AbortSignal;
+    dataDir: string;
+    agentId: string;
+    jobId: string;
+    requestId?: string;
+    timeoutMs?: number | null;
+    fence?: number;
+    onHeartbeat?: any;
+    onProgress?: any;
+  }): Promise<AntigravityRunResult> {
+    const call = {
+      sessionId: options.agentId,
+      task: options.prompt,
+      prompt: options.prompt,
+    };
+    this.promptCalls.push(call);
+    this.activeSessions.add(options.jobId);
+    this.activeSessions.add(options.agentId);
+
+    if (this.client) {
+      this.client.promptCalls.push({ sessionId: options.agentId, task: options.prompt });
+      this.client.activeSessions.add(options.agentId);
+      this.client.activeSessions.add(options.jobId);
+      const clientErr = this.client.promptErrors.shift();
+      if (clientErr) {
+        this.activeSessions.delete(options.jobId);
+        this.activeSessions.delete(options.agentId);
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+        throw clientErr;
+      }
+    }
+
+    const err = this.promptErrors.shift();
+    if (err) {
+      this.activeSessions.delete(options.jobId);
+      this.activeSessions.delete(options.agentId);
+      if (this.client) {
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+      }
+      throw err;
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        resolve: (res: AntigravityRunResult) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          resolve(res);
+        },
+        reject: (error: any) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          reject(error);
+        },
+        agentId: options.agentId,
+        jobId: options.jobId,
+        workspace: options.cwd,
+      };
+
+      this.pendingRuns.set(options.jobId, entry);
+      this.pendingRuns.set(options.agentId, entry);
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          entry.reject(new Error("aborted"));
+          return;
+        }
+        options.signal.addEventListener("abort", () => {
+          entry.reject(new Error("aborted"));
+        });
+      }
+    });
+  }
+
+  async completeActive(target: { id: string; workspacePath?: string }) {
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(target.id)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(target.id);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: target.workspacePath ?? entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  async completeSession(sessionId: string) {
+    const agentId = sessionId.startsWith("antigravity:") ? sessionId.slice("antigravity:".length) : sessionId;
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(agentId) || this.pendingRuns.has(sessionId)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(agentId) ?? this.pendingRuns.get(sessionId);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+}
+
 class FakeOpenCodeClient implements OpenCodeClientLike {
   promptCalls: Array<{ sessionId: string; task: string }> = [];
+  promptErrors: Array<Error | null> = [];
   createdSessions: Array<{ id: string; directory?: string; title?: string }> = [];
   messages: OpenCodeMessage[] = [];
   activeSessions = new Set<string>();
+  antigravity: MockAntigravity;
   private onEvent?: (event: OpenCodeEvent) => Promise<void> | void;
+
+  constructor() {
+    this.antigravity = new MockAntigravity(this);
+  }
 
   async health() {
     return { healthy: true, version: "fake" };
@@ -44,13 +210,41 @@ class FakeOpenCodeClient implements OpenCodeClientLike {
   }
   async abort(sessionId: string) {
     this.activeSessions.delete(sessionId);
+    this.antigravity.activeSessions.delete(sessionId);
   }
   async replyPermission() {}
   async subscribe(onEvent: (event: OpenCodeEvent) => Promise<void> | void) {
     this.onEvent = onEvent;
   }
   async emit(event: OpenCodeEvent) {
+    if (event.type === "session.idle") {
+      const sessId = (event.properties as any)?.sessionID ?? (event.properties as any)?.sessionId;
+      if (sessId) {
+        await this.antigravity.completeSession(sessId);
+      }
+    }
     await this.onEvent?.(event);
+  }
+}
+
+class BridgeService extends BaseBridgeService {
+  constructor(config: any, dependencies: any = {}) {
+    const antigravity = dependencies.antigravity ?? dependencies.manager?.client?.antigravity ?? new MockAntigravity();
+    super(config, {
+      ...dependencies,
+      antigravity,
+    });
+  }
+
+  async completeActive(agent: any) {
+    if ((this.antigravity as any)?.completeActive) {
+      await (this.antigravity as any).completeActive(agent);
+    }
+    for (let i = 0; i < 50; i++) {
+      const j = this.store.listJobs().find((job: any) => job.agentId === agent.id && job.status === "running");
+      if (!j) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 }
 
@@ -184,15 +378,13 @@ test("spawnBatch with worktree strategy and contextFiles admits atomically witho
         "Tracked context file must exist inside the prepared worktree",
       );
 
-      // Verify real prompt constructed at dispatch via OpenCode inline-context path
-      const promptCall = client.promptCalls.find((c) => c.sessionId === agent.opencodeSessionId);
-      assert.ok(promptCall, "Client must receive prompt call for the agent session upon dispatch");
-      const dispatchedPrompt = promptCall.task;
-
-      assert.ok(
-        dispatchedPrompt.includes("Committed notes for worktree batch test"),
-        "Dispatched prompt must inline the context file content from the worktree",
+      // Verify real prompt constructed at dispatch via Antigravity worktree-context path
+      const promptCall = (service as any).antigravity.promptCalls.find(
+        (c: any) => c.sessionId === agent.id || c.sessionId === agent.opencodeSessionId,
       );
+      assert.ok(promptCall, "Antigravity must receive prompt call for the agent session upon dispatch");
+      const dispatchedPrompt = promptCall.prompt;
+
       const expectedWorktreeFile = path.normalize(path.join(agent.workspacePath, "notes.txt"));
       assert.ok(
         dispatchedPrompt.includes("FILE: " + expectedWorktreeFile),
@@ -318,10 +510,16 @@ test("spawnBatch admits multiple worktree items with empty envelopes and dispatc
       assert.equal(existsSync(agentA.workspacePath), true);
       assert.equal(existsSync(agentB.workspacePath), false);
 
-      const callA = client.promptCalls.find((c) => c.sessionId === agentA.opencodeSessionId);
+      const callA = (service as any).antigravity.promptCalls.find(
+        (c: any) => c.sessionId === agentA.id || c.sessionId === agentA.opencodeSessionId,
+      );
       assert.ok(callA);
-      assert.ok(callA.task.includes("Context A payload"));
-      assert.equal(callA.task.includes("Context B payload"), false);
+      const expectedWorktreeFileA = path.normalize(path.join(agentA.workspacePath, "taskA.txt"));
+      assert.ok(
+        callA.prompt.includes("FILE: " + expectedWorktreeFileA),
+        "Dispatched prompt A must reference file path inside worktree A",
+      );
+      assert.equal(callA.prompt.includes("taskB.txt"), false);
 
       // Complete item A to dispatch item B
       store.updateJobStatus(itemA.jobId, "completed");
@@ -329,10 +527,16 @@ test("spawnBatch admits multiple worktree items with empty envelopes and dispatc
 
       assert.equal(existsSync(agentB.workspacePath), true);
 
-      const callB = client.promptCalls.find((c) => c.sessionId === agentB.opencodeSessionId);
+      const callB = (service as any).antigravity.promptCalls.find(
+        (c: any) => c.sessionId === agentB.id || c.sessionId === agentB.opencodeSessionId,
+      );
       assert.ok(callB);
-      assert.ok(callB.task.includes("Context B payload"));
-      assert.equal(callB.task.includes("Context A payload"), false);
+      const expectedWorktreeFileB = path.normalize(path.join(agentB.workspacePath, "taskB.txt"));
+      assert.ok(
+        callB.prompt.includes("FILE: " + expectedWorktreeFileB),
+        "Dispatched prompt B must reference file path inside worktree B",
+      );
+      assert.equal(callB.prompt.includes("taskA.txt"), false);
     } finally {
       await service.stop();
       store.close();

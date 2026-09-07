@@ -1392,10 +1392,13 @@ test("BLK-BRIDGE-2: default unattached MCP path rejects wait=true, requires auth
     store,
     codex: new UnavailableCodexDeliveryAdapter(), // REAL default path, NOT FakeCodexDelivery
     cliTransport: fakeCli,
-    manager: {
-      start: async () => ({ serverId: "srv", baseUrl: "http://127.0.0.1:9999", client: new FakeOpenCodeClient(), processId: null, stop: async () => {} }),
-      stop: async () => {},
-    },
+    antigravity: {
+      runPrompt: async (options: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          if (options.signal?.aborted) return resolve({} as any);
+          options.signal?.addEventListener("abort", () => resolve({} as any), { once: true });
+        }),
+    } as any,
   });
   await service.start();
 

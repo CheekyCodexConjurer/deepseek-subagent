@@ -59,19 +59,17 @@ function makeFakeManager(client: FakeOpenCodeClient): OpenCodeManagerLike {
   };
 }
 
+const fakeAntigravity = {
+  async runPrompt() {
+    return new Promise(() => {});
+  },
+};
+
 function initServiceInstance(
   service: BridgeService,
-  client: FakeOpenCodeClient,
+  client?: FakeOpenCodeClient,
   serverId = "fake_server",
 ) {
-  (service as any).managed = {
-    serverId,
-    baseUrl: "http://127.0.0.1:9999",
-    client,
-    processId: 1234,
-    stop: async () => {},
-  };
-  (service as any).client = client;
   (service as any).lifecycleState = "ready";
   (service as any).running = true;
 }
@@ -88,8 +86,8 @@ test("claim contention: second failed claimant must not delete valid dispatch en
   const client2 = new FakeOpenCodeClient();
   const config1 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
   const config2 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
-  const service1 = new BridgeService(config1, { store: store1, manager: makeFakeManager(client1) });
-  const service2 = new BridgeService(config2, { store: store2, manager: makeFakeManager(client2) });
+  const service1 = new BridgeService(config1, { store: store1, antigravity: fakeAntigravity as any });
+  const service2 = new BridgeService(config2, { store: store2, antigravity: fakeAntigravity as any });
 
   initServiceInstance(service1, client1, "server_1");
   initServiceInstance(service2, client2, "server_2");
@@ -109,12 +107,12 @@ test("claim contention: second failed claimant must not delete valid dispatch en
         workspacePath: tmpDir,
         workspaceStrategy: "shared",
         mode: "subagent",
-        opencodeServerId: "server_1",
-        opencodeSessionId: "session_fake_1",
-        modelProviderId: "opencode-go",
-        modelId: "deepseek-v4-flash",
-        modelVariant: "max",
-        modelRoute: "direct",
+        opencodeServerId: "antigravity",
+        opencodeSessionId: "antigravity:" + agentId,
+        modelProviderId: "antigravity",
+        modelId: "gemini-3.8-flash-high",
+        modelVariant: null,
+        modelRoute: "antigravity-flash-high",
       },
       job: {
         id: jobId,
@@ -173,8 +171,8 @@ test("claim contention: second failed claimant must not call settlement or relea
   const client2 = new FakeOpenCodeClient();
   const config1 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
   const config2 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
-  const service1 = new BridgeService(config1, { store: store1, manager: makeFakeManager(client1) });
-  const service2 = new BridgeService(config2, { store: store2, manager: makeFakeManager(client2) });
+  const service1 = new BridgeService(config1, { store: store1, antigravity: fakeAntigravity as any });
+  const service2 = new BridgeService(config2, { store: store2, antigravity: fakeAntigravity as any });
 
   initServiceInstance(service1, client1, "server_1");
   initServiceInstance(service2, client2, "server_2");
@@ -194,12 +192,12 @@ test("claim contention: second failed claimant must not call settlement or relea
         workspacePath: tmpDir,
         workspaceStrategy: "shared",
         mode: "subagent",
-        opencodeServerId: "server_1",
-        opencodeSessionId: "session_fake_1",
-        modelProviderId: "opencode-go",
-        modelId: "deepseek-v4-flash",
-        modelVariant: "max",
-        modelRoute: "direct",
+        opencodeServerId: "antigravity",
+        opencodeSessionId: "antigravity:" + agentId,
+        modelProviderId: "antigravity",
+        modelId: "gemini-3.8-flash-high",
+        modelVariant: null,
+        modelRoute: "antigravity-flash-high",
       },
       job: {
         id: jobId,
@@ -260,8 +258,8 @@ test("claim contention: second failed claimant must not corrupt status or abort 
   const client2 = new FakeOpenCodeClient();
   const config1 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
   const config2 = createDefaultConfig({ dataDir: tmpDir, swarmCreditCeiling: 2 });
-  const service1 = new BridgeService(config1, { store: store1, manager: makeFakeManager(client1) });
-  const service2 = new BridgeService(config2, { store: store2, manager: makeFakeManager(client2) });
+  const service1 = new BridgeService(config1, { store: store1, antigravity: fakeAntigravity as any });
+  const service2 = new BridgeService(config2, { store: store2, antigravity: fakeAntigravity as any });
 
   initServiceInstance(service1, client1, "server_1");
   initServiceInstance(service2, client2, "server_2");
@@ -281,12 +279,12 @@ test("claim contention: second failed claimant must not corrupt status or abort 
         workspacePath: tmpDir,
         workspaceStrategy: "shared",
         mode: "subagent",
-        opencodeServerId: "server_1",
-        opencodeSessionId: "session_fake_1",
-        modelProviderId: "opencode-go",
-        modelId: "deepseek-v4-flash",
-        modelVariant: "max",
-        modelRoute: "direct",
+        opencodeServerId: "antigravity",
+        opencodeSessionId: "antigravity:" + agentId,
+        modelProviderId: "antigravity",
+        modelId: "gemini-3.8-flash-high",
+        modelVariant: null,
+        modelRoute: "antigravity-flash-high",
       },
       job: {
         id: jobId,

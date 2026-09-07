@@ -4,7 +4,7 @@ import { buildWorkerPrompt } from "../../src/prompts.js";
 
 const ANALYZE_RULE = "Inspect and reason only. Do not edit files, configuration, package state, or Git history.";
 const EDIT_RULE = "Implement the requested change with the smallest safe diff. Preserve unrelated worktree changes.";
-const CONTINUE_RULE = "Continue under the operating mode already established in this OpenCode session.";
+const CONTINUE_RULE = "Continue under the operating mode already established in this Antigravity session.";
 const FINALIZE_SCOPE_RULE =
   "Any prior GRACEFUL_FINALIZE_PROMPT stop was scoped to the expired job; this accepted continuation authorizes the current task without broadening the session's original permissions.";
 

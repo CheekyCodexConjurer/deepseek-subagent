@@ -14,14 +14,14 @@ import type { BridgeConfig } from "./types.js";
 
 const DISPLAY_NAME = "SubAgents MCP";
 const LEGACY_DISPLAY_NAME = "DeepSeek Sub-Agent";
-const MODEL_DISPLAY = "DeepSeek V4 Flash · Max";
+const MODEL_DISPLAY = "Antigravity · gemini-3.8-flash-high";
 const CANONICAL_SERVER_NAME = "subagents";
 
 export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   const config = await loadConfig(configPath);
   await ensureMcpConfig(config);
   const client = new BridgeHttpClient(config);
-  // The MCP handshake and tool listing must never wait for daemon or OpenCode
+  // The MCP handshake and tool listing must never wait for daemon or worker
   // startup. Daemon readiness is bootstrapped lazily on the first tool call,
   // memoized, and shared by concurrent first operations.
   const server = createMcpServer(client, {
@@ -63,7 +63,7 @@ export function createLazyDaemonBootstrap(
         isReady = true;
       } catch (error) {
         isReady = false;
-        throw new Error("DeepSeek Sub-Agent daemon is not ready: " + redactSecrets(String(error)));
+        throw new Error("SubAgents MCP daemon is not ready: " + redactSecrets(String(error)));
       } finally {
         pendingPromise = null;
       }
@@ -200,7 +200,7 @@ export async function ensureDaemonRunning(
     }
     initialReachable = true;
     if (isDaemonHealthDegraded(health)) {
-      throw new Error("DeepSeek Sub-Agent daemon is degraded: " + getDaemonHealthError(health));
+      throw new Error("SubAgents MCP daemon is degraded: " + getDaemonHealthError(health));
     }
     lastError = new Error("Daemon is " + (getDaemonHealthState(health) || "not ready"));
   } catch (error) {
@@ -219,7 +219,7 @@ export async function ensureDaemonRunning(
         return;
       }
       if (isDaemonHealthDegraded(health)) {
-        throw new Error("DeepSeek Sub-Agent daemon is degraded: " + getDaemonHealthError(health));
+        throw new Error("SubAgents MCP daemon is degraded: " + getDaemonHealthError(health));
       }
       lastError = new Error("Daemon is " + (getDaemonHealthState(health) || "not ready"));
     } catch (error) {
@@ -230,7 +230,7 @@ export async function ensureDaemonRunning(
     }
     await delay(Math.min(retryMs, Math.max(1, deadline - Date.now())));
   }
-  throw new Error("DeepSeek Sub-Agent daemon did not become ready: " + redactSecrets(String(lastError)));
+  throw new Error("SubAgents MCP daemon did not become ready: " + redactSecrets(String(lastError)));
 }
 
 async function ensureMcpConfig(config: BridgeConfig): Promise<void> {
@@ -494,7 +494,7 @@ export function createMcpServer(
 
   server.registerTool("subagents_spawn", {
     title: DISPLAY_NAME + " · Spawn",
-    description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The bridge, not the caller, selects and pins the active model route at spawn. Changing routes is an operator-only control-plane action; ordinary MCP callers must never send a remembered/default route name. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
+    description: "Start one asynchronous task in a new managed session on the bridge's active model route. Return immediately after acceptance; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. Do not duplicate this delegated front locally; you may orchestrate other fronts in parallel while it is pending. The bridge, not the caller, selects and pins the active model route at spawn. Changing routes is an operator-only control-plane action; ordinary MCP callers must never send a remembered/default route name. When the task depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; the worker never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: spawnInputSchema,
     outputSchema: {
@@ -557,7 +557,7 @@ export function createMcpServer(
 
   server.registerTool("subagents_continue", {
     title: DISPLAY_NAME + " · Continue",
-    description: "Continue an existing agent after reviewing its delivered result. Asynchronous; returns immediately; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. An open agent continues in its same OpenCode session. Reject or wait if the agent is busy; use subagents_abort to stop it. A closed agent is not continuable: set allow_respawn=true only as an explicit recovery when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted — the bridge then accepts automatically by spawning a NEW agent and a NEW OpenCode session in the same persisted workspace, topic, workspace strategy and pinned model route, records the lineage (parent_agent_id and auditable activity on both agents), preserves or derives the correlation thread/turn hints, and returns the NEW agentId/jobId to follow; it never claims the closed session is the same session and never reopens the closed agent. allow_respawn is rejected (typed 409/400) for aborted agents, closed agents without a persisted result, busy agents, permission-field answers and any scope change: the child inherits only the parent's persisted identity and workspace, with no provider fallback and no live-config route. For an explicit OpenCode permission response on an open agent, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; DeepSeek never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
+    description: "Continue an existing agent after reviewing its delivered result. Asynchronous; returns immediately; do not poll. Accepted is not a result: acceptance creates a pending obligation — consume the job with subagents_follow before a dependent gate or a final response, or explicitly end it with subagents_abort or subagents_close. An open agent continues in its same managed session. Reject or wait if the agent is busy; use subagents_abort to stop it. A closed agent is not continuable: set allow_respawn=true only as an explicit recovery when the agent was closed AFTER a terminal job with a persisted result and was NOT explicitly aborted — the bridge then accepts automatically by spawning a NEW agent and a NEW managed session in the same persisted workspace, topic, workspace strategy and pinned model route, records the lineage (parent_agent_id and auditable activity on both agents), preserves or derives the correlation thread/turn hints, and returns the NEW agentId/jobId to follow; it never claims the closed session is the same session and never reopens the closed agent. allow_respawn is rejected (typed 409/400) for aborted agents, closed agents without a persisted result, busy agents, permission-field answers and any scope change: the child inherits only the parent's persisted identity and workspace, with no provider fallback and no live-config route. For an explicit permission response on an open agent, also provide permission_id and permission_reply (once, always, or reject). When the continuation depends on visual material, inspect the visuals yourself first and send a compact textual visual_context (string, optional, no default) with three labeled parts, 'Direct observations:', 'Interpretation:' and 'Uncertainty:'. Send only your textual interpretation; the worker never receives pixels. Treat direct observations as evidence, interpretation as a hypothesis, and never invent visual details absent from the context.",
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: continueInputSchema,
     outputSchema: {
@@ -1125,14 +1125,14 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
 
   const text = isAlias
     ? (uncertain
-      ? "DeepSeek Sub-Agent accepted the task; OpenCode dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: " + jobId
+      ? "DeepSeek Sub-Agent accepted the task; provider dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: " + jobId
         + ". Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with deepseek_follow, or explicitly abort/close it, before a dependent gate or a final response."
       : "DeepSeek Sub-Agent accepted the task. Pending DeepSeek job created: " + jobId
         + ". Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with deepseek_follow, or explicitly abort/close it.")
     : (uncertain
-      ? `${DISPLAY_NAME} accepted the task (${modelDisplayName}); provider dispatch acceptance is uncertain after a transport failure. Pending DeepSeek job: ` + jobId
+      ? `${DISPLAY_NAME} accepted the task (${modelDisplayName}); provider dispatch acceptance is uncertain after a transport failure. Pending job: ` + jobId
         + `. Accepted is not a result. Do not duplicate this delegated front locally. Consume this exact job with ${followTool}, or explicitly abort/close it with ${abortTool} or ${closeTool}, before a dependent gate or a final response.`
-      : `${DISPLAY_NAME} accepted the task (${modelDisplayName}). Pending DeepSeek job created: ` + jobId
+      : `${DISPLAY_NAME} accepted the task (${modelDisplayName}). Pending job created: ` + jobId
         + `. Accepted is not a result. Do not duplicate this delegated front locally. Before a dependent gate or final response, consume the job with ${followTool}, or explicitly abort/close it with ${abortTool} or ${closeTool}.`);
 
   return {
@@ -1155,7 +1155,7 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
         agentId: result.agentId,
         jobId: result.jobId,
         state: "Starting",
-        provider: result.modelProviderId ?? "deepseek",
+        provider: result.modelProviderId ?? "antigravity",
         model: modelDisplayName,
         ...(result.priority !== undefined ? { priority: result.priority } : {}),
         ...(result.exclusiveResources !== undefined ? { exclusiveResources: result.exclusiveResources } : {}),

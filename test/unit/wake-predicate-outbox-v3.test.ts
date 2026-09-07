@@ -6,6 +6,7 @@ import path from "node:path";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeStore } from "../../src/store.js";
 import { BridgeService } from "../../src/service.js";
+import { AntigravitySpool } from "../../src/antigravity/spool.js";
 import {
   DEFAULT_CODEX_CAPABILITIES,
   type CodexCorrelation,
@@ -1236,7 +1237,21 @@ test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative p
   await service.start();
 
   try {
-    const agent = setupAgent(store, tmp, "agent_timeout_wake");
+    const spool = new AntigravitySpool(tmp);
+    const agent = store.createAgent({
+      id: "agent_timeout_wake",
+      title: "Test Agent",
+      topic: "Testing v3 wake and predicates",
+      repositoryRoot: tmp,
+      workspacePath: tmp,
+      workspaceStrategy: "shared",
+      opencodeServerId: "antigravity",
+      opencodeSessionId: "antigravity:agent_timeout_wake",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
     const job = store.createJob({ id: "job_to1", agentId: agent.id, kind: "spawn", requestId: "rto1", promptHash: "hto1" });
     store.bindJob({ jobId: job.id, threadId: "thread_to", originatingTurnId: "tto", originatingItemId: "ito" });
 
@@ -1244,6 +1259,27 @@ test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative p
     store.updateJobStatus(job.id, "running");
     store.updateJobStatus(job.id, "following");
     store.updateJobStatus(job.id, "finalizing");
+
+    const attempt = await spool.createAttempt({
+      agentId: agent.id,
+      jobId: job.id,
+      requestId: "rto1",
+      prompt: "Testing timeoutFollow",
+      cwd: tmp,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      timeoutMs: 30000,
+    });
+    const now = Date.now();
+    await spool.writeHeartbeat(attempt.attemptId, {
+      nonce: "nonce_to1",
+      supervisorPid: process.pid,
+      agyPid: null,
+      updatedAt: now,
+      timestamp: new Date(now).toISOString(),
+    }, job.id);
 
     const receipt = await service.park({ job_ids: [job.id] });
     assert.equal(receipt.armed, true);
@@ -1279,6 +1315,13 @@ test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative p
 
     // 2. Authoritative proof of dead worker process enables explicit terminal timed_out transition
     store.updateJobLiveness(job.id, { workerPid: 999999 });
+    await spool.writeHeartbeat(attempt.attemptId, {
+      nonce: "nonce_to1",
+      supervisorPid: 999999,
+      agyPid: null,
+      updatedAt: Date.now(),
+      timestamp: new Date().toISOString(),
+    }, job.id);
 
     // Now timeoutFollow has authoritative proof that the worker process is dead
     await (service as any).timeoutFollow(job.id);
@@ -1307,7 +1350,20 @@ test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative p
     assert.equal(outboxRows.length, 1, "Exactly one outbox row must exist for this park and generation");
 
     // 4. Also verify explicit abort terminal event on a healthy job whose follow window expired
-    const agent2 = setupAgent(store, tmp, "agent_timeout_abort");
+    const agent2 = store.createAgent({
+      id: "agent_timeout_abort",
+      title: "Test Agent",
+      topic: "Testing v3 wake and predicates",
+      repositoryRoot: tmp,
+      workspacePath: tmp,
+      workspaceStrategy: "shared",
+      opencodeServerId: "antigravity",
+      opencodeSessionId: "antigravity:agent_timeout_abort",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
     const job2 = store.createJob({ id: "job_to2", agentId: agent2.id, kind: "spawn", requestId: "rto2", promptHash: "hto2" });
     store.bindJob({ jobId: job2.id, threadId: "thread_to2", originatingTurnId: "tto2", originatingItemId: "ito2" });
 
@@ -1315,6 +1371,27 @@ test("WAKE-V3: timeoutFollow() does not kill healthy job without authoritative p
     store.updateJobStatus(job2.id, "running");
     store.updateJobStatus(job2.id, "following");
     store.updateJobStatus(job2.id, "finalizing");
+
+    const attempt2 = await spool.createAttempt({
+      agentId: agent2.id,
+      jobId: job2.id,
+      requestId: "rto2",
+      prompt: "Testing timeout abort",
+      cwd: tmp,
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+      timeoutMs: 30000,
+    });
+    const now2 = Date.now();
+    await spool.writeHeartbeat(attempt2.attemptId, {
+      nonce: "nonce_to2",
+      supervisorPid: process.pid,
+      agyPid: null,
+      updatedAt: now2,
+      timestamp: new Date(now2).toISOString(),
+    }, job2.id);
 
     const receipt2 = await service.park({ job_ids: [job2.id] });
     assert.equal(receipt2.armed, true);

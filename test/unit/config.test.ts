@@ -55,16 +55,22 @@ test("invalid follow defaults fail closed to bounded defaults", async () => {
   }
 });
 
-test("route registry ships flash-max enabled by default and pro-max registered but disabled", () => {
+test("route registry ships antigravity-flash-high enabled by default and legacy routes registered but disabled", () => {
   const config = createDefaultConfig({
     dataDir: "C:\\deepseek-config-routes",
     configPath: "C:\\deepseek-config-routes\\config.json",
   });
+  const ag = config.modelRoutes.find((route) => route.name === "antigravity-flash-high");
   const flash = config.modelRoutes.find((route) => route.name === "flash-max");
   const pro = config.modelRoutes.find((route) => route.name === "pro-max");
+  assert.ok(ag);
+  assert.equal(ag.enabled, true);
+  assert.equal(ag.default, true);
+  assert.equal(ag.providerId, "antigravity");
+  assert.equal(ag.modelId, "gemini-3.8-flash-high");
   assert.ok(flash);
-  assert.equal(flash.enabled, true);
-  assert.equal(flash.default, true);
+  assert.equal(flash.enabled, false);
+  assert.equal(flash.default, false);
   assert.equal(flash.providerId, "opencode-go");
   assert.equal(flash.modelId, "deepseek-v4-flash");
   assert.equal(flash.variant, "max");
@@ -74,11 +80,12 @@ test("route registry ships flash-max enabled by default and pro-max registered b
   assert.equal(pro.providerId, "opencode-go");
   assert.equal(pro.modelId, "deepseek-v4-pro");
   assert.equal(config.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME);
-  assert.equal(MODEL_ROUTE_REGISTRY.some((route) => route.name === "flash-max" && route.enabled), true);
+  assert.equal(MODEL_ROUTE_REGISTRY.some((route) => route.name === "antigravity-flash-high" && route.enabled && route.default), true);
+  assert.equal(MODEL_ROUTE_REGISTRY.some((route) => route.name === "flash-max" && !route.enabled), true);
   assert.equal(MODEL_ROUTE_REGISTRY.some((route) => route.name === "pro-max" && !route.enabled), true);
 });
 
-test("antigravity route is registered, enabled for selection, and never becomes the default", () => {
+test("antigravity route is registered, enabled for selection, and is the default", () => {
   const config = createDefaultConfig({
     dataDir: "C:\\deepseek-config-antigravity",
     configPath: "C:\\deepseek-config-antigravity\\config.json",
@@ -90,9 +97,10 @@ test("antigravity route is registered, enabled for selection, and never becomes 
   assert.equal(route.display, "Antigravity · Gemini 3.8 Flash High");
   assert.equal(route.variant, null);
   assert.equal(route.enabled, true, "selectable by the operator control plane");
-  assert.equal(route.default, false, "never the default");
-  assert.equal(config.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME, "flash-max stays the initial effective default");
+  assert.equal(route.default, true, "is the default");
+  assert.equal(config.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME, "antigravity-flash-high is the default");
   assert.equal(MODEL_ROUTE_REGISTRY.find((candidate) => candidate.name === "antigravity-flash-high")?.enabled, true);
+  assert.equal(MODEL_ROUTE_REGISTRY.find((candidate) => candidate.name === "antigravity-flash-high")?.default, true);
 });
 
 test("antigravity permission auto-approval is opt-in, independent of the sandbox, and path-limited", async () => {
@@ -156,15 +164,17 @@ test("old flat config stays backward compatible and keeps the default route", as
       opencodeVariant: "max",
     }), "utf8");
     const loaded = await loadConfig(configPath);
-    assert.equal(loaded.defaultModelRoute, "flash-max");
+    assert.equal(loaded.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME);
     assert.equal(loaded.opencodeModelId, "deepseek-v4-flash");
-    assert.equal(loaded.modelRoutes.find((route) => route.name === "flash-max")?.enabled, true);
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "flash-max")?.enabled, false);
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "antigravity-flash-high")?.enabled, true);
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "antigravity-flash-high")?.default, true);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("old flat config naming a non-default model promotes that route to default and enabled", async () => {
+test("old flat config naming a legacy model does not promote that route and keeps antigravity default", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-config-flat-pro-"));
   const configPath = path.join(directory, "config.json");
   try {
@@ -176,9 +186,10 @@ test("old flat config naming a non-default model promotes that route to default 
       opencodeVariant: "max",
     }), "utf8");
     const loaded = await loadConfig(configPath);
-    assert.equal(loaded.defaultModelRoute, "pro-max");
-    assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.enabled, true);
-    assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.default, true);
+    assert.equal(loaded.defaultModelRoute, DEFAULT_MODEL_ROUTE_NAME);
+    assert.equal(loaded.opencodeModelId, "deepseek-v4-pro");
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.enabled, false);
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.default, false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -192,15 +203,15 @@ test("explicit modelRoutes registry wins over flat defaults and is persisted", a
       dataDir: directory,
       configPath,
       modelRoutes: [
-        { name: "pro-max", providerId: "opencode-go", modelId: "deepseek-v4-pro", variant: "max", enabled: true, default: true, display: "DeepSeek V4 Pro · Max" },
-        { name: "flash-max", providerId: "opencode-go", modelId: "deepseek-v4-flash", variant: "max", enabled: true, default: false, display: "DeepSeek V4 Flash · Max" },
+        { name: "antigravity-pro-high", providerId: "antigravity", modelId: "gemini-3.8-pro-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.8 Pro High" },
+        { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: false, display: "Antigravity · Gemini 3.8 Flash High" },
       ],
-      defaultModelRoute: "pro-max",
+      defaultModelRoute: "antigravity-pro-high",
     });
     await writeFile(configPath, JSON.stringify(config), "utf8");
     const loaded = await loadConfig(configPath);
-    assert.equal(loaded.defaultModelRoute, "pro-max");
-    assert.equal(loaded.modelRoutes.find((route) => route.name === "pro-max")?.enabled, true);
+    assert.equal(loaded.defaultModelRoute, "antigravity-pro-high");
+    assert.equal(loaded.modelRoutes.find((route) => route.name === "antigravity-pro-high")?.enabled, true);
     assert.equal(loaded.modelRoutes.length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });

@@ -205,7 +205,7 @@ export async function persistAntigravityResult(
     risks: result.risks.slice(0, 100).map((value) => redactSecrets(value)),
     diffSummary: truncate(redactSecrets(result.diffSummary), 10_000),
     fullResultPath: redactSecrets(resultPath),
-    orchestratorInstruction: redactSecrets("Continue this agent only with deepseek_continue after reviewing this result."),
+    orchestratorInstruction: redactSecrets("Continue this agent only with subagents_continue after reviewing this result."),
     receipt,
     ...(result.evidence ? (() => {
       const safe = projectSafeEvidence(result.evidence);
@@ -572,9 +572,19 @@ function isRecord(value: unknown): value is Record<string, any> {
 }
 
 export function formatHumanResult(envelope: ResultEnvelope): string {
-  const isAntigravity = !envelope.fallback && envelope.modelDisplayName.startsWith("Antigravity · ");
+  const isAntigravity = envelope.fallback
+    ? envelope.fallback.to === "antigravity"
+    : (
+        envelope.receipt?.provider === "antigravity" ||
+        envelope.modelDisplayName.startsWith("Antigravity · ") ||
+        envelope.opencodeSessionId.startsWith("antigravity:") ||
+        envelope.model.includes("gemini")
+      );
+  const displayName = isAntigravity ? "Antigravity Sub-Agent" : "DeepSeek Sub-Agent";
+  const recoveryTool = isAntigravity ? "subagents_recover_result" : "deepseek_recover_result";
+  const sessionLabel = isAntigravity ? "session_id" : "opencode_session_id";
   const lines = [
-    "DeepSeek Sub-Agent · " + truncate(envelope.topic.replace(/[\r\n]+/g, " "), 240) + " · " + humanState(envelope.status),
+    displayName + " · " + truncate(envelope.topic.replace(/[\r\n]+/g, " "), 240) + " · " + humanState(envelope.status),
     envelope.modelDisplayName,
     "",
     isAntigravity ? "[ANTIGRAVITY_SUBAGENT_RESULT v1]" : "[OPENCODE_SUBAGENT_RESULT v1]",
@@ -585,13 +595,13 @@ export function formatHumanResult(envelope: ResultEnvelope): string {
   lines.push("", "TESTS", ...(envelope.tests.length > 0 ? envelope.tests.map((test) => "• " + test) : ["• none"]));
   lines.push("", "RISKS", ...(envelope.risks.length > 0 ? envelope.risks.map((risk) => "• " + risk) : ["• none"]));
   lines.push("", "DIFF SUMMARY", envelope.diffSummary || "none");
-  lines.push("", "FULL RESULT", envelope.fullResultPath, "Use deepseek_recover_result only for explicit recovery.");
+  lines.push("", "FULL RESULT", envelope.fullResultPath, "Use " + recoveryTool + " only for explicit recovery.");
   lines.push(
     "",
     "TECHNICAL METADATA",
     "agent_id: " + envelope.agentId,
     "job_id: " + envelope.jobId,
-    "opencode_session_id: " + envelope.opencodeSessionId,
+    sessionLabel + ": " + envelope.opencodeSessionId,
     "model: " + envelope.model,
     "workspace: " + envelope.workspace,
   );

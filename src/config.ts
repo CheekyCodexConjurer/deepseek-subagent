@@ -9,13 +9,30 @@ export const FOLLOW_MAX_GRACE_MINUTES = 10;
 export const FOLLOW_MAX_TOTAL_MINUTES = FOLLOW_MAX_WAIT_MINUTES + FOLLOW_MAX_GRACE_MINUTES;
 export const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 4_500;
 
-export const DEFAULT_MODEL_ROUTE_NAME = "flash-max";
-export const DEFAULT_PROVIDER_ID = "opencode-go";
+export const DEFAULT_MODEL_ROUTE_NAME = "antigravity-flash-high";
+export const DEFAULT_PROVIDER_ID = "antigravity";
+
+export const LEGACY_ROUTE_NAMES = new Set(["flash-max", "pro-max"]);
+
+export function isLegacyRouteName(routeName: string): boolean {
+  const normalized = routeName.trim().toLowerCase();
+  return LEGACY_ROUTE_NAMES.has(normalized) || /deepseek|opencode/.test(normalized);
+}
+
+export function isLegacyRoute(route: Pick<ModelRoute, "name" | "providerId" | "modelId">): boolean {
+  if (isLegacyRouteName(route.name)) return true;
+  const providerId = route.providerId.trim().toLowerCase();
+  const modelId = route.modelId.trim().toLowerCase();
+  return providerId !== "antigravity"
+    || !modelId.startsWith("gemini-")
+    || /deepseek|opencode/.test(providerId)
+    || /deepseek|opencode/.test(modelId);
+}
 
 /**
- * Built-in route registry. flash-max is enabled and default; pro-max is
- * registered but disabled until explicitly enabled; antigravity-flash-high is
- * registered and enabled for operator selection but never the default.
+ * Built-in route registry. antigravity-flash-high is enabled and default;
+ * legacy routes (flash-max, pro-max) are registered as disabled historical
+ * records and never serve as default or execution fallback.
  * Dispatches resolve strictly through this registry: an unknown or disabled
  * route fails closed with a stable typed 400 and there is no silent fallback
  * route. New spawns follow the operator-controlled active route (persisted in
@@ -24,31 +41,31 @@ export const DEFAULT_PROVIDER_ID = "opencode-go";
  */
 export const MODEL_ROUTE_REGISTRY: readonly ModelRoute[] = [
   {
-    name: "flash-max",
-    providerId: DEFAULT_PROVIDER_ID,
-    modelId: "deepseek-v4-flash",
-    variant: "max",
-    enabled: true,
-    default: true,
-    display: "DeepSeek V4 Flash · Max",
-  },
-  {
-    name: "pro-max",
-    providerId: DEFAULT_PROVIDER_ID,
-    modelId: "deepseek-v4-pro",
-    variant: "max",
-    enabled: false,
-    default: false,
-    display: "DeepSeek V4 Pro · Max",
-  },
-  {
     name: "antigravity-flash-high",
     providerId: "antigravity",
     modelId: "gemini-3.8-flash-high",
     variant: null,
     enabled: true,
-    default: false,
+    default: true,
     display: "Antigravity · Gemini 3.8 Flash High",
+  },
+  {
+    name: "flash-max",
+    providerId: "opencode-go",
+    modelId: "deepseek-v4-flash",
+    variant: "max",
+    enabled: false,
+    default: false,
+    display: "DeepSeek V4 Flash · Max",
+  },
+  {
+    name: "pro-max",
+    providerId: "opencode-go",
+    modelId: "deepseek-v4-pro",
+    variant: "max",
+    enabled: false,
+    default: false,
+    display: "DeepSeek V4 Pro · Max",
   },
 ];
 
@@ -112,8 +129,8 @@ function parseRouteRegistry(value: unknown): ModelRoute[] | null {
     if (typeof raw.providerId !== "string" || raw.providerId.length === 0) return null;
     if (typeof raw.modelId !== "string" || raw.modelId.length === 0) return null;
     const variant = asNullableString(raw.variant);
-    const enabled = raw.enabled !== false;
-    const defaultRoute = raw.default === true;
+    let enabled = raw.enabled !== false;
+    let defaultRoute = raw.default === true;
     let modelId = raw.modelId;
     let display = typeof raw.display === "string" && raw.display.length > 0 ? raw.display : null;
     if (raw.name === "antigravity-flash-high" && raw.providerId === "antigravity" && modelId === "gemini-3.7-flash-high") {
@@ -122,45 +139,75 @@ function parseRouteRegistry(value: unknown): ModelRoute[] | null {
         display = "Antigravity · Gemini 3.8 Flash High";
       }
     }
+    if (isLegacyRoute({ name: raw.name, providerId: raw.providerId, modelId })) {
+      enabled = false;
+      defaultRoute = false;
+    }
     const effectiveDisplay = display ?? (raw.providerId + "/" + modelId + (variant ? " · " + variant : ""));
     routes.push({ name: raw.name, providerId: raw.providerId, modelId, variant, enabled, default: defaultRoute, display: effectiveDisplay });
   }
-  if (routes.some((route) => route.default)) return routes;
-  const first = routes[0];
-  if (!first) return null;
-  return routes.map((route) => route.name === first.name ? { ...route, default: true } : route);
+  if (routes.some((route) => route.default && !isLegacyRoute(route))) return routes;
+  const agRoute = routes.find((route) => route.name === "antigravity-flash-high" && !isLegacyRoute(route));
+  if (agRoute) {
+    return routes.map((route) => route.name === agRoute.name ? { ...route, default: true, enabled: true } : { ...route, default: false });
+  }
+  const firstNonLegacy = routes.find((route) => !isLegacyRoute(route));
+  if (firstNonLegacy) {
+    return routes.map((route) => route.name === firstNonLegacy.name ? { ...route, default: true, enabled: true } : { ...route, default: false });
+  }
+  const defaultAg = MODEL_ROUTE_REGISTRY.find((r) => r.name === DEFAULT_MODEL_ROUTE_NAME) ?? {
+    name: "antigravity-flash-high",
+    providerId: "antigravity",
+    modelId: "gemini-3.8-flash-high",
+    variant: null,
+    enabled: true,
+    default: true,
+    display: "Antigravity · Gemini 3.8 Flash High",
+  };
+  return [...routes.map((r) => ({ ...r, default: false, enabled: false })), { ...defaultAg }];
 }
 
 function registryWithFlatDefault(routes: ModelRoute[], providerId: string, modelId: string, variant: string | null): ModelRoute[] {
-  if (routes.some((route) => route.default)) return routes.map((route) => ({ ...route }));
+  if (routes.some((route) => route.default && !isLegacyRoute(route))) return routes.map((route) => ({ ...route }));
   const flatMatches = routes.find((route) =>
-    route.providerId === providerId && route.modelId === modelId && (route.variant ?? null) === variant);
-  const first = routes[0];
-  const winner = flatMatches ?? first;
-  if (!winner) return [];
-  return routes.map((route) => route.name === winner.name ? { ...route, default: true } : route);
+    !isLegacyRoute(route) && route.providerId === providerId && route.modelId === modelId && (route.variant ?? null) === variant);
+  const firstNonLegacy = routes.find((route) => !isLegacyRoute(route));
+  const winner = flatMatches ?? firstNonLegacy;
+  if (!winner) return routes.map((route) => ({ ...route, default: false, enabled: isLegacyRoute(route) ? false : route.enabled }));
+  return routes.map((route) => route.name === winner.name ? { ...route, default: true, enabled: true } : { ...route, default: false });
 }
 
 /**
  * Backward compatibility for old flat configs (opencodeProviderId /
  * opencodeModelId / opencodeVariant): when no modelRoutes registry is present
- * in the config file, the default route is derived from the flat fields. A
- * flat configuration that explicitly names a non-default model (for example
- * deepseek-v4-pro) promotes that route to default and enabled.
+ * in the config file, the registry defaults to the active Antigravity contract.
+ * Legacy routes are never promoted to default or execution fallback.
  */
-function defaultModelRoutes(flat: { providerId: string; modelId: string; variant: string | null }): ModelRoute[] {
-  const matches = MODEL_ROUTE_REGISTRY.filter((route) =>
-    route.providerId === flat.providerId && route.modelId === flat.modelId && (route.variant ?? null) === flat.variant);
-  if (matches.length === 0) return MODEL_ROUTE_REGISTRY.map((route) => ({ ...route }));
-  return MODEL_ROUTE_REGISTRY.map((route) => {
-    if (route.name === matches[0]?.name) return { ...route, default: true, enabled: true };
-    return route.default ? { ...route, default: false } : { ...route };
-  });
+function defaultModelRoutes(flat?: { providerId?: string; modelId?: string; variant?: string | null }): ModelRoute[] {
+  if (flat && flat.providerId && flat.modelId) {
+    const candidate = { name: "", providerId: flat.providerId, modelId: flat.modelId };
+    if (!isLegacyRoute(candidate)) {
+      const matches = MODEL_ROUTE_REGISTRY.filter((route) =>
+        !isLegacyRoute(route) &&
+        route.providerId === flat.providerId &&
+        route.modelId === flat.modelId &&
+        (route.variant ?? null) === (flat.variant ?? null));
+      if (matches.length > 0) {
+        return MODEL_ROUTE_REGISTRY.map((route) => {
+          if (route.name === matches[0]?.name) return { ...route, default: true, enabled: true };
+          return route.default ? { ...route, default: false } : { ...route };
+        });
+      }
+    }
+  }
+  return MODEL_ROUTE_REGISTRY.map((route) => ({ ...route }));
 }
 
 function defaultRouteName(routes: ModelRoute[]): string {
-  const defaultRoute = routes.find((route) => route.default);
-  return defaultRoute?.name ?? DEFAULT_MODEL_ROUTE_NAME;
+  const defaultRoute = routes.find((route) => route.default && !isLegacyRoute(route));
+  if (defaultRoute) return defaultRoute.name;
+  const firstActive = routes.find((route) => !isLegacyRoute(route) && route.enabled);
+  return firstActive?.name ?? DEFAULT_MODEL_ROUTE_NAME;
 }
 
 export function isValidFollowDefaults(config: Pick<BridgeConfig, "followDefaultWaitMinutes" | "followDefaultGraceMinutes">): boolean {
@@ -171,11 +218,36 @@ export function isValidFollowDefaults(config: Pick<BridgeConfig, "followDefaultW
 export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   const dataDir = overrides.dataDir ?? defaultUserDataRoot();
   const configPath = overrides.configPath ?? path.join(dataDir, "config.json");
-  const modelRoutes = overrides.modelRoutes ?? defaultModelRoutes({
-    providerId: overrides.opencodeProviderId ?? DEFAULT_PROVIDER_ID,
-    modelId: overrides.opencodeModelId ?? "deepseek-v4-flash",
-    variant: overrides.opencodeVariant ?? "max",
-  });
+  const modelRoutes = overrides.modelRoutes
+    ? overrides.modelRoutes.map((route) => {
+        if (isLegacyRoute(route)) {
+          return { ...route, enabled: false, default: false };
+        }
+        return { ...route };
+      })
+    : defaultModelRoutes({
+        ...(overrides.opencodeProviderId === undefined ? {} : { providerId: overrides.opencodeProviderId }),
+        ...(overrides.opencodeModelId === undefined ? {} : { modelId: overrides.opencodeModelId }),
+        ...(overrides.opencodeVariant === undefined ? {} : { variant: overrides.opencodeVariant }),
+      });
+
+  let effectiveRoutes = modelRoutes;
+  if (!effectiveRoutes.some((route) => !isLegacyRoute(route))) {
+    effectiveRoutes = [
+      ...effectiveRoutes.map((r) => ({ ...r, default: false, enabled: false })),
+      ...MODEL_ROUTE_REGISTRY.filter((r) => !isLegacyRoute(r)).map((r) => ({ ...r })),
+    ];
+  }
+
+  const defaultRouteCandidate = typeof overrides.defaultModelRoute === "string" && !isLegacyRouteName(overrides.defaultModelRoute)
+    ? overrides.defaultModelRoute
+    : defaultRouteName(effectiveRoutes);
+
+  const effectiveModelRoutes = effectiveRoutes.map((route) => ({
+    ...route,
+    default: route.name === defaultRouteCandidate && !isLegacyRoute(route),
+  }));
+
   return {
     dataDir,
     configPath,
@@ -187,7 +259,7 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     opencodeUsername: overrides.opencodeUsername ?? "opencode",
     opencodePassword: overrides.opencodePassword ?? null,
     opencodeBinary: overrides.opencodeBinary ?? null,
-    opencodeProviderId: overrides.opencodeProviderId ?? DEFAULT_PROVIDER_ID,
+    opencodeProviderId: overrides.opencodeProviderId ?? "opencode-go",
     opencodeModelId: overrides.opencodeModelId ?? "deepseek-v4-flash",
     opencodeVariant: overrides.opencodeVariant ?? "max",
     opencodeAgent: overrides.opencodeAgent ?? "build",
@@ -208,8 +280,8 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     antigravityAutoApprovePermissions: overrides.antigravityAutoApprovePermissions === true,
     antigravityCommand: asNullableCommand(overrides.antigravityCommand),
     antigravityTimeoutFallbackRoute: asNullableString(overrides.antigravityTimeoutFallbackRoute),
-    modelRoutes,
-    defaultModelRoute: overrides.defaultModelRoute ?? defaultRouteName(modelRoutes),
+    modelRoutes: effectiveModelRoutes,
+    defaultModelRoute: defaultRouteCandidate,
     retentionMode: overrides.retentionMode ?? "disabled",
     maxContextFileBytes: boundedInteger(overrides.maxContextFileBytes, DEFAULT_MAX_CONTEXT_FILE_BYTES, 1_024, 64_000_000),
     globalGeminiContextPath: overrides.globalGeminiContextPath ?? defaultGlobalGeminiContextPath(),
@@ -236,7 +308,8 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
     const parsedRoutes = parseRouteRegistry(raw.modelRoutes);
     const modelRoutes = parsedRoutes ?? defaultModelRoutes({ providerId: flatProviderId, modelId: flatModelId, variant: flatVariant });
     const configuredDefaultRoute = typeof raw.defaultModelRoute === "string"
-      && modelRoutes.some((route) => route.name === raw.defaultModelRoute)
+      && !isLegacyRouteName(raw.defaultModelRoute)
+      && modelRoutes.some((route) => route.name === raw.defaultModelRoute && !isLegacyRoute(route))
       ? raw.defaultModelRoute
       : defaultRouteName(modelRoutes);
     const retentionMode = asRetentionMode(raw.retentionMode, defaults.retentionMode);

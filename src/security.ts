@@ -58,7 +58,7 @@ export function normalizeTitle(topic: string): string {
     .split(/\s+/)
     .filter(Boolean)
     .slice(0, 5);
-  if (words.length === 0) return "DeepSeek Task";
+  if (words.length === 0) return "Antigravity Task";
   return words
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ");
@@ -77,13 +77,13 @@ export function isLoopbackHost(host: string): boolean {
 export function assertLoopbackUrl(rawUrl: string): URL {
   const url = new URL(rawUrl);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("OpenCode URL must use http or https");
+    throw new Error("Bridge URL must use http or https");
   }
   if (!isLoopbackHost(url.hostname)) {
-    throw new Error("OpenCode URL must resolve to loopback");
+    throw new Error("Bridge URL must resolve to loopback");
   }
   if (url.username || url.password) {
-    throw new Error("OpenCode URL must not embed credentials; configure them separately");
+    throw new Error("Bridge URL must not embed credentials; configure them separately");
   }
   return url;
 }

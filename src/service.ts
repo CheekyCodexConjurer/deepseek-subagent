@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { canRead, defaultWorkspace, assertInside, isProcessAlive, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFiles, validateContextFilesStrict } from "./security.js";
-import { buildWorkerPrompt, GRACEFUL_FINALIZE_PROMPT, type PromptBuildOptions, type WorkerPromptInput } from "./prompts.js";
+import { canRead, defaultWorkspace, assertInside, isProcessAlive, isSamePath, newId, normalizeTitle, redactSecrets, shouldIncludeGlobalGeminiContext, truncate, validateContextFilesStrict } from "./security.js";
+import { buildWorkerPrompt, type PromptBuildOptions, type WorkerPromptInput } from "./prompts.js";
 import { BridgeStore } from "./store.js";
 import { InboxDelivery } from "./delivery/inbox.js";
 import {
@@ -15,17 +15,15 @@ import {
 } from "./codex/adapter.js";
 import { DefaultCodexCliTransport, type CodexCliTransport } from "./codex/cli-resolver.js";
 import { TranscriptAttestor } from "./codex/transcript-attestor.js";
-import { OpenCodeManager, type ManagedOpenCode } from "./opencode/manager.js";
-import { OpenCodeHttpError, OpenCodeTransportError } from "./opencode/client.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
-import { AntigravityProcessError, AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
+import { AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
-import { AntigravitySpool, isHeartbeatLive } from "./antigravity/spool.js";
+import { AntigravitySpool } from "./antigravity/spool.js";
 import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
 import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult, AntigravityStreamProgress } from "./antigravity/types.js";
 
-import { assistantTextAfterBaseline, formatHumanResult, persistAntigravityResult, persistResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
@@ -47,9 +45,6 @@ import type {
   FollowResult,
   JobRecord,
   ModelRoute,
-  OpenCodeClientLike,
-  OpenCodeEvent,
-  OpenCodeMessage,
   ParkBarrierRecord,
   ParkInput,
   ParkPredicateType,
@@ -83,26 +78,13 @@ function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean, allow
 
 export interface ServiceDependencies {
   store?: BridgeStore;
-  manager?: OpenCodeManagerLike;
+  manager?: unknown;
   codex?: CodexDeliveryAdapter;
   cliTransport?: CodexCliTransport;
   inbox?: InboxDelivery;
   antigravity?: AntigravityProviderLike;
   transcriptAttestor?: TranscriptAttestor;
   sessionsDir?: string;
-}
-
-export interface OpenCodeManagerLike {
-  start(workspaceRoot: string): Promise<ManagedOpenCodeLike>;
-  stop(): Promise<void>;
-}
-
-export interface ManagedOpenCodeLike {
-  serverId: string;
-  baseUrl: string;
-  client: OpenCodeClientLike;
-  processId: number | null;
-  stop(): Promise<void>;
 }
 
 export interface AcceptedOperation {
@@ -123,7 +105,7 @@ export class BridgeBusyError extends ConflictError {
   override readonly code = "busy" as const;
 
   constructor(readonly jobId: string) {
-    super("Agent is busy with job " + jobId + ". Do not retry in a loop; wait for its asynchronous result or call deepseek_abort.", "busy");
+    super("Agent is busy with job " + jobId + ". Do not retry in a loop; wait for its asynchronous result or call subagents_abort.", "busy");
     this.name = "BridgeBusyError";
   }
 }
@@ -155,7 +137,6 @@ export interface ServiceStatus {
   state: DaemonLifecycleState;
   ready: boolean;
   running: boolean;
-  opencodeUrl: string | null;
   provider: string;
   model: string;
   variant: string | null;
@@ -190,7 +171,18 @@ export interface QuiescenceProof {
 const ACTIVE_JOB_STATUSES = new Set(["queued", "dispatching", "running", "following", "finalizing", "needs_approval"]);
 const TERMINAL_JOB_STATUSES = new Set(["completed", "completed_partial", "timed_out", "failed", "aborted", "delivered"]);
 
-const DISPATCH_UNKNOWN_WARNING = "DeepSeek Sub-Agent accepted the task, but OpenCode dispatch acceptance is uncertain after a transport failure. Follow this job (deepseek_follow) or abort it (deepseek_abort) to settle the obligation.";
+function isAntigravityRoute(route: Pick<ResolvedRoute, "providerId" | "modelId">): boolean {
+  return route.providerId === "antigravity" && route.modelId.toLowerCase().startsWith("gemini-");
+}
+
+function isActiveAntigravityAgent(agent: AgentRecord): boolean {
+  return agent.modelProviderId === "antigravity"
+    && agent.modelId.toLowerCase().startsWith("gemini-")
+    && agent.opencodeSessionId.startsWith("antigravity:");
+}
+
+const RETIRED_PROVIDER_MESSAGE = "Historical provider sessions are read-only; only active Antigravity Gemini jobs can be executed";
+const DISPATCH_UNKNOWN_WARNING = "Dispatch outcome is unknown; follow the existing Antigravity job instead of retrying";
 
 interface FollowLifecycle {
   jobId: string;
@@ -210,7 +202,7 @@ export class FollowCancelledError extends Error {
   readonly code = "follow_cancelled";
 
   constructor() {
-    super("deepseek_follow waiter was cancelled; the DeepSeek worker continues running");
+    super("subagents_follow waiter was cancelled; the Antigravity worker continues running");
     this.name = "FollowCancelledError";
   }
 }
@@ -284,16 +276,11 @@ class DeliveryAdmission {
 
 export class BridgeService {
   private readonly store: BridgeStore;
-  private readonly manager: OpenCodeManagerLike;
   private readonly inbox: InboxDelivery;
   private readonly antigravity: AntigravityProviderLike;
   private readonly cliTransport: CodexCliTransport;
   private readonly transcriptAttestor: TranscriptAttestor;
   private codex: CodexDeliveryAdapter;
-  private managed: ManagedOpenCodeLike | null = null;
-  private client: OpenCodeClientLike | null = null;
-  private streamAbort: AbortController | null = null;
-  private streamTask: Promise<void> | null = null;
   private correlationUnsubscribe: (() => void) | null = null;
   private running = false;
   private ownedStore = false;
@@ -310,9 +297,6 @@ export class BridgeService {
   private readonly dispatchWaiters = new Map<string, { resolve: (op: AcceptedOperation) => void; reject: (err: unknown) => void }>();
   private readonly correlationFallbackTimers = new Map<string, NodeJS.Timeout>();
   private readonly inboxFallbackJobs = new Set<string>();
-  private readonly approvalTimers = new Map<string, NodeJS.Timeout>();
-  private readonly eventProcessing = new Set<string>();
-  private readonly eventRetryTimers = new Map<string, NodeJS.Timeout>();
   private readonly followLifecycles = new Map<string, FollowLifecycle>();
   private readonly antigravityAbortControllers = new Map<string, AbortController>();
   private readonly antigravityTasks = new Set<Promise<void>>();
@@ -328,7 +312,6 @@ export class BridgeService {
     cleanupSignal?: (() => void) | undefined;
   }>();
   private readonly wakeRetryTimers = new Map<string, NodeJS.Timeout>();
-  private lastSseEventAt: number | null = null;
   private retentionTimer: NodeJS.Timeout | null = null;
   private advisorySchedulerTimer: NodeJS.Timeout | null = null;
   private readonly jobInactivityTimers = new Map<string, NodeJS.Timeout>();
@@ -381,7 +364,6 @@ export class BridgeService {
     this.targetCredits = this.config.swarmCreditCeiling ?? 8;
     this.store = dependencies.store ?? new BridgeStore(path.join(config.dataDir, "bridge.sqlite"));
     this.ownedStore = !dependencies.store;
-    this.manager = dependencies.manager ?? new OpenCodeManager(config);
     this.codex = config.experimentalSameChatDelivery
       ? dependencies.codex ?? (
         config.codexAppServerCommand || config.codexAppServerSocket
@@ -441,15 +423,6 @@ export class BridgeService {
     this.lifecycleState = "starting";
     this.startupError = null;
     try {
-      const managed = await this.manager.start(defaultWorkspace());
-      this.managed = managed;
-      this.client = managed.client;
-      this.store.registerServer({
-        id: managed.serverId,
-        workspaceRoot: defaultWorkspace(),
-        baseUrl: managed.baseUrl,
-        processId: managed.processId,
-      });
       if (this.config.experimentalSameChatDelivery) {
         try {
           await this.codex.start();
@@ -462,13 +435,6 @@ export class BridgeService {
           });
         });
       }
-      this.streamAbort = new AbortController();
-      this.streamTask = managed.client.subscribe(
-        (event) => this.handleEvent(event),
-        this.streamAbort.signal,
-      ).catch((error: unknown) => {
-        if (!this.streamAbort?.signal.aborted) this.lastStreamError = redactSecrets(String(error));
-      });
       this.lifecycleState = "recovering";
       await this.recoverPendingJobs();
       this.lifecycleState = "ready";
@@ -491,12 +457,8 @@ export class BridgeService {
     this.stopAdvisoryScheduler();
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
-    for (const timer of this.approvalTimers.values()) clearTimeout(timer);
-    this.approvalTimers.clear();
     for (const timer of this.correlationFallbackTimers.values()) clearTimeout(timer);
     this.correlationFallbackTimers.clear();
-    for (const timer of this.eventRetryTimers.values()) clearTimeout(timer);
-    this.eventRetryTimers.clear();
     for (const timer of this.wakeRetryTimers.values()) clearTimeout(timer);
     this.wakeRetryTimers.clear();
     for (const waiter of this.parkWaiters.values()) {
@@ -504,13 +466,12 @@ export class BridgeService {
       waiter.reject(new Error("Bridge daemon stopped while waiting for park wake"));
     }
     this.parkWaiters.clear();
-    this.eventProcessing.clear();
     this.inboxFallbackJobs.clear();
     for (const lifecycle of this.followLifecycles.values()) {
       if (lifecycle.deadlineTimer) clearTimeout(lifecycle.deadlineTimer);
       if (lifecycle.graceTimer) clearTimeout(lifecycle.graceTimer);
       if (!lifecycle.settled) {
-        if (lifecycle.waiters.size > 0) lifecycle.reject(new Error("Bridge daemon stopped while following DeepSeek"));
+        if (lifecycle.waiters.size > 0) lifecycle.reject(new Error("Bridge daemon stopped while following Antigravity"));
         lifecycle.settled = true;
       }
     }
@@ -531,40 +492,26 @@ export class BridgeService {
       this.antigravityTasks.clear();
       this.antigravityTasksByJob.clear();
     }
-    this.streamAbort?.abort();
-    this.streamAbort = null;
-    if (this.streamTask) {
-      await Promise.race([
-        this.streamTask,
-        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-      ]);
-    }
-    this.streamTask = null;
     this.correlationUnsubscribe?.();
     this.correlationUnsubscribe = null;
     if (this.config.experimentalSameChatDelivery) await this.codex.close().catch(() => undefined);
-    await this.manager.stop().catch(() => undefined);
     this.store.stopServers();
     if (this.ownedStore) this.store.close();
     for (const waiter of this.dispatchWaiters.values()) {
       waiter.reject(new Error("Bridge daemon stopped"));
     }
     this.dispatchWaiters.clear();
-    this.client = null;
-    this.managed = null;
   }
 
   status(): ServiceStatus {
-    const defaultRoute = this.config.modelRoutes.find((route) => route.name === this.config.defaultModelRoute);
     const active = this.safeActiveRoute();
     return {
       state: this.lifecycleState,
       ready: this.lifecycleState === "ready",
       running: this.lifecycleState === "ready",
-      opencodeUrl: this.managed?.baseUrl ?? null,
-      provider: defaultRoute?.providerId ?? this.config.opencodeProviderId,
-      model: defaultRoute?.modelId ?? this.config.opencodeModelId,
-      variant: defaultRoute?.variant ?? this.config.opencodeVariant,
+      provider: active?.providerId ?? "antigravity",
+      model: active?.modelId ?? "gemini-3.8-flash-high",
+      variant: active?.variant ?? null,
       experimentalSameChatDelivery: this.config.experimentalSameChatDelivery,
       followDefaultWaitMinutes: this.config.followDefaultWaitMinutes,
       followDefaultGraceMinutes: this.config.followDefaultGraceMinutes,
@@ -803,7 +750,6 @@ export class BridgeService {
       const contextFiles = strategy === "worktree"
         ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles, allowedExternalFiles)
         : validatedContextFiles;
-      const isAntigravity = route.providerId === "antigravity";
       const title = normalizeTitle(input.topic);
       const promptWorkerInput: WorkerPromptInput = {
         ...input,
@@ -818,7 +764,7 @@ export class BridgeService {
         : await buildWorkerPrompt(
             promptWorkerInput,
             workspacePath,
-            workerPromptOptions(this.config, isAntigravity, allowedExternalFiles),
+             workerPromptOptions(this.config, true, allowedExternalFiles),
           );
       const promptHash = hashPrompt(prompt);
       const priority = typeof input.priority === "number" ? Math.max(1, Math.min(100, Math.floor(input.priority))) : 50;
@@ -834,8 +780,11 @@ export class BridgeService {
           workspacePath,
           workspaceStrategy: strategy,
           mode,
-          opencodeServerId: isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown"),
-          opencodeSessionId: isAntigravity ? "antigravity:" + agentId : "pending:" + agentId,
+           // These columns are retained by the historical SQLite schema. New
+           // agents use opaque Antigravity identity values and never acquire a
+           // legacy provider session.
+           opencodeServerId: "antigravity",
+           opencodeSessionId: "antigravity:" + agentId,
           modelProviderId: route.providerId,
           modelId: route.modelId,
           modelVariant: route.variant,
@@ -865,9 +814,7 @@ export class BridgeService {
           contextFiles: contextFiles ?? [],
         },
       });
-      this.recordActivity(agent, null, "dispatch", isAntigravity
-        ? "Created an Antigravity agent for the task (no OpenCode session)"
-        : "Created OpenCode session for the DeepSeek task");
+      this.recordActivity(agent, null, "dispatch", "Created an Antigravity Gemini agent for the task");
       this.pendingDispatches.set(job.id, {
         prompt,
         workerInput: promptWorkerInput,
@@ -976,7 +923,6 @@ export class BridgeService {
         strategy: WorkspaceStrategy;
         mode: AgentMode;
         route: ResolvedRoute;
-        isAntigravity: boolean;
         prompt: string;
         promptWorkerInput: WorkerPromptInput;
         contextFiles: string[];
@@ -987,8 +933,6 @@ export class BridgeService {
         turnId?: string | undefined;
         mcpSessionId?: string | undefined;
         trustedThreadId?: string | undefined;
-        opencodeServerId: string;
-        opencodeSessionId: string;
       }> = [];
 
       for (const item of input.items) {
@@ -1024,8 +968,7 @@ export class BridgeService {
         const contextFiles = strategy === "worktree"
           ? this.mapContextIntoWorktree(workspacePath, repositoryRoot, validatedContextFiles, allowedExternalFiles)
           : validatedContextFiles;
-        const isAntigravity = route.providerId === "antigravity";
-        const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
+        const promptOptions = workerPromptOptions(this.config, true, allowedExternalFiles);
         const visualContext = item.visualContext ?? (typeof raw.visual_context === "string" ? raw.visual_context : undefined);
         const promptWorkerInput: WorkerPromptInput = {
           topic,
@@ -1048,12 +991,6 @@ export class BridgeService {
         const turnId = item.turnId ?? (typeof raw.turn_id === "string" ? raw.turn_id : undefined);
         const mcpSessionId = item.mcpSessionId ?? (typeof raw.mcp_session_id === "string" ? raw.mcp_session_id : undefined);
         const trustedThreadId = item.trustedThreadId ?? (typeof raw.trusted_thread_id === "string" ? raw.trusted_thread_id : undefined);
-        const session = isAntigravity
-          ? null
-          : await this.clientOrThrow().createSession(workspacePath, title);
-        const opencodeSessionId = isAntigravity ? "antigravity:" + agentId : session!.id;
-        const opencodeServerId = isAntigravity ? "antigravity" : (this.managed?.serverId ?? "unknown");
-
         preparedItems.push({
           item,
           agentId,
@@ -1065,7 +1002,6 @@ export class BridgeService {
           strategy,
           mode,
           route,
-          isAntigravity,
           prompt,
           promptWorkerInput,
           contextFiles,
@@ -1076,8 +1012,6 @@ export class BridgeService {
           turnId,
           mcpSessionId,
           trustedThreadId,
-          opencodeServerId,
-          opencodeSessionId,
         });
       }
 
@@ -1098,8 +1032,10 @@ export class BridgeService {
             workspacePath: prep.workspacePath,
             workspaceStrategy: prep.strategy,
             mode: prep.mode,
-            opencodeServerId: prep.opencodeServerId,
-            opencodeSessionId: prep.opencodeSessionId,
+            // Historical column names remain part of the storage contract;
+            // they carry an opaque Antigravity identity for new agents.
+            opencodeServerId: "antigravity",
+            opencodeSessionId: "antigravity:" + prep.agentId,
             modelProviderId: prep.route.providerId,
             modelId: prep.route.modelId,
             modelVariant: prep.route.variant,
@@ -1387,6 +1323,12 @@ export class BridgeService {
       return;
     }
 
+    if (!isActiveAntigravityAgent(agent)) {
+      const error = await this.failRetiredProviderJob(job, agent);
+      waiter?.reject(error);
+      return;
+    }
+
     const envelope = this.store.getDispatchEnvelope(job.id);
     const pending = this.pendingDispatches.get(job.id);
     let prompt: string | undefined;
@@ -1426,60 +1368,10 @@ export class BridgeService {
     }
 
     try {
-      if (workerInput && (workerInput as any).permissionReply) {
-        const permInput = workerInput as any;
-        const currentAgent = this.store.getAgent(agent.id);
-        if (currentAgent && currentAgent.status !== "working") {
-          this.store.updateAgentStatus(agent.id, "working");
-        }
-        this.store.updateJobStatus(job.id, "running");
-        if (Array.isArray(job.exclusiveResources)) {
-          for (const res of job.exclusiveResources) {
-            this.activeExclusiveResources.set(res, job.id);
-          }
-        }
-        try {
-          await this.clientOrThrow().replyPermission(
-            agent.opencodeSessionId,
-            permInput.permissionId,
-            permInput.permissionReply,
-            permInput.permissionMessage,
-          );
-          const afterReply = this.store.getJob(job.id);
-          if (afterReply?.status === "running" && afterReply.permissionId === permInput.permissionId) {
-            this.store.setJobPermission(job.id, null);
-          }
-          this.store.deleteDispatchEnvelope(job.id);
-          this.pendingDispatches.delete(job.id);
-          waiter?.resolve(this.accepted(this.store.getJob(job.id) ?? job));
-          return;
-        } catch (error) {
-          const message = redactSecrets(String(error instanceof Error ? error.message : error));
-          this.store.updateJobStatus(job.id, "failed", message);
-          const curAgent = this.store.getAgent(agent.id);
-          if (curAgent && curAgent.status !== "closed" && curAgent.status !== "aborted") {
-            this.store.updateAgentStatus(agent.id, "failed", message);
-          }
-          this.store.deleteDispatchEnvelope(job.id);
-          this.pendingDispatches.delete(job.id);
-          this.onJobSettled(job.id, job.batchId);
-          waiter?.reject(error);
-          throw error;
-        }
-      }
-
       if (agent.workspaceStrategy === "worktree") {
         await this.withRepoPreparationLock(agent.repositoryRoot, async () => {
           return prepareWorkspace(agent.repositoryRoot, "worktree", agent.id);
         });
-      }
-
-      const isAntigravity = agent.modelProviderId === "antigravity";
-      if (!isAntigravity && agent.opencodeSessionId.startsWith("pending:")) {
-        const session = await this.clientOrThrow().createSession(agent.workspacePath, agent.title);
-        this.store.updateAgentSession(agent.id, this.managed?.serverId ?? "unknown", session.id);
-        agent.opencodeSessionId = session.id;
-        agent.opencodeServerId = this.managed?.serverId ?? "unknown";
       }
 
       if (!prompt || (agent.workspaceStrategy === "worktree" && job.kind !== "continue")) {
@@ -1509,7 +1401,7 @@ export class BridgeService {
           contextFiles: effectiveContextFiles,
         };
         const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
-        const promptOptions = workerPromptOptions(this.config, isAntigravity, allowedExternalFiles);
+         const promptOptions = workerPromptOptions(this.config, true, allowedExternalFiles);
         prompt = await buildWorkerPrompt(effectiveWorkerInput, agent.workspacePath, promptOptions);
       }
 
@@ -1610,6 +1502,9 @@ export class BridgeService {
       if (existing) return this.acceptedRequest(existing);
       const agent = this.store.getAgent(input.agentId);
       if (!agent) throw new UnknownAgentError(input.agentId);
+      if (!isActiveAntigravityAgent(agent)) {
+        throw new ConflictError(RETIRED_PROVIDER_MESSAGE, "not_continuable");
+      }
       const active = this.activeJob(agent.id);
       if (active && active.status !== "needs_approval") throw new BridgeBusyError(active.id);
       if (agent.status === "closed" || agent.status === "aborted") {
@@ -1622,13 +1517,9 @@ export class BridgeService {
         ...(input.visualContext ? { visualContext: input.visualContext } : {}),
       }, agent.workspacePath, workerPromptOptions(this.config, agent.modelProviderId === "antigravity"));
       if (active?.status === "needs_approval") {
-        if (input.permissionId || input.permissionReply || input.permissionMessage) {
-          if (!input.permissionId || !input.permissionReply) {
-            throw new InvalidRequestError("permissionId and permissionReply are both required to answer an approval request", "permission_required");
-          }
-          return this.replyApproval(agent, active, input.permissionId, input.permissionReply, input.permissionMessage);
-        }
-        return this.resumeApproval(agent, active, prompt);
+        const message = "Antigravity jobs do not expose resumable provider approval sessions";
+        await this.failJob(active, agent, message);
+        throw new ConflictError(message, "not_continuable");
       }
       const priorJob = this.store.getLatestJobForAgent(agent.id);
       const priority = priorJob?.priority ?? 50;
@@ -1698,7 +1589,7 @@ export class BridgeService {
   /**
    * Closed-agent recovery with lineage. Only reachable with allow_respawn:
    * a closed agent is NEVER reopened or made continuable; a brand-new agent
-   * and a brand-new OpenCode session are created in the parent's persisted
+   * and a brand-new Antigravity run is created in the parent's persisted
    * workspace/topic/strategy with the parent's pinned route columns (never
    * the live config registry, so no provider fallback and no redirect).
    * Fails closed when the parent was explicitly aborted, has no terminal
@@ -1706,6 +1597,9 @@ export class BridgeService {
    * supplied (a closed agent has no pending approval to answer).
    */
   private async respawnClosedAgent(agent: AgentRecord, input: ContinueInput): Promise<AcceptedOperation> {
+    if (!isActiveAntigravityAgent(agent)) {
+      throw new ConflictError(RETIRED_PROVIDER_MESSAGE, "not_continuable");
+    }
     if (agent.status === "aborted") throw new ConflictError("Agent was explicitly aborted; it cannot be resumed", "not_continuable");
     if (input.permissionId || input.permissionReply || input.permissionMessage) {
       throw new InvalidRequestError("permission fields are not applicable when resuming a closed agent", "invalid_request");
@@ -1722,15 +1616,14 @@ export class BridgeService {
     const childId = newId("agent");
     const workspacePath = agent.workspacePath;
     const title = normalizeTitle(agent.topic);
-    const isAntigravity = agent.modelProviderId === "antigravity";
     const prompt = await buildWorkerPrompt({
       task: input.task,
       relation: input.relation ?? "followup",
       ...(input.visualContext ? { visualContext: input.visualContext } : {}),
-    }, workspacePath, workerPromptOptions(this.config, isAntigravity));
+    }, workspacePath, workerPromptOptions(this.config, true));
 
-    const opencodeServerId = isAntigravity ? "antigravity" : (this.managed?.serverId ?? agent.opencodeServerId);
-    const opencodeSessionId = isAntigravity ? "antigravity:" + childId : "pending:" + childId;
+    const opencodeServerId = "antigravity";
+    const opencodeSessionId = "antigravity:" + childId;
 
     const correlationHint = (input.threadId || input.turnId)
       ? {
@@ -1766,7 +1659,7 @@ export class BridgeService {
         mode: agent.mode ?? "analyze",
         opencodeServerId,
         opencodeSessionId,
-        modelProviderId: agent.modelProviderId,
+        modelProviderId: "antigravity",
         modelId: agent.modelId,
         modelVariant: agent.modelVariant,
         modelRoute: agent.modelRoute,
@@ -1795,7 +1688,7 @@ export class BridgeService {
     });
 
     this.recordActivity(agent, lastJob, "dispatch", "Closed agent resumed: spawned lineage agent " + child!.id + " after job " + lastJob.id);
-    this.recordActivity(child!, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new " + (isAntigravity ? "Antigravity run (no OpenCode session)" : "OpenCode session"));
+    this.recordActivity(child!, job, "dispatch", "Resumed from closed agent " + agent.id + " after job " + lastJob.id + "; new Antigravity Gemini run");
 
     this.pendingDispatches.set(job.id, {
       prompt,
@@ -1919,43 +1812,6 @@ export class BridgeService {
       alivePids,
       verifiedAt: new Date().toISOString(),
       ...(!stopped ? { error: "Antigravity process did not reach quiescence within " + maxWaitMs + "ms (supervisorPid: " + supervisorPid + ", agyPid: " + agyPid + ")" } : {}),
-    };
-  }
-
-  private async ensureOpenCodeQuiescence(
-    pid?: number | null,
-    maxWaitMs = 5000,
-  ): Promise<QuiescenceProof> {
-    if (!pid || (this.managed?.processId && pid === this.managed.processId)) {
-      return {
-        stopped: true,
-        workerPid: null,
-        pidsChecked: [],
-        alivePids: [],
-        verifiedAt: new Date().toISOString(),
-      };
-    }
-    const deadline = Date.now() + maxWaitMs;
-    while (Date.now() < deadline) {
-      if (!isProcessAlive(pid)) {
-        return {
-          stopped: true,
-          workerPid: pid,
-          pidsChecked: [pid],
-          alivePids: [],
-          verifiedAt: new Date().toISOString(),
-        };
-      }
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    const stopped = !isProcessAlive(pid);
-    return {
-      stopped,
-      workerPid: pid,
-      pidsChecked: [pid],
-      alivePids: stopped ? [] : [pid],
-      verifiedAt: new Date().toISOString(),
-      ...(!stopped ? { error: "OpenCode worker process (PID " + pid + ") did not reach quiescence within " + maxWaitMs + "ms" } : {}),
     };
   }
 
@@ -2736,11 +2592,17 @@ export class BridgeService {
     const agent = this.store.getAgent(input.agentId);
     if (!agent) throw new UnknownAgentError(input.agentId);
     const job = this.resolveJobForAgent(agent.id, input.jobId);
-    if (!job) throw new UnknownJobError("No DeepSeek job exists for agent " + agent.id);
+    if (!job) throw new UnknownJobError("No Antigravity job exists for agent " + agent.id);
     if (input.jobId && job.agentId !== agent.id) throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
 
+    if (!isActiveAntigravityAgent(agent) && !TERMINAL_JOB_STATUSES.has(job.status)) {
+      await this.failRetiredProviderJob(job, agent);
+      return this.followResultForJob(agent, this.store.getJob(job.id) ?? job);
+    }
     if (job.status === "needs_approval") {
-      return this.followNeedsApproval(agent, job);
+      const message = "Antigravity does not expose resumable provider approval sessions; the job failed closed";
+      await this.failJob(job, agent, message);
+      return this.followResultForJob(agent, this.store.getJob(job.id) ?? job);
     }
     if (TERMINAL_JOB_STATUSES.has(job.status) || ["delivery_pending"].includes(job.status)) {
       const result = await this.followResultForJob(agent, job);
@@ -2807,68 +2669,47 @@ export class BridgeService {
       });
       return { agentId, jobId: active.id, status: "aborted", quiescent: true };
     }
-    this.clearApprovalTimer(agentId);
+    if (!isActiveAntigravityAgent(agent)) {
+      const localReason = RETIRED_PROVIDER_MESSAGE + ". Job " + active.id + " was aborted locally without contacting the historical session.";
+      this.store.updateJobStatus(active.id, "aborted", localReason);
+      if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", localReason);
+      this.store.deleteDispatchEnvelope(active.id);
+      this.pendingDispatches.delete(active.id);
+      this.recordActivity(agent, active, "abort", localReason);
+      await this.resolveFollow(active.id, { status: "aborted", error: localReason, workerAborted: true });
+      this.onJobSettled(active.id, active.batchId);
+      await this.evaluateParkWakes(active.id).catch((error: unknown) => {
+        this.lastStreamError = redactSecrets(String(error));
+      });
+      return { agentId, jobId: active.id, status: "aborted", quiescent: true };
+    }
+
     this.store.setApprovalDeadline(active.id, null);
-    let remoteError: string | null = null;
     let proof: QuiescenceProof | undefined;
-    const isAntigravityWithoutSession = agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"));
-    if (agent.modelProviderId === "antigravity") {
-      const controller = this.antigravityAbortControllers.get(active.id);
-      if (controller) {
-        controller.abort();
-        this.recordActivity(agent, active, "abort", "Sent abort signal to the active Antigravity process tree");
-      } else if (active.status === "created") {
-        this.recordActivity(agent, active, "abort", "Abort landed before Antigravity dispatch; the launch will be prevented");
-      } else if (isAntigravityWithoutSession) {
-        this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
-      }
-      const spool = new AntigravitySpool(this.config.dataDir);
-      await spool.writeCancelSignal(active.id, reason ?? "Aborted by orchestrator").catch(() => undefined);
-      const qResult = await this.ensureAntigravityQuiescence(active.id, spool);
-      if (!qResult.stopped) {
-        const errorMsg = qResult.error ?? "Antigravity process failed to stop within deadline";
-        this.recordActivity(agent, active, "error", errorMsg);
-        throw new ConflictError(errorMsg, "state_conflict");
-      }
-      proof = qResult;
+    const controller = this.antigravityAbortControllers.get(active.id);
+    if (controller) {
+      controller.abort();
+      this.recordActivity(agent, active, "abort", "Sent abort signal to the active Antigravity process tree");
+    } else if (active.status === "created") {
+      this.recordActivity(agent, active, "abort", "Abort landed before Antigravity dispatch; the launch will be prevented");
+    } else {
+      this.recordActivity(agent, active, "abort", "Antigravity job was aborted locally after its process was no longer controllable");
     }
-    if (!isAntigravityWithoutSession) {
-      try {
-        await this.clientOrThrow().abort(agent.opencodeSessionId);
-      } catch (error) {
-        remoteError = redactSecrets(String(error));
-      }
-      if (remoteError) {
-        this.recordActivity(agent, active, "error", "OpenCode abort failed: " + remoteError);
-        throw new ConflictError("OpenCode abort failed: " + remoteError, "state_conflict");
-      }
-      const ephemeralWorkerPid = active.workerPid && active.workerPid !== this.managed?.processId
-        ? active.workerPid
-        : null;
-      if (ephemeralWorkerPid && isProcessAlive(ephemeralWorkerPid)) {
-        const qResult = await this.ensureOpenCodeQuiescence(ephemeralWorkerPid);
-        if (!qResult.stopped) {
-          const errorMsg = qResult.error ?? "OpenCode worker process failed to stop within deadline";
-          this.recordActivity(agent, active, "error", errorMsg);
-          throw new ConflictError(errorMsg, "state_conflict");
-        }
-        proof = qResult;
-      } else {
-        proof = {
-          stopped: true,
-          workerPid: null,
-          pidsChecked: [],
-          alivePids: [],
-          verifiedAt: new Date().toISOString(),
-        };
-      }
+    const spool = new AntigravitySpool(this.config.dataDir);
+    await spool.writeCancelSignal(active.id, reason ?? "Aborted by orchestrator").catch(() => undefined);
+    const qResult = await this.ensureAntigravityQuiescence(active.id, spool);
+    if (!qResult.stopped) {
+      const errorMsg = qResult.error ?? "Antigravity process failed to stop within deadline";
+      this.recordActivity(agent, active, "error", errorMsg);
+      throw new ConflictError(errorMsg, "state_conflict");
     }
+    proof = qResult;
     const localReason = reason ?? "Aborted by orchestrator";
 
     if (active.status !== "aborted") this.store.updateJobStatus(active.id, "aborted", localReason);
     // Aborted agents are non-continuable; auto-close them safely.
     if (agent.status !== "closed" && agent.status !== "aborted") this.store.updateAgentStatus(agent.id, "closed", reason ?? null);
-    this.recordActivity(agent, active, "abort", "Abort requested for the active DeepSeek task");
+    this.recordActivity(agent, active, "abort", "Abort requested for the active Antigravity task");
     this.store.deleteDispatchEnvelope(active.id);
     this.pendingDispatches.delete(active.id);
     const waiter = this.dispatchWaiters.get(active.id);
@@ -2905,17 +2746,7 @@ export class BridgeService {
     }
     const jobs = this.store.listJobs().filter((j) => j.agentId === agentId);
     for (const job of jobs) {
-      const ephemeralWorkerPid = job.workerPid && job.workerPid !== this.managed?.processId
-        ? job.workerPid
-        : null;
-      if (ephemeralWorkerPid && isProcessAlive(ephemeralWorkerPid)) {
-        const qResult = await this.ensureOpenCodeQuiescence(ephemeralWorkerPid);
-        if (!qResult.stopped) {
-          throw new ConflictError("Cannot close agent: process PID " + ephemeralWorkerPid + " is still alive", "state_conflict");
-        }
-        proof = qResult;
-      }
-      if (agent.modelProviderId === "antigravity" && this.antigravityTasksByJob.has(job.id)) {
+      if (isActiveAntigravityAgent(agent) && this.antigravityTasksByJob.has(job.id)) {
         const spool = new AntigravitySpool(this.config.dataDir);
         const qResult = await this.ensureAntigravityQuiescence(job.id, spool);
         if (!qResult.stopped) {
@@ -2944,19 +2775,10 @@ export class BridgeService {
   }
 
   async recoverResult(jobId: string, agentId?: string): Promise<unknown> {
-    let job = this.store.getJob(jobId);
+    const job = this.store.getJob(jobId);
     if (!job) throw new UnknownJobError(jobId);
     if (agentId && job.agentId !== agentId) throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
-    if (!job.resultPath && this.client && ["dispatching", "running", "completed", "delivery_pending"].includes(job.status)) {
-      await this.reconcileJob(job);
-      job = this.store.getJob(jobId);
-    }
-    if (!job?.resultPath && job?.status === "timed_out" && this.client) {
-      const agent = this.store.getAgent(job.agentId);
-      if (agent) await this.captureTimedOutEvidence(agent, job);
-      job = this.store.getJob(jobId);
-    }
-    if (!job?.resultPath) throw new NotFoundError("No persisted result is available for job " + jobId);
+    if (!job.resultPath) throw new NotFoundError("No persisted result is available for job " + jobId);
     const result = sanitizePersistedResult(JSON.parse(await readFile(job.resultPath, "utf8")), this.config.maxResultLength);
     // Recover returns a usable final result: the terminal obligation is
     // explicitly consumed here, separate from agent close.
@@ -3043,7 +2865,9 @@ export class BridgeService {
   }
 
   listRoutes(): ModelRoute[] {
-    return this.config.modelRoutes.map((route) => ({ ...route }));
+    return this.config.modelRoutes
+      .filter((route) => isAntigravityRoute(route))
+      .map((route) => ({ ...route }));
   }
 
   routeStatus(): RouteStatusInfo {
@@ -3073,7 +2897,10 @@ export class BridgeService {
    * persisted spawn-time route.
    */
   setActiveRoute(name: string): RouteStatusInfo {
-    this.resolveRouteByName(name);
+    const route = this.resolveRouteByName(name);
+    if (!isAntigravityRoute(route)) {
+      throw new InvalidRequestError("Only an Antigravity Gemini route can be active", "unknown_route", { route: name });
+    }
     this.store.setActiveRoute(name);
     return this.routeStatus();
   }
@@ -3092,6 +2919,9 @@ export class BridgeService {
   private resolveRouteForSpawn(modelRoute: string | undefined): ResolvedRoute {
     if (modelRoute !== undefined) {
       const route = this.resolveRouteByName(modelRoute);
+      if (!isAntigravityRoute(route)) {
+        throw new InvalidRequestError("Only an Antigravity Gemini route can be dispatched", "route_disabled", { route: route.name });
+      }
       const activeName = this.effectiveRouteName();
       if (route.name !== activeName) {
         throw new RouteOverrideDeniedError(
@@ -3101,7 +2931,11 @@ export class BridgeService {
       }
       return route;
     }
-    return this.resolveRouteByName(this.effectiveRouteName());
+    const route = this.resolveRouteByName(this.effectiveRouteName());
+    if (!isAntigravityRoute(route)) {
+      throw new InvalidRequestError("Only an Antigravity Gemini route can be dispatched", "route_disabled", { route: route.name });
+    }
+    return route;
   }
 
   /**
@@ -3127,28 +2961,6 @@ export class BridgeService {
         : baseDisplay,
     };
   }
-
-  private dispatchOptions(agent: AgentRecord, job?: JobRecord | null): { providerId: string; modelId: string; variant?: string; agent?: string } {
-    if (job?.fallbackTo) {
-      try {
-        const fallbackRoute = this.resolveRouteByName(job.fallbackTo);
-        return {
-          providerId: fallbackRoute.providerId,
-          modelId: fallbackRoute.modelId,
-          ...(fallbackRoute.variant ? { variant: fallbackRoute.variant } : {}),
-          ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-        };
-      } catch {}
-    }
-    const route = this.resolveAgentRoute(agent);
-    return {
-      providerId: route.providerId,
-      modelId: route.modelId,
-      ...(route.variant ? { variant: route.variant } : {}),
-      ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-    };
-  }
-
 
   /**
    * Resolves candidate context files for a task, automatically including the
@@ -3283,7 +3095,7 @@ export class BridgeService {
       const followAgent = this.store.getAgent(job.agentId);
       this.recordActivity(followAgent, this.store.getJob(job.id), "event", followAgent?.modelProviderId === "antigravity"
         ? "Follow mode started; waiting for the Antigravity run to complete"
-        : "Follow mode started; waiting for an OpenCode completion event");
+        : "Follow mode started; waiting for the Antigravity run to complete");
     }
     const after = this.store.setFollowWindow(job.id, {
       startedAt: new Date(startedAt).toISOString(),
@@ -3409,6 +3221,10 @@ export class BridgeService {
     if (!lifecycle || !job || job.status !== "following" || job.gracefulFinalizeAttempted) return;
     const agent = this.store.getAgent(job.agentId);
     if (!agent) return;
+    if (!isActiveAntigravityAgent(agent)) {
+      await this.failRetiredProviderJob(job, agent);
+      return;
+    }
     const liveness = await this.getAuthoritativeStatus(agent.id, job.id);
     if (liveness.isLive) {
       return;
@@ -3416,42 +3232,9 @@ export class BridgeService {
     const graceDeadlineAt = Date.now() + lifecycle.graceMinutes * 60_000;
     this.store.updateJobStatus(jobId, "finalizing");
     const marked = this.store.markGracefulFinalize(jobId, new Date(graceDeadlineAt).toISOString());
-    this.recordActivity(agent, marked, "deadline", "Follow deadline reached; starting graceful finalization");
+    this.recordActivity(agent, marked, "deadline", "Follow deadline reached; starting local Antigravity finalization");
     this.scheduleGraceTimer(lifecycle, graceDeadlineAt);
-    await this.requestGracefulFinalize(agent, marked);
-  }
-
-  private async requestGracefulFinalize(agent: AgentRecord, job: JobRecord): Promise<void> {
-    if (agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"))) {
-      this.recordActivity(agent, job, "finalize", "Antigravity has no OpenCode session to finalize; the follow deadline settles the job");
-      return;
-    }
-    const client = this.clientOrThrow();
-    try {
-      await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent, job));
-      this.recordActivity(agent, job, "finalize", "Graceful finalization prompt submitted in the same OpenCode session");
-    } catch (error) {
-      if (isUnknownDispatchOutcome(error)) {
-        this.recordActivity(agent, job, "error", "Graceful finalization dispatch outcome is unknown after a transport failure; the deadline will settle it");
-        return;
-      }
-      if (!isBusyError(error)) {
-        this.recordActivity(agent, job, "error", "Graceful finalization prompt was rejected by OpenCode");
-        return;
-      }
-      this.recordActivity(agent, job, "finalize", "OpenCode was busy; aborting the active turn before finalization");
-      try {
-        await client.abort(agent.opencodeSessionId);
-      } catch {
-        this.recordActivity(agent, job, "error", "OpenCode abort failed during graceful finalization");
-      }
-      try {
-        await client.promptAsync(agent.opencodeSessionId, GRACEFUL_FINALIZE_PROMPT, this.dispatchOptions(agent, job));
-        this.recordActivity(agent, job, "finalize", "Graceful finalization prompt resubmitted in the same OpenCode session");
-      } catch {
-        this.recordActivity(agent, job, "error", "Graceful finalization could not be submitted after the busy turn was aborted");
-      }
-    }
+    this.recordActivity(agent, marked, "finalize", "Antigravity has no remotely addressable session; the grace period settles the job");
   }
 
   private async timeoutFollow(jobId: string): Promise<void> {
@@ -3459,53 +3242,32 @@ export class BridgeService {
     const job = this.store.getJob(jobId);
     const agent = job ? this.store.getAgent(job.agentId) : null;
     if (!lifecycle || !job || !agent || job.status !== "finalizing") return;
+    if (!isActiveAntigravityAgent(agent)) {
+      await this.failRetiredProviderJob(job, agent);
+      return;
+    }
     const liveness = await this.getAuthoritativeStatus(agent.id, job.id);
     if (liveness.isLive) {
       return;
     }
-    if (!liveness.pid && !liveness.attempt) {
-      if (agent.modelProviderId !== "antigravity") {
-        await this.reconcileJob(job).catch(() => undefined);
-      }
-      return;
-    }
     const reason = "Follow deadline and graceful-finalize grace period expired";
+    const controller = this.antigravityAbortControllers.get(job.id);
+    if (controller) {
+      controller.abort();
+      this.recordActivity(agent, this.store.getJob(job.id), "abort", "Sent abort signal to the Antigravity process tree after the follow grace period");
+    }
+    await new AntigravitySpool(this.config.dataDir).writeCancelSignal(job.id, reason).catch(() => undefined);
     this.store.updateJobStatus(job.id, "timed_out", reason);
     if (agent.status === "working") this.store.updateAgentStatus(agent.id, "timed_out", reason);
-    const isAntigravityWithoutSession = agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"));
-    this.recordActivity(agent, this.store.getJob(job.id), "deadline", isAntigravityWithoutSession
-      ? "Follow grace period expired; the Antigravity process will be aborted"
-      : "Grace period expired; the worker will be aborted and partial evidence captured");
-    let abortError: string | null = null;
-    if (agent.modelProviderId === "antigravity") {
-      const controller = this.antigravityAbortControllers.get(job.id);
-      if (controller) {
-        controller.abort();
-        this.recordActivity(agent, this.store.getJob(job.id), "abort", "Sent abort signal to the Antigravity process tree after the follow grace period");
-      } else if (isAntigravityWithoutSession) {
-        this.recordActivity(agent, this.store.getJob(job.id), "error", "Antigravity process was no longer controllable at the follow grace expiry");
-      }
-    }
-    if (!isAntigravityWithoutSession) {
-      try {
-        await this.clientOrThrow().abort(agent.opencodeSessionId);
-      } catch (error) {
-        abortError = redactSecrets(String(error));
-        this.recordActivity(agent, this.store.getJob(job.id), "error", "Worker abort failed after the follow grace period");
-      }
-    }
-    const timedOut = this.store.getJob(job.id) ?? job;
-    const stored = await this.captureTimedOutEvidence(agent, timedOut);
-    const envelope = stored?.envelope ?? null;
+    this.recordActivity(agent, this.store.getJob(job.id), "deadline", "Follow grace period expired; the Antigravity job was timed out without a result");
     await this.resolveFollow(job.id, {
       status: "timed_out",
       deadlineReached: true,
       gracefulFinalize: true,
-      partial: true,
+      partial: false,
       workerAborted: true,
-      resultAvailable: envelope !== null,
-      error: abortError ? reason + "; abort error: " + abortError : reason,
-      ...(envelope ? { envelope } : {}),
+      resultAvailable: false,
+      error: reason,
     });
     const pending = this.store.getJob(job.id);
     if (pending?.resultPath && pending.status === "timed_out") {
@@ -3517,32 +3279,6 @@ export class BridgeService {
       await this.evaluateParkWakes(job.id).catch((error: unknown) => {
         this.lastStreamError = redactSecrets(String(error));
       });
-    }
-  }
-
-  private async captureTimedOutEvidence(agent: AgentRecord, job: JobRecord): Promise<Awaited<ReturnType<typeof persistResult>> | null> {
-    if (agent.modelProviderId === "antigravity" && (!agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:"))) {
-      this.recordActivity(agent, job, "error", "Antigravity has no session messages to capture as timeout evidence");
-      return null;
-    }
-
-    try {
-      const messages = await this.clientOrThrow().listMessages(agent.opencodeSessionId);
-      const diff = await this.clientOrThrow().getDiff(agent.opencodeSessionId);
-      const stored = await persistResult(this.config.dataDir, agent, job, messages, diff, this.config.maxResultLength, {
-        statusOverride: "timed_out",
-        deadlineReached: true,
-        gracefulFinalize: true,
-        partial: true,
-        workerAborted: true,
-      });
-      this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
-      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary);
-      this.recordActivity(agent, this.store.getJob(job.id), "result", "Persisted the last available messages and diff as partial timeout evidence");
-      return stored;
-    } catch {
-      this.recordActivity(agent, this.store.getJob(job.id), "error", "Partial timeout evidence could not be fully captured");
-      return null;
     }
   }
 
@@ -3565,15 +3301,6 @@ export class BridgeService {
       gracefulFinalize: Boolean(job.gracefulFinalizeAttempted || envelope?.gracefulFinalize),
       partial: Boolean(envelope?.partial || followStatus === "completed_partial" || followStatus === "timed_out"),
       workerAborted: Boolean(envelope?.workerAborted || followStatus === "timed_out"),
-    });
-  }
-
-  private followNeedsApproval(agent: AgentRecord, job: JobRecord): Promise<FollowResult> {
-    return this.followResultForState(agent, job, {
-      status: "needs_approval",
-      resultAvailable: false,
-      message: "DeepSeek requires explicit approval before continuing.",
-      permissionId: job.permissionId,
     });
   }
 
@@ -3674,18 +3401,18 @@ export class BridgeService {
     const end = parseTimestamp(job?.completedAt) ?? Date.now();
     const latest = activities[0];
 
-    let heartbeatAt: string | null = job?.heartbeatAt ?? null;
+    const activeAntigravity = isActiveAntigravityAgent(agent);
+    let heartbeatAt: string | null = activeAntigravity ? (job?.heartbeatAt ?? null) : null;
     let heartbeatAgoSeconds: number | null = null;
-    let leaseExpiresAt: string | null = job?.leaseExpiresAt ?? job?.graceDeadlineAt ?? job?.followDeadlineAt ?? null;
-    let attemptId: string | null = job?.attempt ?? null;
+    let leaseExpiresAt: string | null = activeAntigravity ? (job?.leaseExpiresAt ?? job?.graceDeadlineAt ?? job?.followDeadlineAt ?? null) : null;
+    let attemptId: string | null = activeAntigravity ? (job?.attempt ?? null) : null;
     let fence: number | null = job?.fence ?? 1;
-    let pid: number | null = job?.workerPid ?? null;
-    let sessionId: string | null = agent.opencodeSessionId ?? null;
+    let pid: number | null = null;
+    let sessionId: string | null = activeAntigravity ? agent.opencodeSessionId : null;
     let resultPersisted = Boolean(job?.resultPath);
     let isLive = false;
 
-    if (job) {
-      if (agent.modelProviderId === "antigravity" || !agent.opencodeSessionId || agent.opencodeSessionId.startsWith("antigravity:")) {
+    if (job && activeAntigravity) {
         const spool = new AntigravitySpool(this.config.dataDir);
         const latestAttempt = await spool.getLatestAttempt(job.id).catch(() => null);
         if (latestAttempt) {
@@ -3709,20 +3436,7 @@ export class BridgeService {
             }
           }
         }
-      } else {
-        pid = job.workerPid ?? null;
-        heartbeatAt = job.heartbeatAt ?? null;
-        if (heartbeatAt) {
-          const hbMs = parseTimestamp(heartbeatAt);
-          if (hbMs !== null) {
-            heartbeatAgoSeconds = Math.max(0, Math.floor((Date.now() - hbMs) / 1000));
-          }
-        }
-        if (pid) {
-          isLive = isProcessAlive(pid);
-        }
       }
-    }
 
     const authoritativeStatus: AuthoritativeLivenessStatus = {
       heartbeatAt,
@@ -3856,92 +3570,17 @@ export class BridgeService {
     workerInput?: WorkerPromptInput,
     contextFiles?: string[],
   ): Promise<AcceptedOperation> {
-    if (agent.modelProviderId === "antigravity") {
-      return this.dispatchAntigravity(agent, job, prompt, workerInput, contextFiles);
+    if (!isActiveAntigravityAgent(agent)) {
+      throw await this.failRetiredProviderJob(job, agent);
     }
-    const currentJob = this.store.getJob(job.id);
-    const currentAgent = this.store.getAgent(agent.id);
-    if (currentJob?.status === "aborted" || currentAgent?.status === "closed" || currentAgent?.status === "aborted") {
-      throw new Error("Invalid job transition: aborted -> dispatching");
-    }
-    this.store.updateAgentStatus(agent.id, "working");
-    this.store.updateJobStatus(job.id, "dispatching");
-    const timeoutMs = this.effectiveWorkerTimeoutMs();
-    const leaseExpiresAt = timeoutMs !== null ? new Date(Date.now() + timeoutMs).toISOString() : null;
-    const workerPid = null;
-    this.store.updateJobLiveness(job.id, {
-      leaseExpiresAt,
-      attempt: "1",
-      fence: job.fence ?? 1,
-      workerPid,
-      heartbeatAt: new Date().toISOString(),
-    });
-    if (job.kind === "continue" && !job.lastAssistantMessageId) {
-      const baselineAssistantMessageId = this.previousAssistantMessageId(agent.id, job.id);
-      if (baselineAssistantMessageId) this.store.setJobMessages(job.id, null, baselineAssistantMessageId);
-    }
-    try {
-      await this.clientOrThrow().promptAsync(jobAgentSession(agent), prompt, this.dispatchOptions(agent, job));
-      const current = this.store.getJob(job.id);
-      if (current?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-      this.recordActivity(agent, job, "dispatch", "Dispatched task to the OpenCode session");
-      return this.accepted(this.store.getJob(job.id) ?? job);
-    } catch (error) {
-      const message = redactSecrets(String(error instanceof Error ? error.message : error));
-      if (isUnknownDispatchOutcome(error)) {
-        // The prompt may still have been accepted server-side. Do not mark the
-        // job or agent failed and do not throw: resolve normally as an
-        // accepted pending bridge obligation so the caller receives the exact
-        // agentId/jobId it must follow or abort. Persist the diagnostic,
-        // keep the job active (which blocks a duplicate continuation), and arm
-        // the existing follow deadline/grace so a prompt that was never
-        // accepted cannot become immortal.
-        const currentJob = this.store.getJob(job.id);
-        if (currentJob?.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-        this.recordActivity(agent, this.store.getJob(job.id), "error", "OpenCode dispatch outcome is unknown after a transport failure; the job stays active");
-        const pending = this.store.getJob(job.id) ?? job;
-        this.ensureFollowLifecycle(
-          pending,
-          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
-          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
-          true,
-        );
-        this.store.setJobError(job.id, "Dispatch outcome unknown after a transport failure: " + message);
-        this.store.markDispatchUnknown(job.id);
-        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
-      }
-      const current = this.store.getJob(job.id);
-      const currentAgent = this.store.getAgent(agent.id);
-      const preservesApproval = current?.status === "needs_approval" || currentAgent?.status === "needs_approval";
-      if (current && current.status !== "failed" && !preservesApproval) this.store.updateJobStatus(job.id, "failed", message);
-      if (currentAgent && currentAgent.status !== "closed" && !preservesApproval) this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(agent, job, "error", "OpenCode rejected the task dispatch");
-      if (!preservesApproval) {
-        this.onJobSettled(job.id, job.batchId);
-        if (this.followLifecycles.has(job.id)) {
-          await this.resolveFollow(job.id, { status: "failed", error: message });
-        }
-        await this.evaluateParkWakes(job.id).catch((err: unknown) => {
-          this.lastStreamError = redactSecrets(String(err));
-        });
-      }
-      const backpressure = isBackpressureError(error);
-      if (backpressure && !(error as any)?.backpressureRecorded) {
-        this.recordBackpressure("bridge_busy");
-      }
-      const propagatedError = error instanceof Error ? error : new Error(message);
-      if (backpressure) {
-        (propagatedError as any).backpressureRecorded = true;
-      }
-      throw propagatedError;
-    }
+    return this.dispatchAntigravity(agent, job, prompt, workerInput, contextFiles);
   }
 
   /**
    * Antigravity dispatch path: preserves the MCP asynchronous contract. The
    * spawn resolves with an accepted pending obligation immediately after job
-   * creation; the agy executable runs once via the AntigravityAdapter (never
-   * OpenCode, never a session) in a background task, and completion/result
+   * creation; the agy executable runs once via the AntigravityAdapter in a
+   * background task, and completion/result
    * persistence/delivery happen asynchronously so deepseek_follow observes
    * them.
    *
@@ -4114,10 +3753,6 @@ export class BridgeService {
         this.lastStreamError = message;
         return;
       }
-      if (this.isEligibleForTimeoutFallback(agent, current ?? job, error)) {
-        await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
-        return;
-      }
       if (current && current.status !== "failed") {
         try {
           this.store.updateJobStatus(job.id, "failed", message, capturedFence);
@@ -4288,10 +3923,6 @@ export class BridgeService {
         this.lastStreamError = message;
         return;
       }
-      if (this.isEligibleForTimeoutFallback(agent, current ?? job, error)) {
-        await this.executeTimeoutFallback(agent, current ?? job, error as AntigravityProcessError, controller, workerInput, contextFiles);
-        return;
-      }
       if (current && current.status !== "failed") {
         try {
           this.store.updateJobStatus(job.id, "failed", message, capturedFence);
@@ -4320,433 +3951,6 @@ export class BridgeService {
     } finally {
       this.clearJobInactivityTimer(job.id);
       if (this.antigravityAbortControllers.get(job.id) === controller) this.antigravityAbortControllers.delete(job.id);
-    }
-  }
-
-  private isEligibleForTimeoutFallback(_agent: AgentRecord, _job: JobRecord, _error: unknown): boolean {
-    return false;
-  }
-
-
-  private async executeTimeoutFallback(
-    agent: AgentRecord,
-    job: JobRecord,
-    error: AntigravityProcessError,
-    controller: AbortController,
-    workerInput?: WorkerPromptInput,
-    contextFiles?: string[],
-  ): Promise<void> {
-    if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") return;
-    const fallbackRoute = this.resolveRouteByName(this.config.antigravityTimeoutFallbackRoute!);
-    this.store.setJobFallback(job.id, {
-      from: agent.modelRoute ?? agent.modelProviderId,
-      to: fallbackRoute.name,
-      reason: error.message,
-      status: "attempted",
-      count: 1,
-    });
-    this.recordActivity(
-      agent,
-      job,
-      "dispatch",
-      "Antigravity process timed out; executing fallback to OpenCode route " + fallbackRoute.name + " (" + fallbackRoute.display + ")",
-    );
-
-    const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
-    const promptOptions = workerPromptOptions(this.config, false, allowedExternalFiles);
-    const opencodePrompt = await buildWorkerPrompt(
-      {
-        ...(workerInput ?? { task: agent.topic }),
-        contextFiles: contextFiles ?? [],
-        mode: agent.mode ?? "analyze",
-        workspaceStrategy: agent.workspaceStrategy,
-      },
-      agent.workspacePath,
-      promptOptions,
-    );
-
-    const client = this.clientOrThrow();
-    let session: { id: string };
-    try {
-      session = await client.createSession(agent.workspacePath, agent.title);
-    } catch (sessionError) {
-      const message = redactSecrets(String(sessionError));
-      this.store.updateJobFallbackStatus(job.id, "failed");
-      const current = this.store.getJob(job.id);
-      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
-      const currentAgent = this.store.getAgent(agent.id);
-      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(agent, job, "error", "Failed to create OpenCode session for fallback: " + message);
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, { status: "failed", error: message });
-      }
-      return;
-    }
-
-    if (controller.signal.aborted || this.store.getJob(job.id)?.status === "aborted") {
-      await client.abort(session.id).catch(() => {});
-      return;
-    }
-
-    const updatedAgent = this.store.updateAgentSession(agent.id, this.managed?.serverId ?? "unknown", session.id);
-    this.recordActivity(updatedAgent, job, "dispatch", "Created OpenCode session " + session.id + " for timeout fallback");
-
-    const dispatchOpts = {
-      providerId: fallbackRoute.providerId,
-      modelId: fallbackRoute.modelId,
-      ...(fallbackRoute.variant ? { variant: fallbackRoute.variant } : {}),
-      ...(this.config.opencodeAgent ? { agent: this.config.opencodeAgent } : {}),
-    };
-
-    try {
-      await client.promptAsync(session.id, opencodePrompt, dispatchOpts);
-      const current = this.store.getJob(job.id);
-      if (current && current.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-      this.recordActivity(updatedAgent, job, "dispatch", "Dispatched task to fallback OpenCode session");
-    } catch (dispatchError) {
-      const message = redactSecrets(String(dispatchError));
-      if (isUnknownDispatchOutcome(dispatchError)) {
-        this.store.markDispatchUnknown(job.id);
-        this.recordActivity(updatedAgent, this.store.getJob(job.id), "error", "Fallback OpenCode dispatch outcome is unknown after a transport failure; the job stays active");
-        const pending = this.store.getJob(job.id) ?? job;
-        this.ensureFollowLifecycle(
-          pending,
-          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
-          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
-          true,
-        );
-        this.store.setJobError(job.id, "Fallback dispatch outcome unknown after a transport failure: " + message);
-        return;
-      }
-      this.store.updateJobFallbackStatus(job.id, "failed");
-      const current = this.store.getJob(job.id);
-      if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", message);
-      const currentAgent = this.store.getAgent(agent.id);
-      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(updatedAgent, job, "error", "Fallback OpenCode rejected task dispatch: " + message);
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, { status: "failed", error: message });
-      }
-    }
-  }
-
-
-  private async resumeApproval(agent: AgentRecord, job: JobRecord, prompt: string): Promise<AcceptedOperation> {
-    this.clearApprovalTimer(agent.id);
-    this.store.setApprovalDeadline(job.id, null);
-    this.store.setJobPermission(job.id, null);
-
-    const activeCount = this.store.getActiveJobCount();
-    const availableCredits = this.targetCredits - activeCount;
-    const claimedResources = this.getActiveExclusiveResources();
-    const hasResourceConflict = (job.exclusiveResources ?? []).some((r) => claimedResources.has(r));
-
-    if (availableCredits <= 0 || hasResourceConflict) {
-      this.store.updateJobStatus(job.id, "queued");
-      const queuedAt = new Date().toISOString();
-      this.store.db.prepare("UPDATE jobs SET queued_at = ?, prompt_hash = ? WHERE id = ?").run(queuedAt, hashPrompt(prompt), job.id);
-      this.store.saveDispatchEnvelope(job.id, {
-        prompt,
-        promptHash: hashPrompt(prompt),
-        workerInput: { task: prompt },
-        contextFiles: [],
-      });
-      this.pendingDispatches.set(job.id, {
-        prompt,
-        workerInput: { task: prompt } as any,
-        contextFiles: [],
-      });
-      return this.accepted(this.store.getJob(job.id) ?? job);
-    }
-
-    this.store.updateJobStatus(job.id, "running");
-    if (agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "working");
-    try {
-      await this.clientOrThrow().promptAsync(agent.opencodeSessionId, prompt, this.dispatchOptions(agent));
-      return this.accepted(this.store.getJob(job.id) ?? job);
-    } catch (error) {
-      const message = redactSecrets(String(error));
-      if (isUnknownDispatchOutcome(error)) {
-        // Same accepted dispatch_unknown contract as spawn/continue: the
-        // caller keeps the exact job id, the follow deadline/grace is armed so
-        // an unaccepted prompt cannot become immortal, and no second
-        // submission occurs while the job stays active.
-        this.store.markDispatchUnknown(job.id);
-        this.recordActivity(agent, this.store.getJob(job.id), "error", "Approval continuation outcome is unknown after a transport failure; the job stays active");
-        const pending = this.store.getJob(job.id) ?? job;
-        this.ensureFollowLifecycle(
-          pending,
-          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
-          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
-          true,
-        );
-        this.store.setJobError(job.id, "Approval continuation outcome unknown after a transport failure: " + message);
-        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
-      }
-      const current = this.store.getJob(job.id);
-      if (current?.status !== "needs_approval") {
-        this.clearApprovalTimer(agent.id);
-        this.store.setApprovalDeadline(job.id, null);
-        if (current && ["dispatching", "running", "following", "finalizing"].includes(current.status)) {
-          this.store.updateJobStatus(job.id, "failed", message);
-        }
-      }
-      const currentAgent = this.store.getAgent(agent.id);
-      if (current?.status !== "needs_approval" && currentAgent && currentAgent.status === "working") {
-        this.store.updateAgentStatus(agent.id, "failed", message);
-      }
-      throw new Error(message);
-    }
-  }
-
-  private async replyApproval(
-    agent: AgentRecord,
-    job: JobRecord,
-    permissionId: string,
-    reply: "once" | "always" | "reject",
-    message?: string,
-  ): Promise<AcceptedOperation> {
-    const current = this.store.getJob(job.id);
-    if (!current || current.status !== "needs_approval" || current.permissionId !== permissionId) {
-      throw new ConflictError("permissionId does not match the active approval request", "permission_mismatch");
-    }
-    this.clearApprovalTimer(agent.id);
-    this.store.setApprovalDeadline(job.id, null);
-
-    const activeCount = this.store.getActiveJobCount();
-    const availableCredits = this.targetCredits - activeCount;
-    const claimedResources = this.getActiveExclusiveResources();
-    const hasResourceConflict = (job.exclusiveResources ?? []).some((r) => claimedResources.has(r));
-
-    if (availableCredits <= 0 || hasResourceConflict) {
-      this.store.updateJobStatus(job.id, "queued");
-      const queuedAt = new Date().toISOString();
-      this.store.db.prepare("UPDATE jobs SET queued_at = ? WHERE id = ?").run(queuedAt, job.id);
-      const workerInput = {
-        permissionId,
-        permissionReply: reply,
-        permissionMessage: message,
-      };
-      this.store.saveDispatchEnvelope(job.id, {
-        prompt: "",
-        promptHash: hashPrompt(""),
-        workerInput,
-        contextFiles: [],
-      });
-      this.pendingDispatches.set(job.id, {
-        prompt: "",
-        workerInput: workerInput as any,
-        contextFiles: [],
-      });
-      return this.accepted(this.store.getJob(job.id) ?? job);
-    }
-
-    this.store.updateJobStatus(job.id, "running");
-    if (agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "working");
-    try {
-      await this.clientOrThrow().replyPermission(agent.opencodeSessionId, permissionId, reply, message);
-      const afterReply = this.store.getJob(job.id);
-      if (afterReply?.status === "running" && afterReply.permissionId === permissionId) {
-        this.store.setJobPermission(job.id, null);
-      }
-      return this.accepted(this.store.getJob(job.id) ?? job);
-    } catch (error) {
-      const errorText = redactSecrets(String(error));
-      if (isUnknownDispatchOutcome(error)) {
-        // Same accepted dispatch_unknown contract as resume: keep the exact
-        // job id, clear the answered permission like the success path, arm the
-        // follow deadline/grace, and prevent a second submission while the job
-        // stays active.
-        this.store.markDispatchUnknown(job.id);
-        const afterReply = this.store.getJob(job.id);
-        if (afterReply?.status === "running" && afterReply.permissionId === permissionId) {
-          this.store.setJobPermission(job.id, null);
-        }
-        this.recordActivity(agent, this.store.getJob(job.id), "error", "Permission reply outcome is unknown after a transport failure; the job stays active");
-        const pending = this.store.getJob(job.id) ?? job;
-        this.ensureFollowLifecycle(
-          pending,
-          this.followWindowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
-          this.followWindowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
-          true,
-        );
-        this.store.setJobError(job.id, "Permission reply outcome unknown after a transport failure: " + errorText);
-        return this.accepted(pending, { outcome: "dispatch_unknown", warning: DISPATCH_UNKNOWN_WARNING });
-      }
-      const current = this.store.getJob(job.id);
-      if (current?.status !== "needs_approval") {
-        this.clearApprovalTimer(agent.id);
-        this.store.setApprovalDeadline(job.id, null);
-        if (current && current.status !== "failed") this.store.updateJobStatus(job.id, "failed", errorText);
-      }
-      const currentAgent = this.store.getAgent(agent.id);
-      if (current?.status !== "needs_approval" && currentAgent && currentAgent.status !== "closed") {
-        this.store.updateAgentStatus(agent.id, "failed", errorText);
-      }
-      throw new Error(errorText);
-    }
-  }
-
-  private async handleEvent(event: OpenCodeEvent, retry: { sourceEventId?: string; attempt?: number } = {}): Promise<void> {
-    // High-volume streaming deltas never change job state and would bloat the
-    // event ledger and activity table; skip them while keeping meaningful
-    // activity and events.
-    if (event.type === "message.part.delta") return;
-    const sessionId = findSessionId(event.properties);
-    if (!sessionId) return;
-    const agent = this.store.getAgentBySession(sessionId);
-    if (!agent) return;
-    const attempt = retry.attempt ?? 0;
-    const observedJob = this.activeJob(agent.id);
-    const eventJob = observedJob ?? this.store.listJobs().find((job) => job.agentId === agent.id) ?? null;
-    const eventScope = eventJob?.id ?? "session";
-    const sourceEventId = retry.sourceEventId ?? (event.id
-      ? sessionId + ":" + event.id
-      : createHash("sha256").update(sessionId + ":" + eventScope + ":" + event.type + ":" + JSON.stringify(event.properties)).digest("hex"));
-    if (this.eventProcessing.has(sourceEventId)) return;
-    this.eventProcessing.add(sourceEventId);
-    const retryTimer = this.eventRetryTimers.get(sourceEventId);
-    if (retryTimer) clearTimeout(retryTimer);
-    this.eventRetryTimers.delete(sourceEventId);
-    try {
-      const inserted = this.store.insertEvent({
-        source: "opencode",
-        sourceEventId,
-        eventType: event.type,
-        sessionId,
-        jobId: eventJob?.id ?? null,
-      });
-      if (!inserted && this.store.isEventProcessed("opencode", sourceEventId)) return;
-      this.recordActivity(agent, observedJob, activityTypeForEvent(event), observableEventSummary(event));
-      if (observedJob) {
-        try {
-          this.store.updateJobLiveness(observedJob.id, {
-            heartbeatAt: new Date().toISOString(),
-          });
-        } catch {}
-      }
-      const status = findStatus(event.properties);
-      if (event.type === "session.error" || event.type.includes(".error")) {
-        await this.failActive(agent, redactSecrets(JSON.stringify(event.properties)));
-      } else if (isApprovalRequestEvent(event.type, event.properties)) {
-        await this.markNeedsApproval(agent, event.properties);
-      } else if (event.type === "session.idle" || status === "idle") {
-        await this.completeActive(agent);
-      }
-      this.store.markEventProcessed("opencode", sourceEventId);
-    } catch (error) {
-      this.lastStreamError = redactSecrets(String(error));
-      if (this.running && attempt < 3) this.scheduleEventRetry(event, sourceEventId, attempt + 1);
-    } finally {
-      this.eventProcessing.delete(sourceEventId);
-    }
-  }
-
-  private scheduleEventRetry(event: OpenCodeEvent, sourceEventId: string, attempt: number): void {
-    const previous = this.eventRetryTimers.get(sourceEventId);
-    if (previous) clearTimeout(previous);
-    const delayMs = attempt === 1 ? 100 : attempt === 2 ? 500 : 2_000;
-    const timer = setTimeout(() => {
-      this.eventRetryTimers.delete(sourceEventId);
-      void this.handleEvent(event, { sourceEventId, attempt }).catch((error) => {
-        this.lastStreamError = redactSecrets(String(error));
-      });
-    }, delayMs);
-    timer.unref?.();
-    this.eventRetryTimers.set(sourceEventId, timer);
-  }
-
-  private async completeActive(agent: AgentRecord): Promise<void> {
-    const job = this.activeJob(agent.id);
-    if (!job || job.status === "needs_approval") return;
-    const client = this.clientOrThrow();
-    const messages = await client.listMessages(agent.opencodeSessionId);
-    const diff = await client.getDiff(agent.opencodeSessionId);
-    const currentAgent = this.store.getAgent(agent.id) ?? agent;
-    const currentJob = this.store.getJob(job.id) ?? job;
-    const assistants = messages.filter((message) => message.info?.role === "assistant");
-    const baselineAssistantId = currentJob.lastAssistantMessageId ?? null;
-    const baselineIndex = baselineAssistantId
-      ? assistants.findIndex((message) => message.info?.id === baselineAssistantId)
-      : -1;
-    const relevantAssistants = baselineAssistantId === null
-      ? assistants
-      : baselineIndex < 0
-        ? []
-        : assistants.slice(baselineIndex + 1);
-    const assistantWithError = relevantAssistants.find((m) => m.info?.error != null);
-    if (assistantWithError) {
-      const errorDetail = formatAssistantError(assistantWithError.info!.error);
-      await this.failJob(currentJob, agent, errorDetail);
-      return;
-    }
-    const latestAssistantId = latestAssistantMessageId(messages);
-    if (currentJob.lastAssistantMessageId && (!latestAssistantId || latestAssistantId === currentJob.lastAssistantMessageId)) return;
-    if (!assistantTextAfterBaseline(messages, currentJob.lastAssistantMessageId).hasText) {
-      // Idle with no non-empty assistant text (tool-only or reasoning-only
-      // tails included) must never become a usable completed success. Leave
-      // the job active so the follow deadline, reconciliation or a later
-      // event settles it fail-closed.
-      if (currentJob.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-      this.recordActivity(agent, this.store.getJob(job.id), "event", "OpenCode session became idle without non-empty assistant output; the job remains active");
-      return;
-    }
-    const partial = currentJob.status === "finalizing" || currentJob.gracefulFinalizeAttempted;
-    if (currentJob.status === "dispatching") this.store.updateJobStatus(job.id, "running");
-    if (currentJob.fallbackTo) {
-      this.store.updateJobFallbackStatus(job.id, "succeeded");
-    }
-    const jobToPersist = this.store.getJob(job.id) ?? currentJob;
-    const stored = await persistResult(this.config.dataDir, currentAgent, jobToPersist, messages, diff, this.config.maxResultLength, {
-      ...(partial ? {
-        statusOverride: "completed_partial",
-        deadlineReached: true,
-        gracefulFinalize: true,
-        partial: true,
-      } : {}),
-    });
-
-    const capturedFence = currentJob.fence ?? job.fence ?? 1;
-    try {
-      this.store.setJobMessages(job.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
-      this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
-      if (stored.envelope.earlyExit?.triggered) {
-        this.store.setJobEarlyExit(job.id, {
-          earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
-          reason: stored.envelope.earlyExit.reason,
-        }, capturedFence);
-      }
-      if (stored.envelope.escalation) {
-        this.store.setJobEscalation(job.id, JSON.stringify(stored.envelope.escalation), capturedFence);
-      }
-      const completedJob = this.store.getJob(job.id) ?? job;
-      if (["running", "following", "finalizing"].includes(completedJob.status)) {
-        this.store.updateJobStatus(job.id, partial ? "completed_partial" : "completed", null, capturedFence);
-      }
-      const completedAgent = this.store.getAgent(agent.id) ?? agent;
-      if (completedAgent.status === "working") this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
-      this.recordActivity(agent, this.store.getJob(job.id), "result", partial ? "Graceful finalization produced a partial result" : "OpenCode session became idle and the result was persisted");
-      this.recordTerminalSuccess(job.id);
-      this.onJobSettled(job.id, job.batchId);
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, {
-          status: partial ? "completed_partial" : "completed",
-          deadlineReached: partial,
-          gracefulFinalize: partial,
-          partial,
-          resultAvailable: true,
-          envelope: stored.envelope,
-        });
-      }
-      const deliveryJob = this.store.getJob(job.id) ?? job;
-      if (["completed", "completed_partial"].includes(deliveryJob.status)) this.store.updateJobStatus(job.id, "delivery_pending", null, capturedFence);
-      await this.deliverEnvelope(stored.envelope, this.store.getJob(job.id) ?? job);
-    } catch (err) {
-      if (err instanceof ConflictError) {
-        this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale session completion rejected by fence check: " + err.message);
-        return;
-      }
-      throw err;
     }
   }
 
@@ -4878,143 +4082,12 @@ export class BridgeService {
     }
   }
 
-  private async reconcileJob(job: JobRecord, options: { fromRecovery?: boolean } = {}): Promise<void> {
-    return this.withAgentOperationLock("reconcile:" + job.id, async () => {
-      const currentJob = this.store.getJob(job.id) ?? job;
-      if (currentJob.resultPath || TERMINAL_JOB_STATUSES.has(currentJob.status) || currentJob.status === "delivery_pending") {
-        return;
-      }
-      const agent = this.store.getAgent(currentJob.agentId);
-      if (!agent || !this.client) return;
-      if (agent.modelProviderId === "antigravity") return;
-
-      let messages: OpenCodeMessage[];
-      try {
-        messages = await this.client.listMessages(agent.opencodeSessionId);
-      } catch (error) {
-        if (isSessionAbsentError(error)) {
-          await this.failJob(currentJob, agent, "OpenCode session absent (404): " + redactSecrets(String(error)));
-          return;
-        }
-        this.lastStreamError = redactSecrets(String(error));
-        this.store.markDispatchUnknown(currentJob.id);
-        this.recordActivity(agent, currentJob, "error", "Reconciliation error: " + redactSecrets(String(error)));
-        return;
-      }
-
-      const assistants = messages.filter((message) => message.info?.role === "assistant");
-      const baselineAssistantId = currentJob.lastAssistantMessageId ?? null;
-      const baselineIndex = baselineAssistantId
-        ? assistants.findIndex((message) => message.info?.id === baselineAssistantId)
-        : -1;
-      const relevantAssistants = baselineAssistantId === null
-        ? assistants
-        : baselineIndex < 0
-          ? []
-          : assistants.slice(baselineIndex + 1);
-
-      // Contract 2: info.error on the relevant assistant message is authoritative failure
-      const assistantWithError = relevantAssistants.find((m) => m.info?.error != null);
-      if (assistantWithError) {
-        const errorDetail = formatAssistantError(assistantWithError.info!.error);
-        await this.failJob(currentJob, agent, errorDetail);
-        return;
-      }
-
-      // Contract 1: OpenCode assistant text is streaming unless the newest relevant assistant message has a non-empty terminal info.finish value
-      const newestAssistant = relevantAssistants.at(-1);
-      const finish = newestAssistant?.info?.finish;
-      const hasTerminalFinish = typeof finish === "string" && finish.trim().length > 0;
-
-      if (relevantAssistants.length === 0 || !hasTerminalFinish) {
-        if (options.fromRecovery) {
-          this.store.markDispatchUnknown(currentJob.id);
-          this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "event", "Startup recovery retained active job with streaming assistant message");
-        }
-        return;
-      }
-
-      // Contract 1 & 3: terminal finish value completes exactly once
-      const textOutput = assistantTextAfterBaseline(messages, baselineAssistantId);
-      if (!textOutput.hasText) {
-        if (currentJob.status === "dispatching") this.store.updateJobStatus(currentJob.id, "running");
-        this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "event", "OpenCode session finished without non-empty assistant output; the job remains active");
-        return;
-      }
-
-      const diff = await this.client.getDiff(agent.opencodeSessionId).catch(() => "");
-      const currentAgent = this.store.getAgent(agent.id) ?? agent;
-      const partial = currentJob.status === "finalizing" || currentJob.gracefulFinalizeAttempted;
-      if (currentJob.status === "dispatching") this.store.updateJobStatus(currentJob.id, "running");
-      if (currentJob.fallbackTo) {
-        this.store.updateJobFallbackStatus(currentJob.id, "succeeded");
-      }
-      const jobToPersist = this.store.getJob(currentJob.id) ?? currentJob;
-      const stored = await persistResult(this.config.dataDir, currentAgent, jobToPersist, messages, diff, this.config.maxResultLength, {
-        ...(partial ? {
-          statusOverride: "completed_partial",
-          deadlineReached: true,
-          gracefulFinalize: true,
-          partial: true,
-        } : {}),
-      });
-
-      const capturedFence = currentJob.fence ?? job.fence ?? 1;
-      try {
-        this.store.setJobMessages(currentJob.id, stored.parsed.userMessageId, stored.parsed.assistantMessageId);
-        this.store.setJobResult(currentJob.id, stored.resultPath, stored.envelope.summary, capturedFence);
-        if (stored.envelope.earlyExit?.triggered) {
-          this.store.setJobEarlyExit(currentJob.id, {
-            earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
-            reason: stored.envelope.earlyExit.reason,
-          }, capturedFence);
-        }
-        if (stored.envelope.escalation) {
-          this.store.setJobEscalation(currentJob.id, JSON.stringify(stored.envelope.escalation), capturedFence);
-        }
-        const completedJob = this.store.getJob(currentJob.id) ?? currentJob;
-        if (["running", "following", "finalizing"].includes(completedJob.status)) {
-          this.store.updateJobStatus(currentJob.id, partial ? "completed_partial" : "completed", null, capturedFence);
-        }
-        const completedAgent = this.store.getAgent(agent.id) ?? agent;
-        if (completedAgent.status === "working") {
-          this.store.updateAgentStatus(agent.id, partial ? "completed_partial" : "completed");
-        }
-        this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "result", partial ? "Graceful finalization produced a partial result" : "Reconciled terminal assistant completion");
-        this.recordTerminalSuccess(currentJob.id);
-        this.onJobSettled(currentJob.id, currentJob.batchId);
-        if (this.followLifecycles.has(currentJob.id)) {
-          await this.resolveFollow(currentJob.id, {
-            status: partial ? "completed_partial" : "completed",
-            deadlineReached: partial,
-            gracefulFinalize: partial,
-            partial,
-            resultAvailable: true,
-            envelope: stored.envelope,
-          });
-        }
-        const deliveryJob = this.store.getJob(currentJob.id) ?? currentJob;
-        if (deliveryJob && ["completed", "completed_partial"].includes(deliveryJob.status)) {
-          this.store.updateJobStatus(currentJob.id, "delivery_pending", null, capturedFence);
-        }
-        const pending = this.store.getJob(currentJob.id);
-        if (pending) await this.deliverEnvelope(stored.envelope, pending);
-      } catch (err) {
-        if (err instanceof ConflictError) {
-          this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "error", "Stale session completion rejected by fence check: " + err.message);
-          return;
-        }
-        throw err;
-      }
-    });
-  }
-
   private async recoverPendingJobs(): Promise<void> {
     for (const job of this.store.recoverPendingJobs()) {
-      if (job.status === "queued") {
-        continue;
-      }
       const agent = this.store.getAgent(job.agentId);
+
+      // A persisted result is authoritative even when its original provider
+      // is retired; recovery only reads and delivers the durable envelope.
       if (job.resultPath) {
         if (job.status === "dispatching" || job.status === "needs_approval") {
           this.store.updateJobStatus(job.id, "running");
@@ -5034,61 +4107,47 @@ export class BridgeService {
         }
         continue;
       }
-      if (agent?.modelProviderId === "antigravity" && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
-        if (agent.opencodeSessionId && !agent.opencodeSessionId.startsWith("antigravity:")) {
-          await this.reconcileJob(job, { fromRecovery: true }).catch((error) => {
-            this.lastStreamError = redactSecrets(String(error));
-          });
-          continue;
-        }
+
+      if (agent && !isActiveAntigravityAgent(agent)) {
+        await this.failRetiredProviderJob(job, agent).catch((error) => {
+          this.lastStreamError = redactSecrets(String(error));
+        });
+        continue;
+      }
+
+      // Queued Antigravity work is left for the normal scheduler. No provider
+      // session is created or contacted during startup recovery.
+      if (job.status === "queued") {
+        continue;
+      }
+
+      if (!agent) {
+        continue;
+      }
+
+      if (job.status === "needs_approval") {
+        const message = "Antigravity does not expose resumable provider approval sessions; the job failed closed";
+        await this.failJob(job, agent, message).catch((error) => {
+          this.lastStreamError = redactSecrets(String(error));
+        });
+        continue;
+      }
+
+      if (isActiveAntigravityAgent(agent) && ["dispatching", "running", "following", "finalizing"].includes(job.status)) {
         await this.recoverAntigravityJob(agent, job).catch((error) => {
           this.lastStreamError = redactSecrets(String(error));
         });
         continue;
       }
-      if (["dispatching", "running"].includes(job.status)) {
-        try {
-          await this.reconcileJob(job, { fromRecovery: true });
-        } catch (error) {
-          const message = redactSecrets(String(error));
-          this.lastStreamError = message;
-          if (isSessionAbsentError(error)) {
-            if (agent) {
-              await this.failJob(job, agent, "OpenCode session absent (404): " + message).catch(() => undefined);
-            }
-          } else {
-            this.store.markDispatchUnknown(job.id);
-            if (agent) {
-              this.recordActivity(agent, job, "error", "Recovery unknown reconciliation outcome: " + message);
-            }
-          }
-        }
-      } else if (["following", "finalizing"].includes(job.status)) {
+
+      if (["following", "finalizing"].includes(job.status)) {
         this.ensureFollowLifecycle(
           job,
           normalizeFollowMinutes(undefined, 1, 60, this.config.followDefaultWaitMinutes),
           normalizeFollowMinutes(undefined, 1, 10, this.config.followDefaultGraceMinutes),
         );
-      } else if (job.status === "timed_out" && !job.resultPath) {
-        const agent = this.store.getAgent(job.agentId);
-        if (agent) {
-          const stored = await this.captureTimedOutEvidence(agent, job);
-          const current = this.store.getJob(job.id);
-          if (stored && current?.status === "timed_out" && current.resultPath) {
-            this.store.updateJobStatus(job.id, "delivery_pending");
-            const pending = this.store.getJob(job.id);
-            if (pending) await this.deliverPersistedJob(pending).catch((error) => {
-              this.lastStreamError = redactSecrets(String(error));
-            });
-          }
-        }
       } else if (job.status === "delivery_pending") {
         await this.deliverPersistedJob(job).catch((error) => {
-          this.lastStreamError = redactSecrets(String(error));
-        });
-      } else if (job.status === "needs_approval") {
-        const agent = this.store.getAgent(job.agentId);
-        if (agent) await this.markNeedsApproval(agent, { permissionID: job.permissionId }).catch((error) => {
           this.lastStreamError = redactSecrets(String(error));
         });
       }
@@ -5147,14 +4206,14 @@ export class BridgeService {
   private async failJob(job: JobRecord, agent: AgentRecord, error: string): Promise<void> {
     const currentJob = this.store.getJob(job.id) ?? job;
     if (TERMINAL_JOB_STATUSES.has(currentJob.status)) return;
-    this.clearApprovalTimer(agent.id);
     this.store.setApprovalDeadline(currentJob.id, null);
+    this.store.setJobPermission(currentJob.id, null);
     this.store.updateJobStatus(currentJob.id, "failed", error);
     const currentAgent = this.store.getAgent(agent.id);
     if (currentAgent && currentAgent.status !== "closed") {
       this.store.updateAgentStatus(agent.id, "failed", error);
     }
-    this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "error", "OpenCode reported a terminal error: " + error);
+    this.recordActivity(agent, this.store.getJob(currentJob.id) ?? currentJob, "error", "Antigravity job failed: " + error);
     this.onJobSettled(currentJob.id, currentJob.batchId);
     if (this.followLifecycles.has(currentJob.id)) {
       await this.resolveFollow(currentJob.id, { status: "failed", error });
@@ -5164,138 +4223,37 @@ export class BridgeService {
     });
   }
 
-  private async failActive(agent: AgentRecord, error: string): Promise<void> {
-    const job = this.activeJob(agent.id);
-    if (!job) return;
-    await this.failJob(job, agent, error);
-  }
-
-  private async markNeedsApproval(agent: AgentRecord, properties: Record<string, unknown> = {}): Promise<void> {
-    const job = this.activeJob(agent.id);
-    if (!job) return;
-    this.clearJobInactivityTimer(job.id);
+  private async failRetiredProviderJob(job: JobRecord, agent: AgentRecord): Promise<ConflictError> {
+    const current = this.store.getJob(job.id) ?? job;
+    const message = RETIRED_PROVIDER_MESSAGE + ". Job " + job.id + " was not sent to the historical session.";
+    if (!TERMINAL_JOB_STATUSES.has(current.status) && current.status !== "failed") {
+      this.store.updateJobStatus(current.id, "failed", message, current.fence ?? undefined);
+    }
     const currentAgent = this.store.getAgent(agent.id);
-    const alreadyNeedsApproval = job.status === "needs_approval";
-    const currentJob = this.store.getJob(job.id) ?? job;
-    const requestedPermissionId = findPermissionId(properties);
-    const permissionId = requestedPermissionId ?? currentJob.permissionId;
-    const permissionChanged = requestedPermissionId !== null && requestedPermissionId !== currentJob.permissionId;
-    const approvalDeadline = permissionChanged
-      ? Date.now() + this.config.approvalTimeoutMs
-      : parseTimestamp(currentJob.approvalDeadlineAt) ?? Date.now() + this.config.approvalTimeoutMs;
-    this.store.setApprovalDeadline(job.id, new Date(approvalDeadline).toISOString());
-    if (["dispatching", "running", "following", "finalizing"].includes(job.status)) this.store.updateJobStatus(job.id, "needs_approval");
-    if (permissionId) this.store.setJobPermission(job.id, permissionId);
-    if (currentAgent?.status === "working") this.store.updateAgentStatus(agent.id, "needs_approval");
-    const approvalNoticeExists = await this.inbox.noticeExists(job.id, "needs_approval", permissionId);
-    if (!approvalNoticeExists) {
-      this.recordActivity(agent, this.store.getJob(job.id), "approval", "OpenCode requested explicit approval before continuing");
+    if (currentAgent && currentAgent.status !== "closed" && currentAgent.status !== "aborted" && currentAgent.status !== "failed") {
+      this.store.updateAgentStatus(agent.id, "failed", message);
     }
-    if (this.followLifecycles.has(job.id) && !alreadyNeedsApproval) {
-      await this.resolveFollow(job.id, {
-        status: "needs_approval",
-        permissionId,
-        message: "DeepSeek requires explicit approval before continuing.",
-      });
+    this.recordActivity(agent, this.store.getJob(current.id) ?? current, "error", "Retired provider session was not contacted; the job failed closed");
+    this.store.deleteDispatchEnvelope(current.id);
+    this.pendingDispatches.delete(current.id);
+    const waiter = this.dispatchWaiters.get(current.id);
+    if (waiter) {
+      this.dispatchWaiters.delete(current.id);
+      waiter.reject(new ConflictError(message, "not_continuable"));
     }
-    this.store.clearFollowWindow(job.id);
-    if (!approvalNoticeExists) {
-      await this.inbox.writeNotice({
-        kind: "needs_approval",
-        agentId: agent.id,
-        jobId: job.id,
-        topic: agent.topic,
-        message: "OpenCode requested approval. Review the task and use deepseek_continue for an explicit response.",
-        permissionId,
-      });
-    }
-    this.scheduleApprovalTimer(agent.id, job.id, approvalDeadline);
-    await this.evaluateParkWakes(job.id);
-  }
-
-  private clearApprovalTimer(agentId: string): void {
-    const timer = this.approvalTimers.get(agentId);
-    if (timer) clearTimeout(timer);
-    this.approvalTimers.delete(agentId);
-  }
-
-  private scheduleApprovalTimer(agentId: string, jobId: string, deadlineAt: number): void {
-    this.clearApprovalTimer(agentId);
-    const timer = setTimeout(() => {
-      void this.expireApproval(agentId, jobId);
-    }, Math.max(0, deadlineAt - Date.now()));
-    timer.unref?.();
-    this.approvalTimers.set(agentId, timer);
-  }
-
-  private async expireApproval(agentId: string, jobId: string): Promise<void> {
-    this.approvalTimers.delete(agentId);
-    const job = this.store.getJob(jobId);
-    if (!job || job.status !== "needs_approval") return;
-    const expiringPermissionId = job.permissionId;
-    const deadlineAt = parseTimestamp(job.approvalDeadlineAt);
-    if (deadlineAt !== null && deadlineAt > Date.now()) {
-      this.scheduleApprovalTimer(agentId, jobId, deadlineAt);
-      return;
-    }
-    const agentBeforeAbort = this.store.getAgent(agentId);
-    let abortError: string | null = null;
-    if (agentBeforeAbort) {
-      try {
-        await this.clientOrThrow().abort(agentBeforeAbort.opencodeSessionId);
-      } catch (error) {
-        abortError = redactSecrets(String(error));
-      }
-    }
-    const current = this.store.getJob(jobId);
-    if (!current || current.status !== "needs_approval") return;
-    if (current.permissionId !== expiringPermissionId) {
-      const persistedDeadlineAt = parseTimestamp(current.approvalDeadlineAt);
-      const effectiveDeadlineAt = persistedDeadlineAt !== null && persistedDeadlineAt > Date.now()
-        ? persistedDeadlineAt
-        : Date.now() + this.config.approvalTimeoutMs;
-      if (persistedDeadlineAt === null || persistedDeadlineAt <= Date.now()) {
-        this.store.setApprovalDeadline(current.id, new Date(effectiveDeadlineAt).toISOString());
-      }
-      this.scheduleApprovalTimer(agentId, jobId, effectiveDeadlineAt);
-      return;
-    }
-    const currentDeadlineAt = parseTimestamp(current.approvalDeadlineAt);
-    if (currentDeadlineAt !== null && currentDeadlineAt > Date.now()) {
-      this.scheduleApprovalTimer(agentId, jobId, currentDeadlineAt);
-      return;
-    }
-    this.store.setApprovalDeadline(current.id, null);
-    const failure = abortError ? "Approval timeout expired; remote abort failed: " + abortError : "Approval timeout expired";
-    this.store.updateJobStatus(current.id, "failed", failure);
-    const agent = this.store.getAgent(agentId);
-    if (agent && agent.status === "needs_approval") this.store.updateAgentStatus(agent.id, "failed", failure);
-    if (agent) this.recordActivity(agent, current, "error", abortError ? "Approval expired and OpenCode abort failed" : "Approval expired and the active worker was aborted");
+    this.clearJobInactivityTimer(current.id);
     this.onJobSettled(current.id, current.batchId);
     if (this.followLifecycles.has(current.id)) {
-      await this.resolveFollow(current.id, { status: "failed", error: failure });
+      await this.resolveFollow(current.id, { status: "failed", error: message });
     }
     await this.evaluateParkWakes(current.id).catch((error: unknown) => {
       this.lastStreamError = redactSecrets(String(error));
     });
-    await this.inbox.writeNotice({
-      kind: "approval_timeout",
-      agentId,
-      jobId,
-      topic: agent?.topic ?? "DeepSeek task",
-      message: "The approval window expired. Start an explicit continuation if the work is still needed.",
-      permissionId: current.permissionId,
-    });
+    return new ConflictError(message, "not_continuable");
   }
 
   private activeJob(agentId: string): JobRecord | null {
     return this.store.listJobs().find((job) => job.agentId === agentId && ACTIVE_JOB_STATUSES.has(job.status)) ?? null;
-  }
-
-  private previousAssistantMessageId(agentId: string, currentJobId: string): string | null {
-    return this.store.listJobs()
-      .find((job) => job.agentId === agentId && job.id !== currentJobId && typeof job.lastAssistantMessageId === "string")
-      ?.lastAssistantMessageId ?? null;
   }
 
   private accepted(job: JobRecord, extra: { outcome?: "dispatch_unknown"; warning?: string } = {}): AcceptedOperation {
@@ -5309,7 +4267,7 @@ export class BridgeService {
       topic: agent.topic,
       modelDisplayName: this.resolveAgentRoute(agent).display,
       state: "Starting",
-      message: extra.warning ?? "DeepSeek Sub-Agent accepted the task and will report asynchronously.",
+      message: extra.warning ?? "Antigravity Gemini accepted the task and will report asynchronously.",
       ...(extra.outcome ? { outcome: extra.outcome } : {}),
       ...(job.priority !== undefined && job.priority !== null ? { priority: job.priority } : {}),
       ...(job.exclusiveResources !== undefined && job.exclusiveResources !== null ? { exclusiveResources: job.exclusiveResources } : {}),
@@ -5703,18 +4661,9 @@ export class BridgeService {
     }
   }
 
-  private clientOrThrow(): OpenCodeClientLike {
-    if (!this.client) throw new Error("Bridge daemon is not started");
-    return this.client;
-  }
-
   private requireRunning(): void {
-    if (!this.running || !this.client) throw new Error("Bridge daemon is not started");
+    if (!this.running) throw new Error("Bridge daemon is not started");
   }
-}
-
-function jobAgentSession(agent: AgentRecord): string {
-  return agent.opencodeSessionId;
 }
 
 /**
@@ -5781,48 +4730,6 @@ export function computeBatchHash(items: BatchItemInput[]): string {
 
 function hashPrompt(prompt: string): string {
   return createHash("sha256").update(prompt, "utf8").digest("hex");
-}
-
-function latestAssistantMessageId(messages: OpenCodeMessage[]): string | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.info?.role !== "assistant") continue;
-    return typeof message.info.id === "string" ? message.info.id : null;
-  }
-  return null;
-}
-
-function findSessionId(properties: Record<string, unknown>): string | null {
-  for (const key of ["sessionID", "sessionId", "session_id"]) {
-    if (typeof properties[key] === "string") return properties[key] as string;
-  }
-  return null;
-}
-
-function findStatus(properties: Record<string, unknown>): string | null {
-  const direct = properties.status;
-  if (typeof direct === "string") return direct;
-  if (direct && typeof direct === "object") {
-    const type = (direct as Record<string, unknown>).type;
-    return typeof type === "string" ? type : null;
-  }
-  return null;
-}
-
-function findPermissionId(properties: Record<string, unknown>): string | null {
-  for (const key of ["permissionID", "permissionId", "permission_id", "requestID", "requestId"]) {
-    if (typeof properties[key] === "string" && properties[key]) return properties[key] as string;
-  }
-  for (const key of ["permission", "request"]) {
-    const nested = properties[key];
-    if (nested && typeof nested === "object") {
-      const nestedRecord = nested as Record<string, unknown>;
-      if (typeof nestedRecord.id === "string" && nestedRecord.id) return nestedRecord.id;
-      const found = findPermissionId(nestedRecord);
-      if (found) return found;
-    }
-  }
-  return null;
 }
 
 function normalizeActivityLimit(value: number | undefined): number {
@@ -5895,56 +4802,6 @@ function isBusyError(error: unknown): boolean {
   return message.includes("busy") || message.includes("already running") || message.includes("active turn") || message.includes("conflict");
 }
 
-function isUnknownDispatchOutcome(error: unknown): boolean {
-  // A transport/timeout failure means the prompt may still have been accepted
-  // server-side; a definite HTTP rejection means it was not.
-  return error instanceof OpenCodeTransportError;
-}
-
-function formatAssistantError(error: unknown): string {
-  if (typeof error === "string") return redactSecrets(error);
-  if (error && typeof error === "object") {
-    const obj = error as Record<string, unknown>;
-    const code = typeof obj.code === "string" ? obj.code : null;
-    const message = typeof obj.message === "string" ? obj.message : typeof obj.error === "string" ? obj.error : null;
-    if (code && message) return redactSecrets(`[${code}] ${message}`);
-    if (message) return redactSecrets(message);
-    if (code) return redactSecrets(code);
-    try {
-      return redactSecrets(JSON.stringify(error));
-    } catch {
-      return redactSecrets(String(error));
-    }
-  }
-  return redactSecrets(String(error));
-}
-
-function isSessionAbsentError(error: unknown): boolean {
-  if (error instanceof OpenCodeHttpError && error.status === 404) return true;
-  const status = typeof (error as any)?.status === "number"
-    ? (error as any).status
-    : typeof (error as any)?.statusCode === "number"
-      ? (error as any).statusCode
-      : undefined;
-  if (status === 404) return true;
-  const message = redactSecrets(String(error)).toLowerCase();
-  return message.includes("404") || message.includes("session not found") || message.includes("unknown session") || message.includes("session absent");
-}
-
-function activityTypeForEvent(event: OpenCodeEvent): Parameters<BridgeStore["recordActivity"]>[0]["activityType"] {
-  if (isApprovalRequestEvent(event.type, event.properties)) return "approval";
-  if (event.type.includes("error")) return "error";
-  if (event.type === "session.idle") return "result";
-  return "event";
-}
-
-function observableEventSummary(event: OpenCodeEvent): string {
-  if (isApprovalRequestEvent(event.type, event.properties)) return "OpenCode emitted an approval request";
-  if (event.type.includes("error")) return "OpenCode emitted an error event";
-  if (event.type === "session.idle") return "OpenCode emitted session.idle";
-  return "OpenCode emitted observable event " + truncate(event.type, 120);
-}
-
 function deriveSemanticProgress(
   activities: AgentActivity[],
   job: JobRecord | null,
@@ -6007,17 +4864,6 @@ function deriveSemanticProgress(
     ...(diagnosticEvidence ? { diagnosticEvidence } : {}),
     ...(isStalled ? { suspected: true } : {}),
   };
-}
-
-function isApprovalRequestEvent(type: string, properties: Record<string, unknown>): boolean {
-  const normalized = type.toLowerCase();
-  if (!normalized.includes("permission") && !normalized.includes("approval")) return false;
-  if (/(?:^|[._-])(replied|updated|resolved|responded|granted|denied|rejected|cancelled|closed)(?:$|[._-])/.test(normalized)) return false;
-  return normalized === "permission.asked"
-    || normalized === "permission.requested"
-    || normalized === "approval.asked"
-    || normalized === "approval.requested"
-    || findPermissionId(properties) !== null;
 }
 
 async function ensureDirectory(directory: string): Promise<void> {

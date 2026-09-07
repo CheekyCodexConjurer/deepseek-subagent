@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BridgeStore } from "../../src/store.js";
 import { BridgeService } from "../../src/service.js";
 import { createDefaultConfig } from "../../src/config.js";
+import { AntigravitySpool } from "../../src/antigravity/spool.js";
 import { DEFAULT_CODEX_CAPABILITIES, type CodexBinding, type CodexDeliveryAdapter } from "../../src/codex/adapter.js";
 import type { AgentRecord, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, WakeEnvelope } from "../../src/types.js";
 import { ConflictError } from "../../src/errors.js";
@@ -69,12 +70,12 @@ function fixtureAgent(agentId: string): AgentRecord {
     repositoryRoot: "C:\\work",
     workspacePath: "C:\\work",
     workspaceStrategy: "shared",
-    opencodeServerId: "server_test",
-    opencodeSessionId: "session_" + agentId,
-    modelProviderId: "opencode-go",
-    modelId: "deepseek-v4-flash",
-    modelVariant: "max",
-    modelRoute: "flash-max",
+    opencodeServerId: "antigravity",
+    opencodeSessionId: "antigravity:" + agentId,
+    modelProviderId: "antigravity",
+    modelId: "gemini-3.8-flash-high",
+    modelVariant: null,
+    modelRoute: "antigravity-flash-high",
     parentAgentId: null,
     status: "working",
     createdAt: now,
@@ -188,6 +189,28 @@ test("no heartbeat counts as work: fresh supervisor heartbeat separates from job
     const heartbeatAt = new Date(Date.now() - 2 * 1000).toISOString();
     store.db.prepare("UPDATE jobs SET started_at = ?, heartbeat_at = ?, worker_pid = ?, attempt = ?, fence = ? WHERE id = ?")
       .run(startedAt, heartbeatAt, process.pid, "attempt_simulated", 2, job.id);
+
+    const spool = new AntigravitySpool(directory);
+    const attemptDir = spool.attemptDir(job.id, "attempt_simulated");
+    await mkdir(attemptDir, { recursive: true });
+    await writeFile(path.join(attemptDir, "manifest.json"), JSON.stringify({
+      schemaVersion: 1,
+      attemptId: "attempt_simulated",
+      jobId: job.id,
+      agentId: agent.id,
+      requestId: job.requestId,
+      createdAt: startedAt,
+      cwd: directory,
+      heartbeatPath: path.join(attemptDir, "heartbeat.json"),
+      attemptDir,
+    }));
+    await spool.writeHeartbeat(attemptDir, {
+      nonce: "test_nonce",
+      supervisorPid: process.pid,
+      agyPid: process.pid,
+      updatedAt: Date.now() - 2 * 1000,
+      timestamp: heartbeatAt,
+    });
 
     const snapshot = await service.consult({
       agentId: agent.id,

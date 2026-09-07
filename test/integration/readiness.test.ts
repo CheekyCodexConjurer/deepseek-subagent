@@ -7,20 +7,7 @@ import path from "node:path";
 import { createDefaultConfig } from "../../src/config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer } from "../../src/http-server.js";
 import { BridgeStore } from "../../src/store.js";
-import { BridgeService, type ManagedOpenCodeLike, type OpenCodeManagerLike } from "../../src/service.js";
-import { InboxDelivery } from "../../src/delivery/inbox.js";
-import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage } from "../../src/types.js";
-
-class FakeInbox extends InboxDelivery {
-  delivered: string[] = [];
-  constructor(directory: string) {
-    super(directory, async () => undefined);
-  }
-  override async deliver(envelope: { jobId: string }): Promise<string> {
-    this.delivered.push(envelope.jobId);
-    return "fake://" + envelope.jobId;
-  }
-}
+import { BridgeService } from "../../src/service.js";
 
 async function freePort(): Promise<number> {
   const probe = createServer();
@@ -34,67 +21,9 @@ async function freePort(): Promise<number> {
   });
 }
 
-class FakeClient implements OpenCodeClientLike {
-  sessionCount = 0;
-  promptCalls: Array<{ sessionId: string; task: string }> = [];
-  messages: OpenCodeMessage[] = [];
-  private onEvent: ((event: OpenCodeEvent) => Promise<void> | void) | null = null;
-  private waiters: Array<() => void> = [];
-
-  async health(): Promise<{ healthy: boolean; version?: string }> {
-    return { healthy: true, version: "fake" };
-  }
-  async createSession(): Promise<{ id: string }> {
-    this.sessionCount += 1;
-    return { id: "session_" + this.sessionCount };
-  }
-  async promptAsync(sessionId: string, task: string): Promise<void> {
-    this.promptCalls.push({ sessionId, task });
-  }
-  async listMessages(): Promise<OpenCodeMessage[]> {
-    return this.messages;
-  }
-  async getDiff(): Promise<unknown> {
-    return [];
-  }
-  async abort(): Promise<void> {}
-  async replyPermission(): Promise<void> {}
-  async subscribe(onEvent: (event: OpenCodeEvent) => Promise<void> | void, signal?: AbortSignal): Promise<void> {
-    this.onEvent = onEvent;
-    await new Promise<void>((resolve) => {
-      this.waiters.push(resolve);
-      signal?.addEventListener("abort", () => resolve(), { once: true });
-    });
-  }
-  async emit(event: OpenCodeEvent): Promise<void> {
-    await this.onEvent?.(event);
-  }
-}
-
-class FakeManager implements OpenCodeManagerLike {
-  constructor(private readonly client: FakeClient, private readonly startDelayMs = 0, private readonly shouldFail = false) {}
-  async start(): Promise<ManagedOpenCodeLike> {
-    if (this.startDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.startDelayMs));
-    }
-    if (this.shouldFail) {
-      throw new Error("OpenCode failed to start (simulated error)");
-    }
-    return {
-      serverId: "server_fake",
-      baseUrl: "http://127.0.0.1:1",
-      client: this.client,
-      processId: null,
-      stop: async () => undefined,
-    };
-  }
-  async stop(): Promise<void> {}
-}
-
 test("Phase 1: daemon binds socket before recovery, /health reports lifecycle state, and non-health tool endpoints return 503 while starting", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-phase1-readiness-"));
   const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
   const port = await freePort();
   const config = createDefaultConfig({
     daemonHost: "127.0.0.1",
@@ -105,12 +34,15 @@ test("Phase 1: daemon binds socket before recovery, /health reports lifecycle st
     retentionMode: "auto",
   });
 
-  // Delayed manager startup simulates slow recovery
-  const manager = new FakeManager(client, 150);
   const service = new BridgeService(config, {
     store,
-    manager,
   });
+  // Delayed recovery simulates slow recovery
+  const originalRecover = (service as any).recoverPendingJobs.bind(service);
+  (service as any).recoverPendingJobs = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return originalRecover();
+  };
   const http = new BridgeHttpServer(config, service);
 
   // 1. Start HTTP server first
@@ -174,7 +106,6 @@ test("Phase 1: daemon binds socket before recovery, /health reports lifecycle st
 test("Phase 1: service startup failure leaves HTTP server in degraded state without crash", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-phase1-degraded-"));
   const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
   const port = await freePort();
   const config = createDefaultConfig({
     daemonHost: "127.0.0.1",
@@ -184,11 +115,13 @@ test("Phase 1: service startup failure leaves HTTP server in degraded state with
     configPath: path.join(directory, "config.json"),
   });
 
-  const manager = new FakeManager(client, 10, true); // will fail
   const service = new BridgeService(config, {
     store,
-    manager,
   });
+  // Startup recovery failure puts daemon into degraded state
+  (service as any).recoverPendingJobs = async () => {
+    throw new Error("Antigravity recovery failed (simulated error)");
+  };
   const http = new BridgeHttpServer(config, service);
 
   await http.start();
@@ -202,7 +135,7 @@ test("Phase 1: service startup failure leaves HTTP server in degraded state with
     const healthBody = await healthRes.json() as Record<string, unknown>;
     assert.equal(healthBody.state, "degraded");
     assert.equal(healthBody.ready, false);
-    assert.match(String(healthBody.error), /OpenCode failed to start/);
+    assert.match(String(healthBody.error), /Antigravity recovery failed/);
 
     // Non-health endpoints return 503 with retry=false for degraded state
     const spawnRes = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/spawn`, {
@@ -228,7 +161,6 @@ test("Phase 1: service startup failure leaves HTTP server in degraded state with
 test("Phase 1: retention policy scheduling does not execute synchronous pruning during startup microtask or block /health", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-phase1-retention-readiness-"));
   const store = await BridgeStore.open(directory);
-  const client = new FakeClient();
   const port = await freePort();
 
   // Populate store with an agent, consumed job, and old events eligible for pruning
@@ -292,10 +224,8 @@ test("Phase 1: retention policy scheduling does not execute synchronous pruning 
     retentionMode: "enabled",
   });
 
-  const manager = new FakeManager(client);
   const service = new BridgeService(config, {
     store,
-    manager,
   });
   const http = new BridgeHttpServer(config, service);
 

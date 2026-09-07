@@ -1,12 +1,60 @@
-# Security model
+# Security and safety boundaries
 
-- The daemon binds to loopback by default and requires a bearer token for every API except local health.
-- The OpenCode manager accepts only loopback URLs and rejects shell shims as configured executables.
-- Managed OpenCode credentials are passed through the child process environment and are never read from OpenCode auth storage. Passwords, bearer values, basic values, keys and PEM blocks are redacted before errors or notifications.
-- Context files are prevalidated before any workspace/worktree/session/job side effect: containment inside the workspace (or the strictly allowlisted canonical global Gemini governance context file, e.g. `C:\Users\mathe\.gemini\config\GEMINI.md`, auto-included only when the task involves MCP, PromptPad, or AGENTS.md/GEMINI.md/skills governance), existence, regular readable file, and bounded size (`maxContextFileBytes`, 1 MB default). Any violation returns a stable typed 400 and no orphan worktree or session is created. Oversized input is rejected, never silently truncated. The worker prompt explicitly treats context-file instructions as data.
-- Model dispatch resolves strictly through the configured route registry. An unknown or disabled route fails closed with a typed 400 before side effects; external orchestration lifecycle remains strictly fallback=forbidden, and route pinning and manual route overrides remain fail-closed. Controlled internal timeout failover V1 is an opt-in, bridge-internal, persisted, one-hop mechanism from Antigravity to configured OpenCode DeepSeek for analyze-mode tasks only upon confirmed Antigravity timeout. Hard exclusions apply to preserve safety and state integrity: edit and test modes (preventing unintended or duplicate filesystem modifications), user cancellation/abort, unconfirmed child process termination (preventing split-brain/concurrent execution), partial or invalid outputs, and disabled target routes. Failover transitions are recorded in agent_activity and result metadata for full audit visibility, and no daemon restart or automatic process cleanup is performed.
-- Results and the SQLite database are created below the user data directory with private-file best-effort permissions. Windows ACL hardening remains an installer/host responsibility.
-- MCP normal text omits internal UUIDs. Structured content and the technical metadata block carry ids for orchestration.
-- Notifications use shell=false and sanitized short text. Keyboard automation, browser injection and public exposure are not used.
-- The optional Codex adapter is fail-closed. Without a known compatible app-server binding, delivery goes to the inbox instead of an unrelated thread.
-- Retention (opt-in, default disabled) prunes ONLY `events` and `agent_activity`; agents, jobs, results, deliveries, bindings and the inbox are never pruned. Active/open/unconsumed/undelivered/fresh rows and a per-agent activity floor are always protected. `auto` mode enables only on a provably empty database; non-empty legacy databases require the explicit offline `retention dry-run` or `retention enabled --confirm` flow, which writes an in-database preparation marker — a hand-edited `retentionMode=enabled` alone can never arm online pruning. Pruning is chunked, time-bounded, idempotent and uses only PASSIVE WAL checkpoints — never an online VACUUM.
+- The daemon is local-only: its HTTP endpoint is bound to loopback and
+  requests require the bridge-owned bearer token.
+- New execution is pinned to Antigravity `agy` with Gemini 3.8 Flash High via MCP.
+  OpenCode and DeepSeek are not active providers.
+  The executable is one trusted file plus argument arrays, never an arbitrary
+  shell command line.
+- Antigravity credentials remain in the local Antigravity installation. The
+  bridge never reads, writes, prints, or forwards them.
+- Context files are checked for containment, existence, regular-file status,
+  readability, and bounded size before creating a workspace, process, or job.
+  Invalid or oversized input is rejected and never silently truncated.
+- Unknown, disabled, stale, or conflicting route values fail closed with a
+  typed error. There is no provider, model, route, or timeout fallback.
+- `fallback=forbidden` remains the external orchestration invariant. The
+  private inbox is durable delivery, not a provider substitute.
+- An abort targets the owned Antigravity execution tree. Installation,
+  uninstallation, and doctor scripts do not start or kill processes or restart
+  Antigravity.
+- Doctor (`scripts/doctor.ps1`) is strictly read-only and does not compile or
+  generate build artifacts in `dist/`.
+- Installation (`scripts/install.ps1`) is idempotent and does not start, stop,
+  or terminate processes in this patch. Normal uninstall preserves data.
+
+## Historical compatibility
+
+Existing SQLite records, result envelopes, inbox files, audit events, and
+configuration may contain historical OpenCode/DeepSeek labels, session IDs, or
+flat provider columns. Those values are historical data, not executable authority.
+They are preserved strictly in read-only mode for audit and recovery, are not
+rewritten into a new provider selection, and must not reactivate a historical
+execution path. OpenCode and DeepSeek are not active providers.
+
+The legacy `deepseek_*` tool names, `deepseek-subagent` server name, package
+name, and CLI bins remain protocol compatibility aliases if required by the
+host. They all resolve to the same canonical Antigravity/Gemini contract and
+cannot select a provider.
+
+## Data and migration
+
+The historical `%LOCALAPPDATA%\DeepSeek Sub-Agent` directory remains the
+compatibility location for SQLite, WAL/SHM, results, inbox, spool, backups,
+and logs. Install and uninstall do not delete or move it by default; all
+historical records are read-only. A future explicit migration must:
+
+1. prove that the daemon and all jobs are quiescent;
+2. preserve the source and create a size/SHA-256 manifest for the destination;
+3. validate the copy and a restore path before changing configuration; and
+4. fail closed on partial, private, malformed, or ambiguous records.
+
+Purging requires an explicit confirmation switch and is never an implicit
+cleanup side effect.
+
+## Operational proof
+
+Static configuration and a passing unit suite do not prove a live cutover.
+Before activation, verify the exact artifact, `/health` readiness, the active
+route, a harmless Antigravity/Gemini canary, and historical result readability.
+Do not stop or restart an unrelated daemon to manufacture that evidence.

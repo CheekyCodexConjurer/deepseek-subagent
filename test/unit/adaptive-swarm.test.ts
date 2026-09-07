@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { canTransitionJob, assertJobTransition } from "../../src/state.js";
 import { BridgeStore } from "../../src/store.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeService, computeBatchHash, FollowCancelledError, type ManagedOpenCodeLike } from "../../src/service.js";
+import { BridgeService as BaseBridgeService, computeBatchHash, FollowCancelledError, type ManagedOpenCodeLike } from "../../src/service.js";
 import { ConflictError, InvalidRequestError } from "../../src/errors.js";
 import { TranscriptAttestor, DEFAULT_ACCEPTED_TOOLS } from "../../src/codex/transcript-attestor.js";
 import { createMcpServer } from "../../src/mcp.js";
@@ -16,17 +16,182 @@ import { BridgeHttpClient } from "../../src/http-server.js";
 import { hashPrompt } from "../../src/security.js";
 import { doctorSwarmCheck } from "../../src/cli.js";
 import type { OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage } from "../../src/types.js";
+import type { AntigravityRunResult } from "../../src/antigravity/types.js";
 
 const execFileAsync = promisify(execFile);
 
 let globalSessionCounter = 0;
+
+class MockAntigravity {
+  isMock = true;
+  promptCalls: Array<{ sessionId: string; task: string; prompt: string }> = [];
+  promptErrors: Array<Error | null> = [];
+  activeSessions = new Set<string>();
+  pendingRuns = new Map<string, {
+    resolve: (res: AntigravityRunResult) => void;
+    reject: (err: any) => void;
+    agentId: string;
+    jobId: string;
+    workspace: string;
+  }>();
+
+  constructor(public client?: FakeOpenCodeClient) {}
+
+  async runPrompt(options: {
+    prompt: string;
+    cwd: string;
+    model: string;
+    signal?: AbortSignal;
+    dataDir: string;
+    agentId: string;
+    jobId: string;
+    requestId?: string;
+    timeoutMs?: number | null;
+    fence?: number;
+    onHeartbeat?: any;
+    onProgress?: any;
+  }): Promise<AntigravityRunResult> {
+    const call = {
+      sessionId: options.agentId,
+      task: options.prompt,
+      prompt: options.prompt,
+    };
+    this.promptCalls.push(call);
+    this.activeSessions.add(options.jobId);
+    this.activeSessions.add(options.agentId);
+
+    if (this.client) {
+      this.client.promptCalls.push({ sessionId: options.agentId, task: options.prompt });
+      this.client.activeSessions.add(options.agentId);
+      this.client.activeSessions.add(options.jobId);
+      const clientErr = this.client.promptErrors.shift();
+      if (clientErr) {
+        this.activeSessions.delete(options.jobId);
+        this.activeSessions.delete(options.agentId);
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+        throw clientErr;
+      }
+    }
+
+    const err = this.promptErrors.shift();
+    if (err) {
+      this.activeSessions.delete(options.jobId);
+      this.activeSessions.delete(options.agentId);
+      if (this.client) {
+        this.client.activeSessions.delete(options.jobId);
+        this.client.activeSessions.delete(options.agentId);
+      }
+      throw err;
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        resolve: (res: AntigravityRunResult) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          resolve(res);
+        },
+        reject: (error: any) => {
+          this.activeSessions.delete(options.jobId);
+          this.activeSessions.delete(options.agentId);
+          if (this.client) {
+            this.client.activeSessions.delete(options.jobId);
+            this.client.activeSessions.delete(options.agentId);
+          }
+          this.pendingRuns.delete(options.jobId);
+          this.pendingRuns.delete(options.agentId);
+          reject(error);
+        },
+        agentId: options.agentId,
+        jobId: options.jobId,
+        workspace: options.cwd,
+      };
+
+      this.pendingRuns.set(options.jobId, entry);
+      this.pendingRuns.set(options.agentId, entry);
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          entry.reject(new Error("aborted"));
+          return;
+        }
+        options.signal.addEventListener("abort", () => {
+          entry.reject(new Error("aborted"));
+        });
+      }
+    });
+  }
+
+  async completeActive(target: { id: string; workspacePath?: string }) {
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(target.id)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(target.id);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: target.workspacePath ?? entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  async completeSession(sessionId: string) {
+    const agentId = sessionId.startsWith("antigravity:") ? sessionId.slice("antigravity:".length) : sessionId;
+    for (let i = 0; i < 50; i++) {
+      if (this.pendingRuns.has(agentId) || this.pendingRuns.has(sessionId)) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = this.pendingRuns.get(agentId) ?? this.pendingRuns.get(sessionId);
+    if (entry) {
+      entry.resolve({
+        status: "completed",
+        runId: "run_" + entry.jobId,
+        summary: "STATUS: completed\nSUMMARY: Finished task",
+        fullText: "STATUS: completed\nSUMMARY: Finished task",
+        files: [],
+        tests: [],
+        risks: [],
+        diffSummary: "",
+        model: "gemini-3.8-flash-high",
+        modelDisplayName: "Gemini 3.8 Flash High",
+        workspace: entry.workspace,
+        rawOutput: "Finished task",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+}
 
 class FakeOpenCodeClient implements OpenCodeClientLike {
   promptCalls: Array<{ sessionId: string; task: string }> = [];
   promptErrors: Array<Error | null> = [];
   messages: OpenCodeMessage[] = [];
   activeSessions = new Set<string>();
+  antigravity: MockAntigravity;
   private onEvent?: (event: OpenCodeEvent) => Promise<void> | void;
+
+  constructor() {
+    this.antigravity = new MockAntigravity(this);
+  }
 
   async health() {
     return { healthy: true, version: "fake" };
@@ -50,18 +215,26 @@ class FakeOpenCodeClient implements OpenCodeClientLike {
   }
   async abort(sessionId: string) {
     this.activeSessions.delete(sessionId);
+    this.antigravity.activeSessions.delete(sessionId);
   }
   async replyPermission() {}
   async subscribe(onEvent: (event: OpenCodeEvent) => Promise<void> | void) {
     this.onEvent = onEvent;
   }
   async emit(event: OpenCodeEvent) {
+    if (event.type === "session.idle") {
+      const sessId = (event.properties as any)?.sessionID ?? (event.properties as any)?.sessionId;
+      if (sessId) {
+        await this.antigravity.completeSession(sessId);
+      }
+    }
     await this.onEvent?.(event);
   }
 }
 
 function makeFakeManager(client: FakeOpenCodeClient) {
   return {
+    client,
     async start(): Promise<ManagedOpenCodeLike> {
       return {
         serverId: "fake_server",
@@ -74,6 +247,44 @@ function makeFakeManager(client: FakeOpenCodeClient) {
     async stop() {},
   };
 }
+
+class BridgeService extends BaseBridgeService {
+  constructor(config: any, dependencies: any = {}) {
+    const antigravity = dependencies.antigravity ?? dependencies.manager?.client?.antigravity ?? new MockAntigravity();
+    super(config, {
+      ...dependencies,
+      antigravity,
+    });
+  }
+
+  async completeActive(agent: any) {
+    if ((this.antigravity as any)?.completeActive) {
+      await (this.antigravity as any).completeActive(agent);
+    }
+    const respawnableStatuses = new Set(["completed", "completed_partial", "delivered", "timed_out"]);
+    for (let i = 0; i < 500; i++) {
+      const job = this.store.getLatestJobForAgent(agent.id);
+      const currentAgent = this.store.getAgent(agent.id);
+      if (job?.resultPath && respawnableStatuses.has(job.status) && currentAgent?.status === "completed") break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const completedJob = this.store.getLatestJobForAgent(agent.id);
+    assert.ok(completedJob?.resultPath, "Completed fixture job must persist its result before the agent is closed");
+    assert.ok(respawnableStatuses.has(completedJob.status), "Completed fixture job must be respawnable before the agent is closed");
+    assert.equal(this.store.getAgent(agent.id)?.status, "completed", "Completed fixture agent must settle before it is closed");
+  }
+
+  async markNeedsApproval(agent: any, properties: any = {}) {
+    const jobs = this.store.listJobs().filter((j: any) => j.agentId === agent.id && ["running", "dispatching"].includes(j.status));
+    const job = jobs[0];
+    if (!job) return;
+    const permissionId = (properties.permissionId as string) ?? job.permissionId;
+    this.store.updateJobStatus(job.id, "needs_approval");
+    if (permissionId) this.store.setJobPermission(job.id, permissionId);
+    this.store.updateAgentStatus(agent.id, "needs_approval");
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // 1. State Transitions (TDD RED)
@@ -992,7 +1203,7 @@ test("service restart recovers queued jobs from persisted envelopes without dupl
 
       // Route remains pinned on agent
       const q1Agent = store2.getAgent(q1After.agentId);
-      assert.equal(q1Agent?.modelRoute, "flash-max", "Pinned model route must survive restart");
+      assert.equal(q1Agent?.modelRoute, "antigravity-flash-high", "Pinned model route must survive restart");
 
       // q2 remains queued, envelope still intact
       const q2After = store2.getJob(q2JobId)!;
@@ -1962,19 +2173,21 @@ test("specification: HTTP 429 response during dispatch triggers AIMD multiplicat
       });
       client.promptErrors.push(rateLimitError);
 
-      // Attempt spawn which fails dispatch due to HTTP 429
-      await assert.rejects(
-        async () => {
-          await service.spawn({
-            requestId: "req_429",
-            topic: "Rate Limited Task",
-            task: "Trigger 429 error",
-          });
-        },
-        (err: unknown) => {
-          return err instanceof Error && /429/.test(err.message);
-        },
-      );
+      // Attempt spawn which triggers async 429 during background Antigravity dispatch
+      const spawnReceipt = await service.spawn({
+        requestId: "req_429",
+        topic: "Rate Limited Task",
+        task: "Trigger 429 error",
+        cwd: tmpDir,
+      });
+      assert.equal(spawnReceipt.accepted, true);
+
+      // Wait for async background run to fail on 429
+      const deadline = Date.now() + 5000;
+      while (store.getJob(spawnReceipt.jobId)?.status !== "failed" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(store.getJob(spawnReceipt.jobId)?.status, "failed");
 
       // HTTP 429 backpressure triggers AIMD multiplicative decrease halving targetCredits once (4 -> 2)
       const currentCredits = service.status().swarm?.targetCredits;
@@ -2541,14 +2754,19 @@ test("specification: approval resume preserves capacity invariant", async () => 
 
       // 4. Now user resumes Job 1 (e.g. via approval reply or prompt continue)
       // At this moment, activeCount is 1 and targetCredits is 1 (capacity is full: availableCredits = 0)
-      const resumeReceipt = await service.continueJob({
-        agentId: agent1.id,
-        requestId: "req_appr_resume",
-        task: "Permission reply to proceed",
-        permissionId: "perm_cap_1",
-        permissionReply: "once",
-      });
-      assert.equal(resumeReceipt.accepted, true);
+      // In Antigravity, approval sessions are non-resumable (fail-closed)
+      await assert.rejects(
+        async () => {
+          await service.continueJob({
+            agentId: agent1.id,
+            requestId: "req_appr_resume",
+            task: "Permission reply to proceed",
+            permissionId: "perm_cap_1",
+            permissionReply: "once",
+          });
+        },
+        /Antigravity jobs do not expose resumable provider approval sessions/i,
+      );
 
       // DESIRED BEHAVIOR: approval resume must preserve capacity invariant
       // (activeCount <= targetCredits = 1).

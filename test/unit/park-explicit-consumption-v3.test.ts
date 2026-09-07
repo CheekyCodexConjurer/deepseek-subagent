@@ -589,7 +589,7 @@ test("CONSUMPTION-3.1: Non-consuming operations (status changes, park arming, ag
   }
 });
 
-test("CONSUMPTION-3.2: Non-terminal follow (needs_approval) keeps obligation pending and does NOT consume", async () => {
+test("CONSUMPTION-3.2: Antigravity fail-closed follow (needs_approval) keeps result unconsumed", async () => {
   const { tmp, config, store } = await createTestEnv();
   const fakeCodex = new FakeCodexDelivery();
   const fakeCli = new FakeCliTransport();
@@ -603,7 +603,7 @@ test("CONSUMPTION-3.2: Non-terminal follow (needs_approval) keeps obligation pen
 
     // Follow a job requiring approval
     const followResult = await service.follow({ agentId: agent.id, jobId: job.id });
-    assert.equal(followResult.status, "needs_approval");
+    assert.equal(followResult.status, "failed");
     assert.equal(followResult.resultAvailable, false);
 
     const jobAfterFollow = store.getJob(job.id)!;
