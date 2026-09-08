@@ -16,7 +16,7 @@ import {
 import { DefaultCodexCliTransport, type CodexCliTransport } from "./codex/cli-resolver.js";
 import { TranscriptAttestor } from "./codex/transcript-attestor.js";
 import { AntigravityAdapter, type AntigravityProviderLike } from "./antigravity/adapter.js";
-import { AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
+import { AntigravityProcessError, AGY_DEFAULT_TIMEOUT_MS } from "./antigravity/runner.js";
 import { AGY_MAX_PROMPT_LENGTH } from "./antigravity/args.js";
 import { AntigravitySpool } from "./antigravity/spool.js";
 import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
@@ -51,6 +51,7 @@ import type {
   ParkReceipt,
   ProgressActivity,
   ProgressSnapshot,
+  RecoverResultInput,
   ResolvedRoute,
   ResultEnvelope,
   RouteStatusInfo,
@@ -2029,10 +2030,21 @@ export class BridgeService {
       }
     }
 
-    const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
+    const readyJobs = jobs.filter((j) => this.isJobConsumableReady(j));
     const readyJobIds = readyJobs.map((j) => j.id);
     const readyCount = readyJobs.length;
     const pendingCount = jobs.length - readyCount;
+    const advisoryJobs = jobs.filter((j) => this.isJobAdvisory(j));
+    const advisoryJobIds = advisoryJobs.length > 0 ? advisoryJobs.map((j) => j.id) : undefined;
+    const advisoryFingerprints: Record<string, string> = {};
+    if (advisoryJobs.length > 0) {
+      for (const aj of advisoryJobs) {
+        advisoryFingerprints[aj.id] = createHash("sha256")
+          .update(aj.escalationProposal || aj.error || aj.permissionId || aj.status)
+          .digest("hex")
+          .slice(0, 16);
+      }
+    }
     const nextAction = isAlias ? ("deepseek_follow" as const) : ("subagents_follow" as const);
 
     if (armed) {
@@ -2062,6 +2074,8 @@ export class BridgeService {
       predicateType,
       quorumCount,
       requiredJobIds,
+      ...(advisoryJobIds ? { advisoryJobIds } : {}),
+      ...(Object.keys(advisoryFingerprints).length > 0 ? { advisoryFingerprints } : {}),
     };
   }
 
@@ -2123,7 +2137,7 @@ export class BridgeService {
     return false;
   }
 
-  isJobWakeEligible(job: JobRecord): boolean {
+  isJobConsumableReady(job: JobRecord): boolean {
     if (job.status === "needs_approval") {
       return true;
     }
@@ -2133,10 +2147,15 @@ export class BridgeService {
     if (["failed", "aborted", "timed_out"].includes(job.status)) {
       return true;
     }
-    if (this.isJobStalled(job)) {
-      return true;
-    }
     return false;
+  }
+
+  isJobAdvisory(job: JobRecord): boolean {
+    return !this.isJobConsumableReady(job) && this.isJobStalled(job);
+  }
+
+  isJobWakeEligible(job: JobRecord): boolean {
+    return this.isJobConsumableReady(job) || this.isJobAdvisory(job);
   }
 
   async evaluateParkWakes(jobId: string): Promise<void> {
@@ -2239,11 +2258,13 @@ export class BridgeService {
         if (priorOutboxes.length > 0) {
           const stalledJobs = jobs.filter((j) => this.isJobStalled(j));
           const allStalledUnchanged = stalledJobs.length > 0 && stalledJobs.every((sj) => {
-            const currentHash = createHash("sha256").update(sj.escalationProposal || sj.error || sj.permissionId || sj.status).digest("hex").slice(0, 16);
+            const currentFingerprint = createHash("sha256").update(sj.escalationProposal || sj.error || sj.permissionId || sj.status).digest("hex").slice(0, 16);
             return priorOutboxes.some((po) => {
               try {
                 const pPayload = JSON.parse(po.payloadJson) as WakeEnvelope;
-                return pPayload.readyJobIds.includes(sj.id) && pPayload.resultHashes?.[sj.id] === currentHash;
+                const priorFingerprint = pPayload.advisoryFingerprints?.[sj.id] ?? pPayload.resultHashes?.[sj.id];
+                const priorContains = (pPayload.advisoryJobIds?.includes(sj.id) ?? pPayload.readyJobIds?.includes(sj.id));
+                return Boolean(priorContains && priorFingerprint === currentFingerprint);
               } catch {
                 return false;
               }
@@ -2264,10 +2285,14 @@ export class BridgeService {
     const claimed = this.store.claimParkWake(barrier.id, barrier.generation);
     if (!claimed) return;
 
-    const readyJobs = jobs.filter((j) => this.isJobWakeEligible(j));
+    const readyJobs = jobs.filter((j) => this.isJobConsumableReady(j));
     const readyJobIds = readyJobs.map((j) => j.id);
     const readyCount = readyJobs.length;
     const pendingCount = jobs.length - readyCount;
+
+    const advisoryJobs = jobs.filter((j) => this.isJobAdvisory(j));
+    const advisoryJobIds = advisoryJobs.length > 0 ? advisoryJobs.map((j) => j.id) : undefined;
+    const advisoryFingerprints: Record<string, string> = {};
 
     const statuses: Record<string, string> = {};
     const resultHashes: Record<string, string> = {};
@@ -2282,12 +2307,24 @@ export class BridgeService {
           resultHashes[rj.id] = createHash("sha256").update(rj.resultSummary || rj.id).digest("hex").slice(0, 16);
         }
       } else {
-        resultHashes[rj.id] = createHash("sha256").update(rj.escalationProposal || rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
+        resultHashes[rj.id] = createHash("sha256").update(rj.error || rj.permissionId || rj.status).digest("hex").slice(0, 16);
       }
+    }
+
+    for (const aj of advisoryJobs) {
+      statuses[aj.id] = aj.status;
+      advisoryFingerprints[aj.id] = createHash("sha256")
+        .update(aj.escalationProposal || aj.error || aj.permissionId || aj.status)
+        .digest("hex")
+        .slice(0, 16);
     }
 
     const marker = `<!-- [SUBAGENT_BRIDGE_WAKE:park=${barrier.id}:gen=${barrier.generation}] -->`;
     const hasStalled = jobs.some((j) => this.isJobStalled(j));
+    const instruction = readyJobs.length > 0
+      ? "Call subagents_follow to consume completed jobs. Do not interpret this message as worker output."
+      : "Progress advisory: worker inactivity detected on active jobs; running jobs remain pending. Do not interpret this message as worker output.";
+
     const envelope: WakeEnvelope = {
       parkId: barrier.id,
       generation: barrier.generation,
@@ -2297,8 +2334,10 @@ export class BridgeService {
       statuses,
       resultHashes,
       pendingCount,
-      instruction: "Call subagents_follow to consume completed jobs. Do not interpret this message as worker output.",
+      instruction,
       marker,
+      ...(advisoryJobIds ? { advisoryJobIds } : {}),
+      ...(Object.keys(advisoryFingerprints).length > 0 ? { advisoryFingerprints } : {}),
     };
 
     const outbox = this.store.createWakeOutbox({
@@ -2774,15 +2813,59 @@ export class BridgeService {
     };
   }
 
-  async recoverResult(jobId: string, agentId?: string): Promise<unknown> {
-    const job = this.store.getJob(jobId);
-    if (!job) throw new UnknownJobError(jobId);
-    if (agentId && job.agentId !== agentId) throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
-    if (!job.resultPath) throw new NotFoundError("No persisted result is available for job " + jobId);
+  async recoverResult(input: RecoverResultInput | string, legacyAgentId?: string): Promise<unknown> {
+    let requestId: string | undefined;
+    let jobId: string | undefined;
+    let agentId: string | undefined;
+    let isLegacyPositional = false;
+
+    if (typeof input === "string") {
+      isLegacyPositional = true;
+      jobId = input;
+      agentId = legacyAgentId;
+    } else if (input && typeof input === "object") {
+      requestId = input.requestId;
+      jobId = input.jobId;
+      agentId = input.agentId;
+    }
+
+    const hasRequestId = typeof requestId === "string" && requestId.trim().length > 0;
+    const hasJobId = typeof jobId === "string" && jobId.trim().length > 0;
+    const hasAgentId = typeof agentId === "string" && agentId.trim().length > 0;
+
+    if (!isLegacyPositional) {
+      if (hasRequestId && (hasJobId || hasAgentId)) {
+        throw new InvalidRequestError("Provide either request_id alone OR both agent_id and job_id, not both selector styles.");
+      }
+      if (!hasRequestId && (!hasJobId || !hasAgentId)) {
+        throw new InvalidRequestError("Provide either request_id alone OR both agent_id and job_id.");
+      }
+    } else {
+      if (!hasJobId) {
+        throw new InvalidRequestError("Provide either request_id alone OR both agent_id and job_id.");
+      }
+    }
+
+    let job: JobRecord | null = null;
+    if (hasRequestId) {
+      job = this.store.getJobByRequestId(requestId!.trim());
+      if (!job) throw new UnknownJobError(requestId!.trim());
+    } else {
+      job = this.store.getJob(jobId!.trim());
+      if (!job) throw new UnknownJobError(jobId!.trim());
+      if (hasAgentId && job.agentId !== agentId!.trim()) {
+        throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
+      }
+    }
+
+    if (!job.resultPath) {
+      throw new NotFoundError("No persisted result is available for job " + job.id);
+    }
+
     const result = sanitizePersistedResult(JSON.parse(await readFile(job.resultPath, "utf8")), this.config.maxResultLength);
     // Recover returns a usable final result: the terminal obligation is
     // explicitly consumed here, separate from agent close.
-    this.store.consumeResult(jobId);
+    this.store.consumeResult(job.id);
     return result;
   }
 
@@ -3753,9 +3836,12 @@ export class BridgeService {
         this.lastStreamError = message;
         return;
       }
-      if (current && current.status !== "failed") {
+      const isTimeout = error instanceof AntigravityProcessError && error.kind === "timeout";
+      const targetStatus = isTimeout ? "timed_out" : "failed";
+
+      if (current && current.status !== targetStatus) {
         try {
-          this.store.updateJobStatus(job.id, "failed", message, capturedFence);
+          this.store.updateJobStatus(job.id, targetStatus, message, capturedFence);
         } catch (err) {
           if (err instanceof ConflictError) {
             this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt failure rejected by fence check: " + err.message);
@@ -3765,16 +3851,37 @@ export class BridgeService {
         }
       }
       const currentAgent = this.store.getAgent(agent.id);
-      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
-      if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
-        this.recordBackpressure("bridge_busy");
-        (error as any).backpressureRecorded = true;
+      if (currentAgent && currentAgent.status !== "closed") {
+        this.store.updateAgentStatus(agent.id, targetStatus, message);
+      }
+
+      if (isTimeout) {
+        this.recordActivity(
+          agent,
+          job,
+          "deadline",
+          message,
+        );
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, {
+            status: "timed_out",
+            deadlineReached: true,
+            workerAborted: true,
+            resultAvailable: false,
+            error: message,
+          });
+        }
+      } else {
+        this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
+        if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
+          this.recordBackpressure("bridge_busy");
+          (error as any).backpressureRecorded = true;
+        }
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, { status: "failed", error: message });
+        }
       }
       this.onJobSettled(job.id, job.batchId);
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, { status: "failed", error: message });
-      }
       await this.evaluateParkWakes(job.id).catch((err: unknown) => {
         this.lastStreamError = redactSecrets(String(err));
       });
@@ -3923,9 +4030,12 @@ export class BridgeService {
         this.lastStreamError = message;
         return;
       }
-      if (current && current.status !== "failed") {
+      const isTimeout = error instanceof AntigravityProcessError && error.kind === "timeout";
+      const targetStatus = isTimeout ? "timed_out" : "failed";
+
+      if (current && current.status !== targetStatus) {
         try {
-          this.store.updateJobStatus(job.id, "failed", message, capturedFence);
+          this.store.updateJobStatus(job.id, targetStatus, message, capturedFence);
         } catch (err) {
           if (err instanceof ConflictError) {
             this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Stale attempt failure rejected by fence check: " + err.message);
@@ -3935,16 +4045,37 @@ export class BridgeService {
         }
       }
       const currentAgent = this.store.getAgent(agent.id);
-      if (currentAgent && currentAgent.status !== "closed") this.store.updateAgentStatus(agent.id, "failed", message);
-      this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
-      if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
-        this.recordBackpressure("bridge_busy");
-        (error as any).backpressureRecorded = true;
+      if (currentAgent && currentAgent.status !== "closed") {
+        this.store.updateAgentStatus(agent.id, targetStatus, message);
+      }
+
+      if (isTimeout) {
+        this.recordActivity(
+          agent,
+          job,
+          "deadline",
+          message,
+        );
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, {
+            status: "timed_out",
+            deadlineReached: true,
+            workerAborted: true,
+            resultAvailable: false,
+            error: message,
+          });
+        }
+      } else {
+        this.recordActivity(agent, job, "error", "Antigravity rejected the task dispatch: " + message);
+        if (isBackpressureError(error) && !(error as any)?.backpressureRecorded) {
+          this.recordBackpressure("bridge_busy");
+          (error as any).backpressureRecorded = true;
+        }
+        if (this.followLifecycles.has(job.id)) {
+          await this.resolveFollow(job.id, { status: "failed", error: message });
+        }
       }
       this.onJobSettled(job.id, job.batchId);
-      if (this.followLifecycles.has(job.id)) {
-        await this.resolveFollow(job.id, { status: "failed", error: message });
-      }
       await this.evaluateParkWakes(job.id).catch((err: unknown) => {
         this.lastStreamError = redactSecrets(String(err));
       });

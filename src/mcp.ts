@@ -1,4 +1,4 @@
-import { open } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -9,7 +9,7 @@ import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-server.js";
 import { ConflictError, InvalidRequestError } from "./errors.js";
 import { resolveCodexTaskProvenance, type TaskProvenance } from "./codex/cli-resolver.js";
-import { canRead, ensurePrivateDir, newId, redactSecrets } from "./security.js";
+import { canRead, ensurePrivateDir, isProcessAlive, newId, redactSecrets } from "./security.js";
 import type { BridgeConfig } from "./types.js";
 
 const DISPLAY_NAME = "SubAgents MCP";
@@ -209,7 +209,31 @@ export async function ensureDaemonRunning(
   }
 
   if (!initialReachable) {
-    await (options.start ?? startDetachedDaemon)(config);
+    const pidPath = path.join(config.dataDir, "daemon.pid");
+    let shouldSpawn = true;
+
+    try {
+      const content = await readFile(pidPath, "utf8");
+      const trimmed = content.trim();
+      const pid = /^[1-9]\d*$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        if (isProcessAlive(pid)) {
+          // Live booting daemon detected: do not spawn a duplicate
+          shouldSpawn = false;
+        }
+      } else {
+        throw new Error("Corrupt daemon PID file encountered during bootstrap");
+      }
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        throw err;
+      }
+    }
+
+    if (shouldSpawn) {
+      await (options.start ?? startDetachedDaemon)(config);
+    }
   }
 
   while (Date.now() < deadline) {
@@ -369,8 +393,12 @@ export function createMcpServer(
   };
 
   const recoverInputSchema = {
-    agent_id: z.string().min(1),
-    job_id: z.string().min(1),
+    request_id: z.string().min(1).optional(),
+    requestId: z.string().min(1).optional(),
+    agent_id: z.string().min(1).optional(),
+    agentId: z.string().min(1).optional(),
+    job_id: z.string().min(1).optional(),
+    jobId: z.string().min(1).optional(),
   };
 
   const parkInputSchema = {
@@ -708,6 +736,10 @@ export function createMcpServer(
       requiredJobIds: z.array(z.string()).nullable().optional(),
       queueMessageId: z.string().nullable().optional(),
       queue_message_id: z.string().nullable().optional(),
+      advisoryJobIds: z.array(z.string()).optional(),
+      advisory_job_ids: z.array(z.string()).optional(),
+      advisoryFingerprints: z.record(z.string(), z.string()).optional(),
+      advisory_fingerprints: z.record(z.string(), z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -776,12 +808,17 @@ export function createMcpServer(
 
   server.registerTool("subagents_recover_result", {
     title: DISPLAY_NAME + " · Recover result",
-    description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
+    description: "Recover a persisted asynchronous result by request_id (recommended after connection loss) or by legacy agent_id and job_id. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: recoverInputSchema,
   }, async (args, extra) => {
     try {
-      const result = await readyClient.call<unknown>("/v1/jobs/recover", args, extra?.signal);
+      const payload = {
+        requestId: (args as any).request_id ?? (args as any).requestId,
+        agentId: (args as any).agent_id ?? (args as any).agentId,
+        jobId: (args as any).job_id ?? (args as any).jobId,
+      };
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
         content: [{ type: "text", text: "Persisted SubAgents MCP result recovered." }],
         structuredContent: { result },
@@ -965,6 +1002,10 @@ export function createMcpServer(
       requiredJobIds: z.array(z.string()).nullable().optional(),
       queueMessageId: z.string().nullable().optional(),
       queue_message_id: z.string().nullable().optional(),
+      advisoryJobIds: z.array(z.string()).optional(),
+      advisory_job_ids: z.array(z.string()).optional(),
+      advisoryFingerprints: z.record(z.string(), z.string()).optional(),
+      advisory_fingerprints: z.record(z.string(), z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -1034,12 +1075,17 @@ export function createMcpServer(
 
   server.registerTool("deepseek_recover_result", {
     title: LEGACY_DISPLAY_NAME + " · Recover result",
-    description: "Recover a persisted asynchronous result after automatic delivery failed or the user explicitly requested recovery. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
+    description: "Recover a persisted asynchronous result by request_id (recommended after connection loss) or by legacy agent_id and job_id. A successful recover returns the usable final result and explicitly consumes the job obligation (persisted), separate from closing the agent. Do not use this as a status poll and never call it repeatedly to check progress.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: recoverInputSchema,
   }, async (args, extra) => {
     try {
-      const result = await readyClient.call<unknown>("/v1/jobs/recover", args, extra?.signal);
+      const payload = {
+        requestId: (args as any).request_id ?? (args as any).requestId,
+        agentId: (args as any).agent_id ?? (args as any).agentId,
+        jobId: (args as any).job_id ?? (args as any).jobId,
+      };
+      const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
         content: [{ type: "text", text: "Persisted DeepSeek result recovered." }],
         structuredContent: { result },
@@ -1251,6 +1297,10 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
     requiredJobIds?: string[] | null;
     queueMessageId?: string | null;
     queue_message_id?: string | null;
+    advisoryJobIds?: string[];
+    advisory_job_ids?: string[];
+    advisoryFingerprints?: Record<string, string>;
+    advisory_fingerprints?: Record<string, string>;
   };
 } {
   const parkId = String(result.parkId ?? "");
@@ -1289,6 +1339,11 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
     ? rawQueueMsgId
     : (rawQueueMsgId === null ? null : undefined);
 
+  const rawAdvisoryJobIds = result.advisoryJobIds ?? result.advisory_job_ids;
+  const advisoryJobIds = Array.isArray(rawAdvisoryJobIds) ? (rawAdvisoryJobIds as string[]) : undefined;
+  const rawAdvisoryFingerprints = result.advisoryFingerprints ?? result.advisory_fingerprints;
+  const advisoryFingerprints = (rawAdvisoryFingerprints && typeof rawAdvisoryFingerprints === "object") ? (rawAdvisoryFingerprints as Record<string, string>) : undefined;
+
   let text: string;
   if (armed) {
     text = `${displayName} parked turn on barrier ${parkId} (target: ${targetIdentity}). The turn will wake when ready jobs finish. Jobs remain pending; consume them with ${nextRequiredAction} upon wake.`;
@@ -1316,6 +1371,8 @@ function parkResult(result: Record<string, unknown>, isAlias = false): {
       ...(quorumCount !== undefined ? { quorumCount } : {}),
       ...(requiredJobIds !== undefined ? { requiredJobIds } : {}),
       ...(queueMessageId !== undefined ? { queueMessageId, queue_message_id: queueMessageId } : {}),
+      ...(advisoryJobIds ? { advisoryJobIds, advisory_job_ids: advisoryJobIds } : {}),
+      ...(advisoryFingerprints ? { advisoryFingerprints, advisory_fingerprints: advisoryFingerprints } : {}),
     },
   };
 }

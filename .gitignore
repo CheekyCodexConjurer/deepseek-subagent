@@ -8,5 +8,7 @@ coverage/
 data/
 tmp/
 .deepseek-worktrees/
+.scratchpad/
+.serena/
 .DS_Store
 Thumbs.db

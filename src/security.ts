@@ -293,6 +293,13 @@ export function isProcessAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ESRCH") {
+      return false;
+    }
+    if (code === "EPERM" || code === "EACCES") {
+      return true;
+    }
+    throw error;
   }
 }

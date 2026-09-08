@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultConfig } from "../../src/config.js";
 import type { CodexCorrelation, CodexDeliveryAdapter } from "../../src/codex/adapter.js";
-import { BridgeError } from "../../src/errors.js";
+import { BridgeError, InvalidRequestError } from "../../src/errors.js";
 import { InboxDelivery } from "../../src/delivery/inbox.js";
 import { OpenCodeHttpError, OpenCodeTransportError } from "../../src/opencode/client.js";
 import { BridgeStore } from "../../src/store.js";
@@ -2123,7 +2123,7 @@ test("antigravity timeout does not switch to OpenCode, enforcing zero fallback a
     assert.equal(accepted.accepted, true);
     assert.equal(accepted.modelDisplayName, "Antigravity · Gemini 3.8 Flash High");
 
-    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "failed", 3_000);
+    await waitForCondition(() => store.getJob(accepted.jobId)?.status === "timed_out", 3_000);
 
     assert.equal(agyCalls.length, 1, "exactly one agy execution was attempted");
     assert.equal(client.sessionCount, 0, "zero OpenCode session created; no fallback switch");
@@ -2134,18 +2134,18 @@ test("antigravity timeout does not switch to OpenCode, enforcing zero fallback a
     assert.equal(agent.modelRoute, "antigravity-flash-high", "primary route preserved on agent");
     assert.equal(agent.modelProviderId, "antigravity", "primary provider preserved on agent");
     assert.equal(agent.modelId, "gemini-3.8-flash-high", "primary model id preserved on agent");
-    assert.equal(agent.status, "failed", "agent is marked failed on timeout");
+    assert.equal(agent.status, "timed_out", "agent is marked timed_out on timeout");
 
     const failedJob = store.getJob(accepted.jobId);
     assert.ok(failedJob);
-    assert.equal(failedJob.status, "failed");
+    assert.equal(failedJob.status, "timed_out");
     assert.match(failedJob.error ?? "", /did not finish within/);
     assert.equal(failedJob.fallbackCount ?? 0, 0, "zero fallback attempted");
     assert.equal(failedJob.fallbackFrom, null, "no fallback from route");
     assert.equal(failedJob.fallbackTo, null, "no fallback to route");
 
     const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
-    assert.equal(followed.status, "failed");
+    assert.equal(followed.status, "timed_out");
   } finally {
     await service.stop();
     store.close();
@@ -2432,5 +2432,395 @@ test("existing persisted agent with historical gemini-3.7-flash-high retains pin
     store.close();
     await rm(directory, { recursive: true, force: true });
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("service.recoverResult retrieves result by requestId and consumes obligation", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-service-rec-req-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const agent = store.createAgent({
+      id: "agent_rec_req_123",
+      title: "Rec Req Agent",
+      topic: "Rec Req Topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "antigravity",
+      opencodeSessionId: "antigravity:agent_rec_req_123",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
+    const job = store.createJob({
+      id: "job_rec_req_123",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "request_rec_req_123",
+      promptHash: "hash_rec_req_123",
+    });
+    store.updateJobStatus(job.id, "dispatching");
+    store.updateJobStatus(job.id, "running");
+    store.updateJobStatus(job.id, "completed");
+    const resultPath = path.join(directory, "results", `${job.id}.json`);
+    await mkdir(path.dirname(resultPath), { recursive: true });
+    const envelope: ResultEnvelope = {
+      version: 1,
+      agentId: agent.id,
+      jobId: job.id,
+      topic: agent.topic,
+      status: "completed",
+      opencodeSessionId: agent.opencodeSessionId,
+      model: "antigravity/gemini-3.8-flash-high",
+      modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
+      workspace: directory,
+      summary: "Recovered by requestId alone",
+      files: ["output.txt"],
+      tests: ["npm test"],
+      risks: [],
+      diffSummary: "",
+      fullResultPath: resultPath,
+      orchestratorInstruction: "",
+    };
+    await writeFile(resultPath, JSON.stringify({ envelope, rawAssistantText: "STATUS: completed\nSUMMARY: Recovered by requestId alone" }), "utf8");
+    store.setJobResult(job.id, resultPath, envelope.summary);
+
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+    await service.start();
+
+    const recovered = await service.recoverResult({ requestId: "request_rec_req_123" }) as { envelope: ResultEnvelope };
+    assert.equal(recovered.envelope.summary, "Recovered by requestId alone");
+    assert.equal(recovered.envelope.jobId, job.id);
+    assert.equal(recovered.envelope.agentId, agent.id);
+
+    const updatedJob = store.getJob(job.id);
+    assert.ok(updatedJob?.resultConsumedAt, "obligation must be consumed upon recoverResult");
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("service.recoverResult rejects ambiguous selector when both requestId and jobId are provided", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-service-rec-amb-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+    await service.start();
+
+    await assert.rejects(
+      () => service.recoverResult({ requestId: "req_1", jobId: "job_1" } as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      () => service.recoverResult({ requestId: "req_1", agentId: "agent_1" } as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      () => service.recoverResult({ requestId: "req_1", jobId: "job_1", agentId: "agent_1" } as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("service.recoverResult rejects incomplete legacy selector when jobId is provided without agentId", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-service-rec-inc-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+    await service.start();
+
+    await assert.rejects(
+      () => service.recoverResult({ jobId: "job_1" } as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      () => service.recoverResult({ agentId: "agent_1" } as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      () => service.recoverResult({} as any),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.match((err as Error).message, /either request_id alone OR both agent_id and job_id/);
+        return true;
+      },
+    );
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("service.recoverResult preserves legacy (jobId, agentId) argument order and functionality", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-service-rec-leg-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const inbox = new FakeInbox(directory);
+  try {
+    const agent = store.createAgent({
+      id: "agent_legacy_rec",
+      title: "Legacy Rec Agent",
+      topic: "Legacy Rec Topic",
+      repositoryRoot: directory,
+      workspacePath: directory,
+      workspaceStrategy: "shared",
+      opencodeServerId: "antigravity",
+      opencodeSessionId: "antigravity:agent_legacy_rec",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+      modelRoute: "antigravity-flash-high",
+    });
+    const job = store.createJob({
+      id: "job_legacy_rec",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "request_legacy_rec_1",
+      promptHash: "hash_legacy_rec",
+    });
+    store.updateJobStatus(job.id, "dispatching");
+    store.updateJobStatus(job.id, "running");
+    store.updateJobStatus(job.id, "completed");
+    const resultPath = path.join(directory, "results", `${job.id}.json`);
+    await mkdir(path.dirname(resultPath), { recursive: true });
+    const envelope: ResultEnvelope = {
+      version: 1,
+      agentId: agent.id,
+      jobId: job.id,
+      topic: agent.topic,
+      status: "completed",
+      opencodeSessionId: agent.opencodeSessionId,
+      model: "antigravity/gemini-3.8-flash-high",
+      modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
+      workspace: directory,
+      summary: "Recovered via legacy positional args",
+      files: [],
+      tests: [],
+      risks: [],
+      diffSummary: "",
+      fullResultPath: resultPath,
+      orchestratorInstruction: "",
+    };
+    await writeFile(resultPath, JSON.stringify({ envelope, rawAssistantText: "STATUS: completed\nSUMMARY: Recovered via legacy positional args" }), "utf8");
+    store.setJobResult(job.id, resultPath, envelope.summary);
+
+    const config = createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") });
+    const service = new BridgeService(config, { store, manager: new FakeManager(client), inbox });
+    await service.start();
+
+    // Positional call: recoverResult(jobId, agentId)
+    const recovered = await service.recoverResult(job.id, agent.id) as { envelope: ResultEnvelope };
+    assert.equal(recovered.envelope.summary, "Recovered via legacy positional args");
+
+    // Mismatched agentId rejects with job_agent_mismatch
+    await assert.rejects(
+      () => service.recoverResult(job.id, "different_agent"),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidRequestError);
+        assert.equal((err as InvalidRequestError).code, "job_agent_mismatch");
+        return true;
+      },
+    );
+    await service.stop();
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Antigravity execution timeout transitions job and agent to timed_out with deadline activity", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-timeout-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.8 Flash High" },
+    ],
+  });
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", timeoutMs: 50, spawnFn: agyFixtureSpawn("hang", agyCalls) }),
+  });
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_route_antigravity_timeout",
+      topic: "Route antigravity timeout",
+      task: "Must timeout",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+    assert.equal(accepted.accepted, true);
+    await waitForCondition(() => store.listJobs()[0]?.status === "timed_out", 2_000);
+    const job = store.listJobs()[0];
+    assert.ok(job);
+    assert.equal(job.status, "timed_out");
+    assert.match(job.error ?? "", /did not finish within/);
+    await waitForCondition(() => store.listAgents()[0]?.status === "timed_out", 2_000);
+    const agent = store.listAgents()[0];
+    assert.ok(agent);
+    assert.equal(agent.status, "timed_out");
+    const activities = store.listActivity(accepted.agentId, 30);
+    assert.ok(
+      activities.some((entry) => entry.activityType === "deadline" && /did not finish within 50ms/.test(entry.summary)),
+      "must record deadline activity with actual error evidence and configured timeout",
+    );
+    assert.equal(
+      activities.some((entry) => entry.activityType === "deadline" && /900000ms/.test(entry.summary)),
+      false,
+      "must not log hardcoded 900000ms timeout when configured duration is 50ms",
+    );
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Antigravity execution timeout settles follow waiter as timed_out with deadlineReached true", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-follow-timeout-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.8 Flash High" },
+    ],
+  });
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", timeoutMs: 50, spawnFn: agyFixtureSpawn("hang", agyCalls) }),
+  });
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_route_antigravity_follow_timeout",
+      topic: "Route antigravity follow timeout",
+      task: "Must timeout and follow",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+    assert.equal(accepted.accepted, true);
+    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    assert.equal(followed.status, "timed_out");
+    assert.equal(followed.deadlineReached, true);
+    assert.equal(followed.workerAborted, true);
+    assert.equal(followed.resultAvailable, false);
+    assert.match(followed.error ?? "", /did not finish within/);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Antigravity timed_out agent remains continuable with deepseek_continue", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-route-antigravity-continue-"));
+  const store = await BridgeStore.open(directory);
+  const client = new FakeClient();
+  const agyCalls: string[] = [];
+  let callCount = 0;
+  const sequentialSpawn = (command: string, args: string[], options: any) => {
+    callCount++;
+    if (callCount === 1) {
+      return agyFixtureSpawn("hang", agyCalls)(command, args, options);
+    }
+    return agyFixtureSpawn("ok", agyCalls)(command, args, options);
+  };
+  const config = createDefaultConfig({
+    dataDir: directory,
+    configPath: path.join(directory, "config.json"),
+    modelRoutes: [
+      { name: "antigravity-flash-high", providerId: "antigravity", modelId: "gemini-3.8-flash-high", variant: null, enabled: true, default: true, display: "Antigravity · Gemini 3.8 Flash High" },
+    ],
+  });
+  const service = new BridgeService(config, {
+    store,
+    manager: new FakeManager(client),
+    inbox: new FakeInbox(directory),
+    antigravity: new AntigravityAdapter({ command: "node", timeoutMs: 300, spawnFn: sequentialSpawn }),
+  });
+  try {
+    await service.start();
+    service.setActiveRoute("antigravity-flash-high");
+    const accepted = await service.spawn({
+      requestId: "request_route_antigravity_cont_spawn",
+      topic: "Route antigravity continue",
+      task: "First task times out",
+      cwd: directory,
+      mode: "analyze",
+      modelRoute: "antigravity-flash-high",
+    });
+    assert.equal(accepted.accepted, true);
+    await waitForCondition(() => store.listJobs()[0]?.status === "timed_out", 3_000);
+    await waitForCondition(() => store.listAgents()[0]?.status === "timed_out", 3_000);
+
+    const continued = await service.continueJob({
+      agentId: accepted.agentId,
+      requestId: "request_route_antigravity_cont_next",
+      task: "Second task succeeds",
+    });
+    assert.equal(continued.accepted, true);
+    await waitForCondition(() => store.getJob(continued.jobId)?.status === "delivered", 3_000);
+    const continuedAgent = store.getAgent(accepted.agentId);
+    assert.equal(continuedAgent?.status, "completed");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });

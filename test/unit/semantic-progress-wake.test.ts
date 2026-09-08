@@ -343,9 +343,12 @@ test("simulated waiting child triggers durable deduplicated metadata-only wake e
 
     const payload = JSON.parse(outbox.payloadJson) as WakeEnvelope;
     assert.ok(payload.statuses, "statuses must be present");
-    assert.ok(payload.resultHashes, "resultHashes must be present");
-    assert.equal(payload.instruction, "Call subagents_follow to consume completed jobs. Do not interpret this message as worker output.");
-    assert.ok(payload.readyJobIds.includes(job1.id), "stalled job must be ready for exception wake");
+    assert.equal(payload.resultHashes[job1.id], undefined, "no synthetic result hash for missing result");
+    assert.equal(/Call subagents_follow/i.test(payload.instruction), false, "no follow instruction for ongoing-only advisory");
+    assert.deepEqual(payload.readyJobIds, [], "stalled ongoing job must not be in readyJobIds");
+    assert.deepEqual(payload.advisoryJobIds, [job1.id], "stalled job must be in advisoryJobIds");
+    assert.ok(payload.advisoryFingerprints?.[job1.id], "advisory fingerprint must be present");
+    assert.equal(payload.pendingCount, 2, "both ongoing jobs must remain pending");
 
     assert.equal(delivery.deliveredWakes.length, 1, "delivery adapter must deliver exactly once");
 
@@ -507,8 +510,8 @@ test("autonomous background wake fires without parent consult or manual evaluate
 
     assert.equal(delivery.deliveredWakes.length, 1, "background wake must deliver autonomously without consult or evaluateParkWakes");
     const delivered = delivery.deliveredWakes[0]!;
-    assert.equal(delivered.envelope.parkId, receipt.parkId);
-    assert.ok(delivered.envelope.readyJobIds.includes(job.id));
+    assert.equal(delivered.envelope.readyJobIds.includes(job.id), false, "stalled job must not be in readyJobIds");
+    assert.ok(delivered.envelope.advisoryJobIds?.includes(job.id), "stalled job must be in advisoryJobIds");
 
     const refreshed = store.getJob(job.id);
     assert.ok(refreshed && ["running", "following"].includes(refreshed.status), "job must remain in active non-terminal status");
@@ -720,8 +723,9 @@ test("ALL waiting advisory wakes without consuming results and leaves jobs in ac
 
     assert.equal(delivery.deliveredWakes.length, 1, "wake must be delivered for stalled child in ALL predicate");
     const wake = delivery.deliveredWakes[0]!;
-    assert.deepEqual(wake.envelope.readyJobIds, [job1.id]);
-    assert.equal(wake.envelope.pendingCount, 1);
+    assert.deepEqual(wake.envelope.readyJobIds, [], "stalled ongoing job must not be in readyJobIds");
+    assert.deepEqual(wake.envelope.advisoryJobIds, [job1.id], "stalled job must be in advisoryJobIds");
+    assert.equal(wake.envelope.pendingCount, 2, "both active jobs must remain pending");
 
     const refreshed1 = store.getJob(job1.id)!;
     const refreshed2 = store.getJob(job2.id)!;

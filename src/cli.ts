@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { canRead, defaultUserDataRoot, ensurePrivateDir, redactSecrets, writePrivateFile, writePrivateFileExclusive } from "./security.js";
+import { canRead, defaultUserDataRoot, ensurePrivateDir, isProcessAlive, redactSecrets, writePrivateFile, writePrivateFileExclusive } from "./security.js";
 import { createDefaultConfig, DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC, defaultConfigPath, FOLLOW_MAX_TOTAL_MINUTES, isValidFollowDefaults, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError, BRIDGE_CONNECT_TIMEOUT_MS, createDoctorHealthDispatcher, DOCTOR_HEALTH_TIMEOUT_MS } from "./http-server.js";
 import { runMcp } from "./mcp.js";
@@ -118,18 +118,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 }
 
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+export { isProcessAlive };
+
 
 export async function acquireDaemonLock(dataDir: string, pid = process.pid): Promise<() => Promise<void>> {
   await ensurePrivateDir(dataDir);
   const pidPath = path.join(dataDir, "daemon.pid");
+  const takeoverLockPath = path.join(dataDir, "daemon.pid.lock");
 
   const maxAttempts = 5;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -151,12 +146,12 @@ export async function acquireDaemonLock(dataDir: string, pid = process.pid): Pro
     }
 
     const trimmed = existingContent.trim();
-    if (!trimmed || !/^\d+$/.test(trimmed)) {
+    if (!trimmed || !/^[1-9]\d*$/.test(trimmed)) {
       throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
     }
 
     const existingPid = Number.parseInt(trimmed, 10);
-    if (!Number.isInteger(existingPid) || existingPid <= 0) {
+    if (!Number.isSafeInteger(existingPid) || existingPid <= 0) {
       throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
     }
 
@@ -164,44 +159,86 @@ export async function acquireDaemonLock(dataDir: string, pid = process.pid): Pro
       throw new Error(`${ACTIVE_DISPLAY_NAME} daemon is already running (PID ${existingPid}). Duplicate daemon instance prevented.`);
     }
 
-    // Existing PID is dead (stale lock). Attempt atomic CAS takeover via atomic rename to a unique temp file.
-    const staleClaimPath = path.join(
-      dataDir,
-      `daemon.pid.stale.${pid}.${Date.now()}.${randomBytes(6).toString("hex")}`,
-    );
-
-    let claimedStale = false;
-    try {
-      await rename(pidPath, staleClaimPath);
-      claimedStale = true;
-    } catch {
-      claimedStale = false;
-    }
-
-    if (claimedStale) {
+    // Existing PID is dead (stale lock). Attempt serialized takeover via exclusive sidecar lock.
+    const claimedTakeover = await writePrivateFileExclusive(takeoverLockPath, String(pid) + "\n");
+    if (claimedTakeover) {
       try {
-        const claimedContent = await readFile(staleClaimPath, "utf8").catch(() => "");
-        const claimedPid = Number.parseInt(claimedContent.trim(), 10);
-        if (Number.isInteger(claimedPid) && claimedPid > 0 && isProcessAlive(claimedPid)) {
-          await rename(staleClaimPath, pidPath).catch(() => undefined);
-          throw new Error(`${ACTIVE_DISPLAY_NAME} daemon is already running (PID ${claimedPid}). Duplicate daemon instance prevented.`);
+        // Re-read pidPath under exclusive takeover lock to verify it is still dead or absent.
+        let freshContent = "";
+        try {
+          freshContent = await readFile(pidPath, "utf8");
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw error;
+          }
         }
+        const freshTrimmed = freshContent.trim();
+        if (freshTrimmed && /^[1-9]\d*$/.test(freshTrimmed)) {
+          const freshPid = Number.parseInt(freshTrimmed, 10);
+          if (Number.isSafeInteger(freshPid) && freshPid > 0 && isProcessAlive(freshPid)) {
+            throw new Error(`${ACTIVE_DISPLAY_NAME} daemon is already running (PID ${freshPid}). Duplicate daemon instance prevented.`);
+          }
+        }
+
+        // Stale confirmed; overwrite pidPath with our PID.
+        await writePrivateFile(pidPath, String(pid) + "\n");
+        return createDaemonLockReleaser(pidPath, pid);
       } finally {
-        await unlink(staleClaimPath).catch(() => undefined);
+        await releaseOwnerLockFile(takeoverLockPath, pid);
+      }
+    } else {
+      // Another contender is actively performing takeover. Inspect the sidecar lock.
+      // NEVER automatically unlink/reclaim an existing sidecar lock to avoid recursive TOCTOU races.
+      let takeoverContent = "";
+      try {
+        takeoverContent = await readFile(takeoverLockPath, "utf8");
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          // Takeover owner unlinked the sidecar right after writePrivateFileExclusive failed; retry.
+          continue;
+        }
+        throw new Error("Failed to acquire exclusive daemon lock: takeover sidecar lock is unreadable.");
       }
 
-      const acquiredSecond = await writePrivateFileExclusive(pidPath, String(pid) + "\n");
-      if (acquiredSecond) {
-        return createDaemonLockReleaser(pidPath, pid);
+      const takeoverTrimmed = takeoverContent.trim();
+      if (!takeoverTrimmed || !/^[1-9]\d*$/.test(takeoverTrimmed)) {
+        throw new Error("Failed to acquire exclusive daemon lock: orphan or corrupt takeover sidecar lock encountered. Manual operator cleanup required.");
       }
+
+      const takeoverPid = Number.parseInt(takeoverTrimmed, 10);
+      if (!Number.isSafeInteger(takeoverPid) || takeoverPid <= 0) {
+        throw new Error("Failed to acquire exclusive daemon lock: orphan or corrupt takeover sidecar lock encountered. Manual operator cleanup required.");
+      }
+
+      if (!isProcessAlive(takeoverPid)) {
+        throw new Error(`Failed to acquire exclusive daemon lock: orphan or stale takeover sidecar lock encountered (PID ${takeoverPid}). Manual operator cleanup required.`);
+      }
+
+      // Live takeover owner is actively holding the sidecar lock; wait briefly so the winner can finish writing its new PID, then retry.
+      await new Promise((resolve) => setTimeout(resolve, 10));
       continue;
     }
 
-    // Lost the stale claim race; wait briefly so the winner can finish writing its new PID, then retry.
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // Lost or waiting on takeover race; wait briefly so the winner can finish writing its new PID, then retry.
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   throw new Error("Failed to acquire exclusive daemon lock: lock file is held by another process.");
+}
+
+async function releaseOwnerLockFile(filePath: string, expectedPid: number): Promise<void> {
+  try {
+    const current = await readFile(filePath, "utf8").catch(() => "");
+    const trimmed = current.trim();
+    if (trimmed && /^[1-9]\d*$/.test(trimmed)) {
+      const currentPid = Number.parseInt(trimmed, 10);
+      if (currentPid === expectedPid) {
+        await unlink(filePath).catch(() => undefined);
+      }
+    }
+  } catch {
+    // Ignore errors on cleanup
+  }
 }
 
 function createDaemonLockReleaser(pidPath: string, pid: number): () => Promise<void> {
@@ -209,15 +246,7 @@ function createDaemonLockReleaser(pidPath: string, pid: number): () => Promise<v
   return async () => {
     if (released) return;
     released = true;
-    try {
-      const current = await readFile(pidPath, "utf8").catch(() => "");
-      const currentPid = Number.parseInt(current.trim(), 10);
-      if (currentPid === pid) {
-        await unlink(pidPath).catch(() => undefined);
-      }
-    } catch {
-      // Ignore errors on cleanup
-    }
+    await releaseOwnerLockFile(pidPath, pid);
   };
 }
 

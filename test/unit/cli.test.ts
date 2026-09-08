@@ -486,6 +486,188 @@ test("acquireDaemonLock fails closed when lock file content is empty or unreadab
   }
 });
 
+test("acquireDaemonLock concurrent contenders (10) recovering from stale dead PID result in exactly one winner", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-stale-10-race-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    await writeFile(pidPath, "9999999\n", "utf8");
+
+    const contenders = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const results = await Promise.allSettled(
+      contenders.map(() => acquireDaemonLock(directory, process.pid)),
+    );
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<() => Promise<void>> => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+    assert.equal(fulfilled.length, 1, "exactly one contender acquires the lock after stale recovery");
+    assert.equal(rejected.length, contenders.length - 1, "all other contenders are rejected");
+    for (const rej of rejected) {
+      assert.match(rej.reason?.message ?? "", /Duplicate daemon instance prevented|already running|lock file is held by another process/);
+    }
+
+    await fulfilled[0].value();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock fails closed and leaves orphan dead sidecar lock untouched with zero winners", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-dead-sidecar-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    const takeoverLockPath = path.join(directory, "daemon.pid.lock");
+    await writeFile(pidPath, "9999999\n", "utf8");
+    await writeFile(takeoverLockPath, "9999998\n", "utf8");
+
+    await assert.rejects(
+      () => acquireDaemonLock(directory, process.pid),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /orphan or stale takeover sidecar lock.*Manual operator cleanup required/i);
+        return true;
+      },
+    );
+
+    // Verify sidecar was NOT unlinked and content is untouched
+    const sidecarContent = await readFile(takeoverLockPath, "utf8");
+    assert.equal(sidecarContent, "9999998\n");
+    const pidContent = await readFile(pidPath, "utf8");
+    assert.equal(pidContent, "9999999\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock fails closed and leaves corrupt sidecar lock untouched", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-corrupt-sidecar-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    const takeoverLockPath = path.join(directory, "daemon.pid.lock");
+    await writeFile(pidPath, "9999999\n", "utf8");
+    await writeFile(takeoverLockPath, "not-a-valid-pid\n", "utf8");
+
+    await assert.rejects(
+      () => acquireDaemonLock(directory, process.pid),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /orphan or corrupt takeover sidecar lock.*Manual operator cleanup required/i);
+        return true;
+      },
+    );
+
+    // Verify sidecar was NOT unlinked and content is untouched
+    const sidecarContent = await readFile(takeoverLockPath, "utf8");
+    assert.equal(sidecarContent, "not-a-valid-pid\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock under live sidecar contention does not delete sidecar and produces no ownership", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-live-sidecar-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    const takeoverLockPath = path.join(directory, "daemon.pid.lock");
+    await writeFile(pidPath, "9999999\n", "utf8");
+    await writeFile(takeoverLockPath, `${process.pid}\n`, "utf8");
+
+    await assert.rejects(
+      () => acquireDaemonLock(directory, process.pid),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /lock file is held by another process|already running/i);
+        return true;
+      },
+    );
+
+    // Verify sidecar was NOT unlinked
+    const sidecarContent = await readFile(takeoverLockPath, "utf8");
+    assert.equal(sidecarContent, `${process.pid}\n`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock normal owner cleanup removes only its own sidecar lock in finally", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-owner-cleanup-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    const takeoverLockPath = path.join(directory, "daemon.pid.lock");
+    await writeFile(pidPath, "9999999\n", "utf8");
+
+    const release = await acquireDaemonLock(directory, process.pid);
+    assert.ok(typeof release === "function");
+
+    // During active lock: daemon.pid has process.pid, and sidecar was cleaned up in acquire finally
+    const pidContent = await readFile(pidPath, "utf8");
+    assert.equal(pidContent.trim(), String(process.pid));
+
+    let sidecarExists = false;
+    try {
+      await readFile(takeoverLockPath, "utf8");
+      sidecarExists = true;
+    } catch {
+      sidecarExists = false;
+    }
+    assert.equal(sidecarExists, false, "takeover sidecar lock must be cleaned up in finally by creator");
+
+    // On release: daemon.pid is removed
+    await release();
+    let pidExists = false;
+    try {
+      await readFile(pidPath, "utf8");
+      pidExists = true;
+    } catch {
+      pidExists = false;
+    }
+    assert.equal(pidExists, false, "daemon.pid must be cleaned up on release");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("acquireDaemonLock preserves replacement sidecar lock if content PID changes before cleanup", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-cli-replace-sidecar-"));
+  try {
+    const pidPath = path.join(directory, "daemon.pid");
+    const takeoverLockPath = path.join(directory, "daemon.pid.lock");
+    await writeFile(pidPath, "9999999\n", "utf8");
+
+    const replacePromise = (async () => {
+      for (let i = 0; i < 500; i++) {
+        try {
+          const content = await readFile(takeoverLockPath, "utf8");
+          if (content.trim() === String(process.pid)) {
+            await writeFile(takeoverLockPath, "8888888\n", "utf8");
+            return true;
+          }
+        } catch {
+          // Sidecar not yet written
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return false;
+    })();
+
+    const [release, replaced] = await Promise.all([
+      acquireDaemonLock(directory, process.pid),
+      replacePromise,
+    ]);
+
+    assert.equal(replaced, true, "sidecar was replaced before acquire finished");
+    assert.ok(typeof release === "function");
+
+    // The replaced sidecar with foreign PID 8888888 must survive creator's finally cleanup
+    const sidecarContent = await readFile(takeoverLockPath, "utf8");
+    assert.equal(sidecarContent.trim(), "8888888", "replaced sidecar must not be unlinked by creator");
+
+    // Clean up daemon.pid lock
+    await release();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("main displays help on help, --help, and -h without requiring config or database", async () => {
   for (const args of [[], ["help"], ["--help"], ["-h"]]) {
     const logs: string[] = [];

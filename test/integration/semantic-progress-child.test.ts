@@ -221,7 +221,12 @@ test("real spawned finite child: timed output crosses capturecap without advisor
     assert.equal(delivery.deliveredWakes.length, 1, "background advisory wake must fire autonomously on silence");
     const wake = delivery.deliveredWakes[0]!;
     assert.equal(wake.envelope.parkId, receipt.parkId);
-    assert.deepEqual(wake.envelope.readyJobIds, [accepted.jobId]);
+    assert.deepEqual(wake.envelope.readyJobIds, []);
+    assert.deepEqual(wake.envelope.advisoryJobIds, [accepted.jobId]);
+    assert.equal(wake.envelope.pendingCount, 1);
+    assert.equal(wake.envelope.resultHashes[accepted.jobId], undefined);
+    assert.ok(wake.envelope.advisoryFingerprints?.[accepted.jobId]);
+    assert.doesNotMatch(wake.envelope.instruction, /subagents_follow/);
     assert.ok(["running", "following"].includes(wake.envelope.statuses[accepted.jobId] ?? ""));
 
     // 4. Inspect SQLite active job: unconsumed, no resultPath, active non-terminal status, fence intact
@@ -427,7 +432,12 @@ test("isolated actual process-backed recovery and reopen SQLite of active attemp
     assert.equal(delivery2.deliveredWakes.length, 1, "background advisory wake delivered exactly once on reopened service");
     const wake = delivery2.deliveredWakes[0]!;
     assert.equal(wake.envelope.parkId, receipt.parkId);
-    assert.deepEqual(wake.envelope.readyJobIds, [accepted.jobId]);
+    assert.deepEqual(wake.envelope.readyJobIds, []);
+    assert.deepEqual(wake.envelope.advisoryJobIds, [accepted.jobId]);
+    assert.equal(wake.envelope.pendingCount, 1);
+    assert.equal(wake.envelope.resultHashes[accepted.jobId], undefined);
+    assert.ok(wake.envelope.advisoryFingerprints?.[accepted.jobId]);
+    assert.doesNotMatch(wake.envelope.instruction, /subagents_follow/);
 
     // 5. Finite child completes silence and exits 0:
     const completionDeadline = Date.now() + 6000;

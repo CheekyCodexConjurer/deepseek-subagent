@@ -2290,3 +2290,84 @@ test("DefaultCodexCliTransport: line-terminated marker framing ensures single te
   assert.ok(runC, "Resume command must have executed");
   assert.equal(runC.stdin, "<!-- [WAKE:CRLF] -->\r\n", "Must preserve existing \\r\\n without adding second blank line");
 });
+
+test("SWARM-DEFECT-REPRO: stalled following job with null result_path is progress advisory, NOT consumable readyJob", async () => {
+  const { tmp, config, store } = await createTestEnv();
+  const delivery = new FakeCodexDelivery();
+  const service = new BridgeService(config, {
+    store,
+    codex: delivery,
+    manager: {
+      start: async () => ({
+        serverId: "srv",
+        baseUrl: "http://127.0.0.1:9999",
+        client: new FakeOpenCodeClient(),
+        processId: null,
+        stop: async () => {},
+      }),
+      stop: async () => {},
+    },
+  });
+  await service.start();
+
+  try {
+    const agent = store.createAgent({
+      id: "agent_swarm_repro",
+      title: "Test",
+      topic: "Topic",
+      repositoryRoot: tmp,
+      workspacePath: tmp,
+      workspaceStrategy: "shared",
+      opencodeServerId: "srv",
+      opencodeSessionId: "session_repro",
+      modelProviderId: "antigravity",
+      modelId: "gemini-3.8-flash-high",
+      modelVariant: null,
+    });
+    const job = store.createJob({
+      id: "job_mtrupco3_8ccf105144b28030",
+      agentId: agent.id,
+      kind: "spawn",
+      requestId: "req_repro",
+      promptHash: "hash_repro",
+    });
+    store.db.prepare("UPDATE jobs SET status = 'following' WHERE id = ?").run(job.id);
+    store.bindJob({
+      jobId: job.id,
+      threadId: "thread_swarm_repro",
+      originatingTurnId: "turn_1",
+      originatingItemId: "item_1",
+    });
+
+    const stallTime = new Date(Date.now() - 350 * 1000).toISOString();
+    store.db.prepare("UPDATE jobs SET started_at = ? WHERE id = ?").run(stallTime, job.id);
+
+    // 1. MCP park receipt check
+    const receipt = await service.park({
+      jobIds: [job.id],
+      predicate: "ALL",
+      threadId: "thread_swarm_repro",
+    });
+    assert.equal(receipt.armed, true);
+    assert.deepEqual(receipt.readyJobIds, [], "Ongoing following job must NOT be in readyJobIds");
+    assert.equal(receipt.readyCount, 0, "Ongoing following job must not increment readyCount");
+    assert.equal(receipt.pendingCount, 1, "Ongoing following job must remain in pendingCount");
+    assert.deepEqual(receipt.advisoryJobIds, [job.id], "Stalled following job must be in advisoryJobIds");
+    assert.ok(receipt.advisoryFingerprints?.[job.id], "advisoryFingerprints must be present for stalled job");
+
+    // 2. Evaluate wake check
+    await service.evaluateParkWakes(job.id);
+    assert.equal(delivery.deliveredWakes.length, 1, "Advisory wake must be delivered");
+    const wake = delivery.deliveredWakes[0]!;
+    assert.deepEqual(wake.envelope.readyJobIds, [], "Ongoing following job must NOT be in envelope.readyJobIds");
+    assert.equal(wake.envelope.pendingCount, 1, "Ongoing following job must remain pending in envelope");
+    assert.deepEqual(wake.envelope.advisoryJobIds, [job.id], "Stalled job must be in envelope.advisoryJobIds");
+    assert.ok(wake.envelope.advisoryFingerprints?.[job.id], "advisoryFingerprints must be recorded in envelope");
+    assert.equal(wake.envelope.resultHashes[job.id], undefined, "No synthetic result hash for missing result");
+    assert.equal(/Call subagents_follow/i.test(wake.envelope.instruction), false, "No follow instruction for ongoing-only advisory");
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

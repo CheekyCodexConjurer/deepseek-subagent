@@ -50,3 +50,78 @@ test("allowlisted global context file is accepted while unallowlisted external f
     },
   );
 });
+
+test("isProcessAlive accurately detects running process and non-existent PID", async () => {
+  const { isProcessAlive } = await import("../../src/security.js");
+  assert.equal(typeof isProcessAlive, "function");
+  assert.equal(isProcessAlive(process.pid), true);
+  // Extremely large PID that doesn't exist
+  assert.equal(isProcessAlive(9999999), false);
+});
+
+test("isProcessAlive treats EACCES as alive (fail-closed)", async () => {
+  // Catches mutation: treating EACCES as dead/false
+  const { isProcessAlive } = await import("../../src/security.js");
+  const originalKill = process.kill;
+  try {
+    const error = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    process.kill = (() => {
+      throw error;
+    }) as unknown as typeof process.kill;
+
+    assert.equal(isProcessAlive(1234), true);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("isProcessAlive treats EPERM as alive (fail-closed)", async () => {
+  // Catches mutation: treating EPERM as dead or rethrowing
+  const { isProcessAlive } = await import("../../src/security.js");
+  const originalKill = process.kill;
+  try {
+    const error = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    process.kill = (() => {
+      throw error;
+    }) as unknown as typeof process.kill;
+
+    assert.equal(isProcessAlive(1234), true);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("isProcessAlive treats ESRCH as dead", async () => {
+  // Catches mutation: treating ESRCH as alive or rethrowing
+  const { isProcessAlive } = await import("../../src/security.js");
+  const originalKill = process.kill;
+  try {
+    const error = Object.assign(new Error("no such process"), { code: "ESRCH" });
+    process.kill = (() => {
+      throw error;
+    }) as unknown as typeof process.kill;
+
+    assert.equal(isProcessAlive(1234), false);
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test("isProcessAlive rethrows unexpected OS/runtime errors like EIO", async () => {
+  // Catches mutation: silently swallowing unknown errors and returning false/true
+  const { isProcessAlive } = await import("../../src/security.js");
+  const originalKill = process.kill;
+  const expectedError = Object.assign(new Error("input/output error"), { code: "EIO" });
+  try {
+    process.kill = (() => {
+      throw expectedError;
+    }) as unknown as typeof process.kill;
+
+    assert.throws(
+      () => isProcessAlive(1234),
+      (err: unknown) => err === expectedError,
+    );
+  } finally {
+    process.kill = originalKill;
+  }
+});

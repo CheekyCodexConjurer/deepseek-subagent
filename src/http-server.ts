@@ -207,10 +207,11 @@ export class BridgeHttpServer {
     }
     if (method === "POST" && url.pathname === "/v1/jobs/recover") {
       const value = asRecord(body);
-      const result = await this.service.recoverResult(
-        requiredString(value.jobId ?? value.job_id, "jobId"),
-        optionalString(value.agentId ?? value.agent_id),
-      );
+      const result = await this.service.recoverResult({
+        requestId: optionalString(value.requestId ?? value.request_id),
+        jobId: optionalString(value.jobId ?? value.job_id),
+        agentId: optionalString(value.agentId ?? value.agent_id),
+      });
       writeJson(response, 200, result);
       return;
     }

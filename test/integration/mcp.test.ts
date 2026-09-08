@@ -1457,6 +1457,141 @@ test("MCP bootstrap fails immediately when daemon is degraded", async () => {
   assert.equal(starts, 0, "must not attempt to restart a degraded daemon");
 });
 
+test("ensureDaemonRunning live PID + health initially unreachable later ready no start", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-mcp-live-pid-"));
+  try {
+    const config = createDefaultConfig({
+      dataDir: directory,
+      configPath: path.join(directory, "config.json"),
+    });
+    await writeFile(path.join(directory, "daemon.pid"), `${process.pid}\n`, "utf8");
+
+    let starts = 0;
+    let pollCount = 0;
+    const healthClient = {
+      async health(): Promise<unknown> {
+        pollCount += 1;
+        if (pollCount <= 2) {
+          throw new Error("ECONNREFUSED");
+        }
+        return { displayName: "DeepSeek Sub-Agent", state: "ready", ready: true };
+      },
+    };
+
+    await ensureDaemonRunning(config, healthClient, {
+      start: async () => {
+        starts += 1;
+      },
+      timeoutMs: 500,
+      retryMs: 10,
+    });
+
+    assert.equal(starts, 0, "must not spawn duplicate when live PID is running and health becomes ready");
+    assert.ok(pollCount >= 3, "must wait boundedly for live daemon readiness");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ensureDaemonRunning dead PID start once", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-mcp-dead-pid-"));
+  try {
+    const config = createDefaultConfig({
+      dataDir: directory,
+      configPath: path.join(directory, "config.json"),
+    });
+    await writeFile(path.join(directory, "daemon.pid"), "99999999\n", "utf8");
+
+    let starts = 0;
+    let pollCount = 0;
+    const healthClient = {
+      async health(): Promise<unknown> {
+        pollCount += 1;
+        if (starts === 0) {
+          throw new Error("ECONNREFUSED");
+        }
+        return { displayName: "DeepSeek Sub-Agent", state: "ready", ready: true };
+      },
+    };
+
+    await ensureDaemonRunning(config, healthClient, {
+      start: async () => {
+        starts += 1;
+      },
+      timeoutMs: 500,
+      retryMs: 10,
+    });
+
+    assert.equal(starts, 1, "must start exactly once when PID is dead");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ensureDaemonRunning corrupt PID failclosed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-mcp-corrupt-pid-"));
+  try {
+    const config = createDefaultConfig({
+      dataDir: directory,
+      configPath: path.join(directory, "config.json"),
+    });
+    await writeFile(path.join(directory, "daemon.pid"), "not-a-number\n", "utf8");
+
+    let starts = 0;
+    const healthClient = {
+      async health(): Promise<unknown> {
+        throw new Error("ECONNREFUSED");
+      },
+    };
+
+    await assert.rejects(
+      () => ensureDaemonRunning(config, healthClient, {
+        start: async () => {
+          starts += 1;
+        },
+        timeoutMs: 500,
+        retryMs: 10,
+      }),
+      /Corrupt daemon PID file encountered during bootstrap/,
+    );
+    assert.equal(starts, 0, "must fail closed and never start on corrupt PID file");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ensureDaemonRunning permission ambiguous failclosed", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-mcp-perm-pid-"));
+  try {
+    const config = createDefaultConfig({
+      dataDir: directory,
+      configPath: path.join(directory, "config.json"),
+    });
+    // Create a directory named daemon.pid so readFile throws EISDIR/EPERM/EACCES (an ambiguous read error)
+    await mkdir(path.join(directory, "daemon.pid"));
+
+    let starts = 0;
+    const healthClient = {
+      async health(): Promise<unknown> {
+        throw new Error("ECONNREFUSED");
+      },
+    };
+
+    await assert.rejects(
+      () => ensureDaemonRunning(config, healthClient, {
+        start: async () => {
+          starts += 1;
+        },
+        timeoutMs: 500,
+        retryMs: 10,
+      }),
+    );
+    assert.equal(starts, 0, "must fail closed and never start on ambiguous PID read error");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("MCP subagents_follow and deepseek_follow expose receipt, earlyExit, escalation, semanticProgress in outputSchema and compact summary", async () => {
   const mockReceipt = {
     jobId: "job_sub_1",
@@ -1943,6 +2078,202 @@ test("MCP subagents_spawn_batch accepts mode=test and unary subagents_spawn acce
     const unaryBody = (lastCall?.body ?? {}) as Record<string, unknown>;
     assert.equal(unaryBody.priority, 85);
     assert.deepEqual(unaryBody.exclusive_resources, ["gpu"]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("deepseek_recover_result and subagents_recover_result recover by request_id alone", async () => {
+  const calls: Array<{ pathname: string; body: unknown }> = [];
+  const fakeResult = {
+    version: 1,
+    agentId: "agent_1",
+    jobId: "job_1",
+    topic: "test",
+    status: "completed",
+    opencodeSessionId: "antigravity:agent_1",
+    model: "antigravity/gemini-3.8-flash-high",
+    modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
+    workspace: "C:\\workspace",
+    summary: "recovered result by req_id",
+    files: [],
+    tests: [],
+    risks: [],
+    diffSummary: "",
+    fullResultPath: "C:\\results\\job_1.json",
+    orchestratorInstruction: "",
+  };
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      calls.push({ pathname, body });
+      if (pathname === "/v1/jobs/recover") {
+        return fakeResult;
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    // 1. deepseek_recover_result with request_id alone
+    const result1 = await client.callTool({
+      name: "deepseek_recover_result",
+      arguments: { request_id: "req_rec_1" },
+    });
+    assert.equal(result1.isError, undefined);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.pathname, "/v1/jobs/recover");
+    assert.deepEqual(calls[0]?.body, { requestId: "req_rec_1", agentId: undefined, jobId: undefined });
+    const structured1 = result1.structuredContent as Record<string, unknown>;
+    assert.deepEqual(structured1.result, fakeResult);
+
+    // 2. subagents_recover_result with request_id alone
+    const result2 = await client.callTool({
+      name: "subagents_recover_result",
+      arguments: { request_id: "req_rec_2" },
+    });
+    assert.equal(result2.isError, undefined);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]?.pathname, "/v1/jobs/recover");
+    assert.deepEqual(calls[1]?.body, { requestId: "req_rec_2", agentId: undefined, jobId: undefined });
+    const structured2 = result2.structuredContent as Record<string, unknown>;
+    assert.deepEqual(structured2.result, fakeResult);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("deepseek_recover_result and subagents_recover_result recover by legacy agent_id and job_id", async () => {
+  const calls: Array<{ pathname: string; body: unknown }> = [];
+  const fakeResult = {
+    version: 1,
+    agentId: "agent_legacy",
+    jobId: "job_legacy",
+    topic: "test",
+    status: "completed",
+    opencodeSessionId: "antigravity:agent_legacy",
+    model: "antigravity/gemini-3.8-flash-high",
+    modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
+    workspace: "C:\\workspace",
+    summary: "recovered result legacy",
+    files: [],
+    tests: [],
+    risks: [],
+    diffSummary: "",
+    fullResultPath: "C:\\results\\job_legacy.json",
+    orchestratorInstruction: "",
+  };
+  const bridgeClient = {
+    call: async (pathname: string, body?: unknown) => {
+      calls.push({ pathname, body });
+      if (pathname === "/v1/jobs/recover") {
+        return fakeResult;
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result1 = await client.callTool({
+      name: "deepseek_recover_result",
+      arguments: { agent_id: "agent_legacy", job_id: "job_legacy" },
+    });
+    assert.equal(result1.isError, undefined);
+    assert.equal(calls[0]?.pathname, "/v1/jobs/recover");
+    assert.deepEqual(calls[0]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy" });
+
+    const result2 = await client.callTool({
+      name: "subagents_recover_result",
+      arguments: { agent_id: "agent_legacy", job_id: "job_legacy" },
+    });
+    assert.equal(result2.isError, undefined);
+    assert.equal(calls[1]?.pathname, "/v1/jobs/recover");
+    assert.deepEqual(calls[1]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy" });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("deepseek_recover_result and subagents_recover_result reject ambiguous selector", async () => {
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/recover") {
+        throw new BridgeHttpError(400, "invalid_request", "Provide either request_id alone OR both agent_id and job_id, not both selector styles.");
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result1 = await client.callTool({
+      name: "deepseek_recover_result",
+      arguments: { request_id: "req_1", job_id: "job_1", agent_id: "agent_1" },
+    });
+    assert.equal(result1.isError, true);
+    const structured1 = result1.structuredContent as Record<string, unknown>;
+    assert.equal(structured1.code, "invalid_request");
+    assert.equal(structured1.status, 400);
+
+    const result2 = await client.callTool({
+      name: "subagents_recover_result",
+      arguments: { request_id: "req_1", job_id: "job_1", agent_id: "agent_1" },
+    });
+    assert.equal(result2.isError, true);
+    const structured2 = result2.structuredContent as Record<string, unknown>;
+    assert.equal(structured2.code, "invalid_request");
+    assert.equal(structured2.status, 400);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("deepseek_recover_result and subagents_recover_result reject incomplete legacy selector", async () => {
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/recover") {
+        throw new BridgeHttpError(400, "invalid_request", "Provide either request_id alone OR both agent_id and job_id.");
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "fixture-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const result1 = await client.callTool({
+      name: "deepseek_recover_result",
+      arguments: { job_id: "job_1" },
+    });
+    assert.equal(result1.isError, true);
+    const structured1 = result1.structuredContent as Record<string, unknown>;
+    assert.equal(structured1.code, "invalid_request");
+    assert.equal(structured1.status, 400);
+
+    const result2 = await client.callTool({
+      name: "subagents_recover_result",
+      arguments: { job_id: "job_1" },
+    });
+    assert.equal(result2.isError, true);
+    const structured2 = result2.structuredContent as Record<string, unknown>;
+    assert.equal(structured2.code, "invalid_request");
+    assert.equal(structured2.status, 400);
   } finally {
     await client.close();
     await server.close();

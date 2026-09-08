@@ -1076,3 +1076,16 @@ test("TDD: unconditional cleanup in finally kills hanging worker and clears hand
   // 4. Proved tempDir was successfully removed without file lock / EPERM issues
   assert.equal(existsSync(tempDir), false, "tempDir must be completely removed without handle locks");
 });
+
+test("Antigravity runner AntigravityProcessError exposes kind=\"timeout\" and command info", async () => {
+  await assert.rejects(
+    () => runAgy(fixtureArgs, { command: "node", cwd: process.cwd(), timeoutMs: 50, spawnFn: fixtureSpawn("hang") }),
+    (error: unknown) => {
+      assert.ok(error instanceof AntigravityProcessError);
+      assert.equal(error.kind, "timeout");
+      assert.equal(error.command, "node");
+      assert.match(error.message, /node did not finish within 50ms; the process tree was terminated/);
+      return true;
+    },
+  );
+});

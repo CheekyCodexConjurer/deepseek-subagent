@@ -129,6 +129,12 @@ export interface AbortInput {
   reason?: string;
 }
 
+export interface RecoverResultInput {
+  requestId?: string | undefined;
+  jobId?: string | undefined;
+  agentId?: string | undefined;
+}
+
 export interface AgentRecord {
   id: string;
   title: string;
@@ -674,6 +680,8 @@ export interface ParkReceipt {
   predicateType?: ParkPredicateType;
   quorumCount?: number | null;
   requiredJobIds?: string[] | null;
+  advisoryJobIds?: string[];
+  advisoryFingerprints?: Record<string, string>;
 }
 
 export interface ParkBarrierRecord {
@@ -729,6 +737,8 @@ export interface WakeEnvelope {
   pendingCount: number;
   instruction: string;
   marker: string;
+  advisoryJobIds?: string[];
+  advisoryFingerprints?: Record<string, string>;
 }
 
 export interface CodexCapabilities {

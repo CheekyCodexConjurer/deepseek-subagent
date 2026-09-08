@@ -5,7 +5,7 @@ import { createServer as createHttpServer } from "node:http";
 import { Agent } from "undici";
 import { FOLLOW_MAX_TOTAL_MINUTES } from "../../src/config.js";
 import { createDefaultConfig } from "../../src/config.js";
-import { BridgeError, ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError } from "../../src/errors.js";
+import { BridgeError, ConflictError, InvalidRequestError, NotFoundError, UnknownAgentError, UnknownJobError } from "../../src/errors.js";
 import { BridgeBusyError } from "../../src/service.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeHttpServer, BridgeTransportError, BRIDGE_HEADERS_TIMEOUT_MS, BRIDGE_BODY_TIMEOUT_MS, DOCTOR_HEALTH_TIMEOUT_MS, createDoctorHealthDispatcher } from "../../src/http-server.js";
 import type { BridgeService } from "../../src/service.js";
@@ -772,6 +772,207 @@ test("HTTP handles /v1/jobs/park with ParkInput and validates required job IDs",
     const aliasReceipt = await client.park({ job_ids: ["job_1"] }, true);
     assert.equal(aliasReceipt.nextAction, "deepseek_follow");
     assert.equal(calls[1]?.isAlias, true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("POST /v1/jobs/recover accepts snake_case request_id and camelCase requestId", async () => {
+  const calls: unknown[] = [];
+  const fakeResult = {
+    version: 1,
+    agentId: "agent_1",
+    jobId: "job_1",
+    topic: "test",
+    status: "completed",
+    opencodeSessionId: "antigravity:agent_1",
+    model: "antigravity/gemini-3.8-flash-high",
+    modelDisplayName: "Antigravity · Gemini 3.8 Flash High",
+    workspace: "C:\\workspace",
+    summary: "recovered result",
+    files: [],
+    tests: [],
+    risks: [],
+    diffSummary: "",
+    fullResultPath: "C:\\results\\job_1.json",
+    orchestratorInstruction: "",
+  };
+  const service = {
+    recoverResult: async (input: unknown, legacyAgentId?: string) => {
+      calls.push({ input, legacyAgentId });
+      return fakeResult;
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-recover-token",
+    dataDir: "C:\\deepseek-http-recover-data",
+    configPath: "C:\\deepseek-http-recover-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+
+    // 1. snake_case request_id
+    const res1 = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ request_id: "req_snake_1" }),
+    });
+    assert.equal(res1.status, 200);
+    const body1 = await res1.json();
+    assert.deepEqual(body1, fakeResult);
+
+    // 2. camelCase requestId
+    const res2 = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ requestId: "req_camel_2" }),
+    });
+    assert.equal(res2.status, 200);
+    const body2 = await res2.json();
+    assert.deepEqual(body2, fakeResult);
+
+    assert.equal(calls.length, 2);
+    assert.deepEqual((calls[0] as { input: { requestId?: string } }).input.requestId, "req_snake_1");
+    assert.deepEqual((calls[1] as { input: { requestId?: string } }).input.requestId, "req_camel_2");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("POST /v1/jobs/recover returns 400 invalid_request on ambiguous or incomplete selectors", async () => {
+  const service = {
+    recoverResult: async (input: unknown) => {
+      const inp = input as { requestId?: string; jobId?: string; agentId?: string };
+      const hasReq = typeof inp?.requestId === "string" && inp.requestId.trim().length > 0;
+      const hasJob = typeof inp?.jobId === "string" && inp.jobId.trim().length > 0;
+      const hasAgent = typeof inp?.agentId === "string" && inp.agentId.trim().length > 0;
+      if (hasReq && (hasJob || hasAgent)) {
+        throw new InvalidRequestError("Provide either request_id alone OR both agent_id and job_id, not both selector styles.");
+      }
+      if (!hasReq && (!hasJob || !hasAgent)) {
+        throw new InvalidRequestError("Provide either request_id alone OR both agent_id and job_id.");
+      }
+      return { summary: "ok" };
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-recover-token",
+    dataDir: "C:\\deepseek-http-recover-data",
+    configPath: "C:\\deepseek-http-recover-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+
+    // Ambiguous: both request_id and job_id
+    const res1 = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ request_id: "req_1", job_id: "job_1" }),
+    });
+    assert.equal(res1.status, 400);
+    const body1 = await res1.json() as Record<string, unknown>;
+    assert.equal(body1.code, "invalid_request");
+
+    // Incomplete legacy: job_id without agent_id
+    const res2 = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ job_id: "job_1" }),
+    });
+    assert.equal(res2.status, 400);
+    const body2 = await res2.json() as Record<string, unknown>;
+    assert.equal(body2.code, "invalid_request");
+
+    // Empty selector
+    const res3 = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({}),
+    });
+    assert.equal(res3.status, 400);
+    const body3 = await res3.json() as Record<string, unknown>;
+    assert.equal(body3.code, "invalid_request");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("POST /v1/jobs/recover returns 400 job_agent_mismatch when agentId does not match job", async () => {
+  const service = {
+    recoverResult: async () => {
+      throw new InvalidRequestError("Job does not belong to the requested agent", "job_agent_mismatch");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-recover-token",
+    dataDir: "C:\\deepseek-http-recover-data",
+    configPath: "C:\\deepseek-http-recover-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ job_id: "job_1", agent_id: "wrong_agent" }),
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, "job_agent_mismatch");
+  } finally {
+    await server.stop();
+  }
+});
+
+test("POST /v1/jobs/recover returns 404 unknown_job when request_id does not exist", async () => {
+  const service = {
+    recoverResult: async (input: unknown) => {
+      const inp = input as { requestId?: string };
+      throw new UnknownJobError(inp.requestId ?? "unknown");
+    },
+  } as unknown as BridgeService;
+  const config = createDefaultConfig({
+    daemonHost: "127.0.0.1",
+    daemonPort: await freePort(),
+    daemonToken: "http-recover-token",
+    dataDir: "C:\\deepseek-http-recover-data",
+    configPath: "C:\\deepseek-http-recover-data\\config.json",
+  });
+  const server = new BridgeHttpServer(config, service);
+  await server.start();
+  try {
+    const headers = {
+      authorization: "Bearer " + config.daemonToken,
+      "content-type": "application/json",
+    };
+    const response = await fetch(`http://${config.daemonHost}:${config.daemonPort}/v1/jobs/recover`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ request_id: "nonexistent_req" }),
+    });
+    assert.equal(response.status, 404);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, "unknown_job");
   } finally {
     await server.stop();
   }
