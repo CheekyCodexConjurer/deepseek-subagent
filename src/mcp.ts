@@ -399,6 +399,9 @@ export function createMcpServer(
     agentId: z.string().min(1).optional(),
     job_id: z.string().min(1).optional(),
     jobId: z.string().min(1).optional(),
+    section: z.enum(["summary", "files", "tests", "risks", "diff", "evidence", "full"]).optional(),
+    offset: z.number().int().min(0).optional(),
+    limit: z.number().int().min(1).max(1000).optional(),
   };
 
   const parkInputSchema = {
@@ -682,6 +685,27 @@ export function createMcpServer(
     earlyExitTriggered: z.boolean().optional(),
   }).optional();
 
+  const claimsOutputSchema = z.object({
+    summary: z.string(),
+    files: z.array(z.string()),
+    tests: z.array(z.string()),
+    risks: z.array(z.string()),
+  }).optional();
+
+  const tokensOutputSchema = z.object({
+    inputTokens: z.number(),
+    outputTokens: z.number(),
+    thinkingTokens: z.number(),
+    cachedInputTokens: z.number(),
+    totalTokens: z.number(),
+  }).optional();
+
+  const detailsRefOutputSchema = z.object({
+    resultPath: z.string().optional(),
+    hasMoreDetails: z.boolean(),
+    availableSections: z.array(z.string()),
+  }).optional();
+
   server.registerTool("subagents_follow", {
     title: DISPLAY_NAME + " · Follow",
     description: "Wait for a job until it reaches a terminal result, using internal events and one deadline timer without polling. Use it for every job your next decision depends on: before a dependent gate or a final response, and before synthesizing from that front. You may orchestrate other fronts in parallel while a job is pending, but you must consume its result before depending on it; a pending job is not a result, and an unconsumed job leaves an open obligation. Returning a usable terminal result consumes the job obligation explicitly and persistently; a needs_approval follow keeps the obligation pending and requires subagents_continue with permission_id and permission_reply. A terminal follow result closes the job obligation only: the agent stays open and continuable until you close it with subagents_close after reviewing — closing the agent is separate from consuming the obligation. Completed, failed and timed-out agents remain continuable with subagents_continue. The daemon-configured defaults are the worker's minimum window: wait_minutes and grace_minutes below the defaults are raised, and only larger values extend the window; once active, subsequent followers share the existing persisted window. Omit wait_minutes and grace_minutes to use the defaults. When the follow window expires, the worker is gracefully finalized and may be aborted after the grace period.",
@@ -700,6 +724,9 @@ export function createMcpServer(
       earlyExit: earlyExitOutputSchema,
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
+      claims: claimsOutputSchema,
+      tokens: tokensOutputSchema,
+      detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
@@ -817,6 +844,9 @@ export function createMcpServer(
         requestId: (args as any).request_id ?? (args as any).requestId,
         agentId: (args as any).agent_id ?? (args as any).agentId,
         jobId: (args as any).job_id ?? (args as any).jobId,
+        section: (args as any).section,
+        offset: (args as any).offset,
+        limit: (args as any).limit,
       };
       const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
@@ -966,6 +996,9 @@ export function createMcpServer(
       earlyExit: earlyExitOutputSchema,
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
+      claims: claimsOutputSchema,
+      tokens: tokensOutputSchema,
+      detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
@@ -1084,6 +1117,9 @@ export function createMcpServer(
         requestId: (args as any).request_id ?? (args as any).requestId,
         agentId: (args as any).agent_id ?? (args as any).agentId,
         jobId: (args as any).job_id ?? (args as any).jobId,
+        section: (args as any).section,
+        offset: (args as any).offset,
+        limit: (args as any).limit,
       };
       const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
@@ -1223,6 +1259,9 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
   const earlyExit = result.earlyExit as Record<string, unknown> | undefined;
   const escalation = result.escalation as Record<string, unknown> | undefined;
   const semanticProgress = (result.semanticProgress ?? (result.progress as Record<string, unknown> | undefined)?.semanticProgress) as Record<string, unknown> | undefined;
+  const claims = result.claims as Record<string, unknown> | undefined;
+  const detailsRef = result.detailsRef as Record<string, unknown> | undefined;
+  const tokens = result.tokens as Record<string, unknown> | undefined;
 
   const compactParts: string[] = [];
   if (receipt) {
@@ -1239,8 +1278,27 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
   if (semanticProgress) {
     compactParts.push(`stage: ${semanticProgress.stage}`);
   }
+  if (tokens) {
+    compactParts.push(`tokens: ${tokens.totalTokens}`);
+  }
 
   const compactSuffix = compactParts.length > 0 ? " [" + compactParts.join(" | ") + "]" : "";
+
+  const baseStructured: Record<string, unknown> = {
+    ...result,
+    ...(receipt ? { receipt } : {}),
+    ...(earlyExit ? { earlyExit } : {}),
+    ...(escalation ? { escalation } : {}),
+    ...(semanticProgress ? { semanticProgress } : {}),
+    ...(claims ? { claims } : {}),
+    ...(detailsRef ? { detailsRef } : {}),
+    ...(tokens ? { tokens } : {}),
+  };
+
+  if (claims) {
+    delete baseStructured.progress;
+    delete baseStructured.result;
+  }
 
   if (result.status === "needs_approval") {
     return {
@@ -1249,11 +1307,7 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
         text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.${compactSuffix}`,
       }],
       structuredContent: {
-        ...result,
-        ...(receipt ? { receipt } : {}),
-        ...(earlyExit ? { earlyExit } : {}),
-        ...(escalation ? { escalation } : {}),
-        ...(semanticProgress ? { semanticProgress } : {}),
+        ...baseStructured,
         obligationState: "pending",
         nextRequiredAction,
       },
@@ -1265,11 +1319,7 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
       text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.${compactSuffix}`,
     }],
     structuredContent: {
-      ...result,
-      ...(receipt ? { receipt } : {}),
-      ...(earlyExit ? { earlyExit } : {}),
-      ...(escalation ? { escalation } : {}),
-      ...(semanticProgress ? { semanticProgress } : {}),
+      ...baseStructured,
       obligationState: "closed",
     },
   };

@@ -12,7 +12,9 @@ import type {
   ExecutionReceipt,
   JobRecord,
   OpenCodeMessage,
+  ResultDetailsRef,
   ResultEnvelope,
+  WorkerClaims,
 } from "./types.js";
 
 const PROTOCOL_HEADINGS = [
@@ -197,7 +199,7 @@ export async function persistAntigravityResult(
     status: result.status,
     opencodeSessionId: redactSecrets(agent.opencodeSessionId),
     model: redactSecrets(result.model),
-    modelDisplayName: redactSecrets(result.modelDisplayName),
+    modelDisplayName: redactSecrets(result.modelDisplayName || result.model || "Antigravity"),
     workspace: redactSecrets(result.workspace),
     summary: truncate(redactSecrets(result.summary), 4_000),
     files: result.files.slice(0, 100).map((value) => redactSecrets(value)),
@@ -445,6 +447,28 @@ export function createExecutionReceipt(input: {
     earlyExit: Boolean(input.earlyExit),
     filesCount: input.filesCount ?? 0,
     testsCount: input.testsCount ?? 0,
+  };
+}
+
+export function createCompactClaims(envelope: ResultEnvelope): WorkerClaims {
+  return {
+    summary: truncate(envelope.summary || "", 1_000),
+    files: (envelope.files ?? []).slice(0, 10),
+    tests: (envelope.tests ?? []).slice(0, 10),
+    risks: (envelope.risks ?? []).slice(0, 5),
+  };
+}
+
+export function createDetailsRef(envelope: ResultEnvelope): ResultDetailsRef {
+  const hasMore = (envelope.files?.length ?? 0) > 10 ||
+    (envelope.tests?.length ?? 0) > 10 ||
+    (envelope.risks?.length ?? 0) > 5 ||
+    (envelope.diffSummary && envelope.diffSummary.length > 0 && envelope.diffSummary !== "none") ||
+    (envelope.evidence && (envelope.evidence.items?.length ?? 0) > 0);
+  return {
+    resultPath: envelope.fullResultPath,
+    hasMoreDetails: Boolean(hasMore),
+    availableSections: ["summary", "files", "tests", "risks", "diff", "evidence", "full"],
   };
 }
 

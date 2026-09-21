@@ -22,6 +22,8 @@ export interface PromptBuildOptions {
   maxPromptLength?: number;
   /** Optional explicitly allowlisted external context files (e.g. global GEMINI.md). */
   allowedExternalFiles?: string[];
+  /** When true and resuming an existing conversation, emit a lean delta prompt. */
+  isContinuation?: boolean;
 }
 
 export const MAX_VISUAL_CONTEXT_LENGTH = 20_000;
@@ -73,6 +75,31 @@ export async function buildWorkerPrompt(
     : await readContextFiles(absoluteContext, options.contextFileDelivery ?? "inline");
   const relation = "relation" in input && input.relation ? input.relation : "new task";
   const visualContextText = visualContextSection(input.visualContext);
+
+  if (options.isContinuation) {
+    const deltaParts = [
+      "Continuation Task:",
+      task,
+    ];
+    if (relation && relation !== "new task") {
+      deltaParts.push("", "Request relation: " + relation);
+    }
+    if (visualContextText) {
+      deltaParts.push("", "Visual context from the orchestrator:", visualContextText);
+    }
+    if (absoluteContext.length > 0) {
+      deltaParts.push("", "Additional context files:", contextText);
+    }
+    const deltaPrompt = deltaParts.join("\n");
+    if (options.maxPromptLength !== undefined && deltaPrompt.length > options.maxPromptLength) {
+      throw new InvalidRequestError(
+        "Task prompt length (" + deltaPrompt.length + ") exceeds the maximum safe argument length (" +
+          options.maxPromptLength + " characters); reduce task, visual context, or the number of context file references",
+      );
+    }
+    return deltaPrompt;
+  }
+
   const operatingRuleLines = mode
     ? ["Operating rule: " + MODE_RULES[mode]]
     : [

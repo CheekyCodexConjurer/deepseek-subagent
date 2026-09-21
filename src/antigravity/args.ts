@@ -18,6 +18,8 @@ export interface AntigravityCliOptions {
   sandbox?: boolean;
   addDirs?: string[];
   dangerouslySkipPermissions?: boolean;
+  conversationId?: string | null | undefined;
+  outputFormat?: "text" | "json" | "stream-json" | null | undefined;
 }
 
 export function formatPrintTimeout(timeoutMs: number): string {
@@ -35,9 +37,13 @@ export function buildAgyArgs(prompt: string, options: AntigravityCliOptions = {}
     "--model",
     options.model ?? AGY_MODEL,
   ];
+  if (options.conversationId && options.conversationId.trim().length > 0) {
+    args.push("--conversation", options.conversationId.trim());
+  }
   if (options.sandbox) args.push("--sandbox");
   for (const directory of options.addDirs ?? []) args.push("--add-dir", directory);
   if (options.dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
+  if (options.outputFormat) args.push("--output-format", options.outputFormat);
 
   const printTimeout = (typeof options.printTimeout === "string" && options.printTimeout.length > 0)
     ? options.printTimeout

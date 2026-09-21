@@ -129,10 +129,15 @@ export interface AbortInput {
   reason?: string;
 }
 
+export type RecoverResultSection = "summary" | "files" | "tests" | "risks" | "diff" | "evidence" | "full";
+
 export interface RecoverResultInput {
   requestId?: string | undefined;
   jobId?: string | undefined;
   agentId?: string | undefined;
+  section?: RecoverResultSection | undefined;
+  offset?: number | undefined;
+  limit?: number | undefined;
 }
 
 export interface AgentRecord {
@@ -151,6 +156,7 @@ export interface AgentRecord {
   modelRoute: string | null;
   /** Lineage link to the agent this one was spawned from (closed-agent resume). */
   parentAgentId: string | null;
+  providerConversationId?: string | null;
   status: AgentStatus;
   createdAt: string;
   updatedAt: string;
@@ -208,6 +214,11 @@ export interface JobRecord {
   exclusiveResources?: string[] | null;
   queuedAt?: string | null;
   dispatchedAt?: string | null;
+  workerInputTokens?: number | null;
+  workerOutputTokens?: number | null;
+  workerThinkingTokens?: number | null;
+  workerCachedInputTokens?: number | null;
+  workerTotalTokens?: number | null;
 }
 
 export interface BatchRecord {
@@ -420,6 +431,19 @@ export interface ProgressSnapshot {
   diagnosticEvidence?: string | null;
 }
 
+export interface WorkerClaims {
+  summary: string;
+  files: string[];
+  tests: string[];
+  risks: string[];
+}
+
+export interface ResultDetailsRef {
+  resultPath: string;
+  hasMoreDetails: boolean;
+  availableSections: string[];
+}
+
 export interface FollowResult {
   agentId: string;
   jobId: string;
@@ -435,6 +459,15 @@ export interface FollowResult {
   permissionId?: string | null;
   message?: string;
   receipt?: ExecutionReceipt;
+  claims?: WorkerClaims;
+  detailsRef?: ResultDetailsRef;
+  tokens?: {
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    cachedInputTokens: number;
+    totalTokens: number;
+  };
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
   semanticProgress?: SemanticProgress;

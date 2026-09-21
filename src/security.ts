@@ -64,7 +64,8 @@ export function normalizeTitle(topic: string): string {
     .join(" ");
 }
 
-export function truncate(value: string, maxLength: number): string {
+export function truncate(value: string, maxLength?: number): string {
+  if (maxLength === undefined || maxLength === null) return value;
   if (value.length <= maxLength) return value;
   return value.slice(0, Math.max(0, maxLength - 1)) + "…";
 }

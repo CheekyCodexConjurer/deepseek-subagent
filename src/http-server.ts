@@ -207,10 +207,16 @@ export class BridgeHttpServer {
     }
     if (method === "POST" && url.pathname === "/v1/jobs/recover") {
       const value = asRecord(body);
+      const section = value.section !== undefined ? enumValue(value.section, ["summary", "files", "tests", "risks", "diff", "evidence", "full"], "section") : undefined;
+      const offset = value.offset !== undefined ? integerInRange(value.offset, 0, 1_000_000, "offset") : undefined;
+      const limit = value.limit !== undefined ? integerInRange(value.limit, 1, 1_000, "limit") : undefined;
       const result = await this.service.recoverResult({
         requestId: optionalString(value.requestId ?? value.request_id),
         jobId: optionalString(value.jobId ?? value.job_id),
         agentId: optionalString(value.agentId ?? value.agent_id),
+        ...(section ? { section: section as any } : {}),
+        ...(offset !== undefined ? { offset } : {}),
+        ...(limit !== undefined ? { limit } : {}),
       });
       writeJson(response, 200, result);
       return;

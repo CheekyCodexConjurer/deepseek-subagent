@@ -23,7 +23,7 @@ import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
 import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult, AntigravityStreamProgress } from "./antigravity/types.js";
 
-import { formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { createCompactClaims, createDetailsRef, formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
@@ -52,6 +52,7 @@ import type {
   ProgressActivity,
   ProgressSnapshot,
   RecoverResultInput,
+  RecoverResultSection,
   ResolvedRoute,
   ResultEnvelope,
   RouteStatusInfo,
@@ -66,7 +67,12 @@ import type {
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
 
-function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean, allowedExternalFiles?: string[]): PromptBuildOptions {
+function workerPromptOptions(
+  config: BridgeConfig,
+  isAntigravity: boolean,
+  allowedExternalFiles?: string[],
+  isContinuation?: boolean,
+): PromptBuildOptions {
   return {
     maxLength: config.maxTaskLength,
     ...(isAntigravity ? {
@@ -74,6 +80,7 @@ function workerPromptOptions(config: BridgeConfig, isAntigravity: boolean, allow
       maxPromptLength: AGY_MAX_PROMPT_LENGTH,
     } : {}),
     ...(allowedExternalFiles ? { allowedExternalFiles } : {}),
+    ...(isContinuation ? { isContinuation: true } : {}),
   };
 }
 
@@ -1402,7 +1409,8 @@ export class BridgeService {
           contextFiles: effectiveContextFiles,
         };
         const allowedExternalFiles = [path.resolve(this.config.globalGeminiContextPath)];
-         const promptOptions = workerPromptOptions(this.config, true, allowedExternalFiles);
+        const isContinuation = job.kind === "continue" && Boolean(agent.providerConversationId);
+        const promptOptions = workerPromptOptions(this.config, true, allowedExternalFiles, isContinuation);
         prompt = await buildWorkerPrompt(effectiveWorkerInput, agent.workspacePath, promptOptions);
       }
 
@@ -1512,11 +1520,12 @@ export class BridgeService {
         if (!input.allowRespawn) throw new ConflictError("Agent is not continuable", "not_continuable");
         return this.respawnClosedAgent(agent, input);
       }
+      const isContinuation = Boolean(agent.providerConversationId);
       const prompt = await buildWorkerPrompt({
         task: input.task,
         relation: input.relation,
         ...(input.visualContext ? { visualContext: input.visualContext } : {}),
-      }, agent.workspacePath, workerPromptOptions(this.config, agent.modelProviderId === "antigravity"));
+      }, agent.workspacePath, workerPromptOptions(this.config, agent.modelProviderId === "antigravity", undefined, isContinuation));
       if (active?.status === "needs_approval") {
         const message = "Antigravity jobs do not expose resumable provider approval sessions";
         await this.failJob(active, agent, message);
@@ -2817,6 +2826,9 @@ export class BridgeService {
     let requestId: string | undefined;
     let jobId: string | undefined;
     let agentId: string | undefined;
+    let section: RecoverResultSection | undefined;
+    let offset: number | undefined;
+    let limit: number | undefined;
     let isLegacyPositional = false;
 
     if (typeof input === "string") {
@@ -2827,6 +2839,9 @@ export class BridgeService {
       requestId = input.requestId;
       jobId = input.jobId;
       agentId = input.agentId;
+      section = input.section;
+      offset = input.offset;
+      limit = input.limit;
     }
 
     const hasRequestId = typeof requestId === "string" && requestId.trim().length > 0;
@@ -2866,6 +2881,74 @@ export class BridgeService {
     // Recover returns a usable final result: the terminal obligation is
     // explicitly consumed here, separate from agent close.
     this.store.consumeResult(job.id);
+
+    if (section && section !== "full") {
+      const envelope = (result as { envelope?: ResultEnvelope }).envelope;
+      const off = Math.max(0, offset ?? 0);
+      const lim = Math.max(1, limit ?? 50);
+
+      switch (section) {
+        case "summary":
+          return {
+            section: "summary",
+            summary: envelope?.summary ?? "",
+            rawAssistantText: (result as { rawAssistantText?: string }).rawAssistantText,
+          };
+        case "files": {
+          const files = envelope?.files ?? [];
+          return {
+            section: "files",
+            items: files.slice(off, off + lim),
+            offset: off,
+            limit: lim,
+            totalCount: files.length,
+            hasMore: off + lim < files.length,
+          };
+        }
+        case "tests": {
+          const tests = envelope?.tests ?? [];
+          return {
+            section: "tests",
+            items: tests.slice(off, off + lim),
+            offset: off,
+            limit: lim,
+            totalCount: tests.length,
+            hasMore: off + lim < tests.length,
+          };
+        }
+        case "risks": {
+          const risks = envelope?.risks ?? [];
+          return {
+            section: "risks",
+            items: risks.slice(off, off + lim),
+            offset: off,
+            limit: lim,
+            totalCount: risks.length,
+            hasMore: off + lim < risks.length,
+          };
+        }
+        case "diff":
+          return {
+            section: "diff",
+            diffSummary: envelope?.diffSummary ?? "",
+            diff: (result as { diff?: unknown }).diff,
+          };
+        case "evidence": {
+          const evidence = envelope?.evidence;
+          const items = evidence?.items ?? [];
+          return {
+            section: "evidence",
+            summary: evidence?.summary,
+            items: items.slice(off, off + lim),
+            offset: off,
+            limit: lim,
+            totalCount: items.length,
+            hasMore: off + lim < items.length,
+          };
+        }
+      }
+    }
+
     return result;
   }
 
@@ -3417,6 +3500,15 @@ export class BridgeService {
     const earlyExit = envelope?.earlyExit ?? progress.earlyExit;
     const escalation = envelope?.escalation ?? progress.escalation;
     const semanticProgress = progress.semanticProgress;
+    const claims = envelope ? createCompactClaims(envelope) : undefined;
+    const detailsRef = envelope ? createDetailsRef(envelope) : undefined;
+    const tokens = (job.workerTotalTokens !== null && job.workerTotalTokens !== undefined) ? {
+      inputTokens: job.workerInputTokens ?? 0,
+      outputTokens: job.workerOutputTokens ?? 0,
+      thinkingTokens: job.workerThinkingTokens ?? 0,
+      cachedInputTokens: job.workerCachedInputTokens ?? 0,
+      totalTokens: job.workerTotalTokens ?? 0,
+    } : undefined;
     return {
       agentId: agent.id,
       jobId: job.id,
@@ -3435,6 +3527,9 @@ export class BridgeService {
       ...(earlyExit ? { earlyExit } : {}),
       ...(escalation ? { escalation } : {}),
       ...(semanticProgress ? { semanticProgress } : {}),
+      ...(claims ? { claims } : {}),
+      ...(detailsRef ? { detailsRef } : {}),
+      ...(tokens ? { tokens } : {}),
     };
   }
 
@@ -3781,6 +3876,20 @@ export class BridgeService {
       const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
       try {
         this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
+        if (result.conversationId) {
+          this.store.setAgentProviderConversationId(agent.id, result.conversationId);
+        }
+        if (result.usage) {
+          const prior = this.store.getAgentPriorCumulativeWorkerTokens(agent.id, job.id);
+          const deltaUsage = {
+            inputTokens: Math.max(0, (result.usage.inputTokens ?? 0) - prior.inputTokens),
+            outputTokens: Math.max(0, (result.usage.outputTokens ?? 0) - prior.outputTokens),
+            thinkingTokens: Math.max(0, (result.usage.thinkingTokens ?? 0) - prior.thinkingTokens),
+            cachedInputTokens: Math.max(0, (result.usage.cachedInputTokens ?? 0) - prior.cachedInputTokens),
+            totalTokens: Math.max(0, (result.usage.totalTokens ?? 0) - prior.totalTokens),
+          };
+          this.store.updateJobWorkerUsage(job.id, deltaUsage, capturedFence);
+        }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {
             earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),
@@ -3949,6 +4058,7 @@ export class BridgeService {
         requestId: job.requestId,
         timeoutMs: effectiveTimeoutMs,
         fence: capturedFence,
+        conversationId: agent.providerConversationId ?? undefined,
         onHeartbeat,
         onProgress,
       });
@@ -3965,6 +4075,20 @@ export class BridgeService {
       const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
       try {
         this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
+        if (result.conversationId) {
+          this.store.setAgentProviderConversationId(agent.id, result.conversationId);
+        }
+        if (result.usage) {
+          const prior = this.store.getAgentPriorCumulativeWorkerTokens(agent.id, job.id);
+          const deltaUsage = {
+            inputTokens: Math.max(0, (result.usage.inputTokens ?? 0) - prior.inputTokens),
+            outputTokens: Math.max(0, (result.usage.outputTokens ?? 0) - prior.outputTokens),
+            thinkingTokens: Math.max(0, (result.usage.thinkingTokens ?? 0) - prior.thinkingTokens),
+            cachedInputTokens: Math.max(0, (result.usage.cachedInputTokens ?? 0) - prior.cachedInputTokens),
+            totalTokens: Math.max(0, (result.usage.totalTokens ?? 0) - prior.totalTokens),
+          };
+          this.store.updateJobWorkerUsage(job.id, deltaUsage, capturedFence);
+        }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {
             earlyExitAt: stored.envelope.earlyExit.signaledAt || new Date().toISOString(),

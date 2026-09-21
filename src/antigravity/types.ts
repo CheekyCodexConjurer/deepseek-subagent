@@ -2,6 +2,14 @@ import type { EarlyExitSignal, EscalationProposal, EvidenceBundle } from "../typ
 
 export type AntigravityResultStatus = "completed" | "completed_partial" | "timed_out" | "failed" | "aborted";
 
+export interface WorkerTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  cachedInputTokens: number;
+  totalTokens: number;
+}
+
 /**
  * Result of a single Antigravity `agy` run, shaped after the bridge's
  * persisted ResultEnvelope contract (summary/files/tests/risks/diffSummary/
@@ -11,6 +19,7 @@ export type AntigravityResultStatus = "completed" | "completed_partial" | "timed
 export interface AntigravityRunResult {
   status: AntigravityResultStatus;
   runId: string | null;
+  conversationId?: string | null;
   summary: string;
   fullText?: string;
   files: string[];
@@ -21,6 +30,9 @@ export interface AntigravityRunResult {
   modelDisplayName: string;
   workspace: string;
   rawOutput: string;
+  usage?: WorkerTokenUsage;
+  durationSeconds?: number | null;
+  numTurns?: number | null;
   evidence?: EvidenceBundle;
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
@@ -48,6 +60,8 @@ export interface AntigravityAttemptManifest {
   sandbox: boolean;
   addDirs: string[];
   dangerouslySkipPermissions: boolean;
+  conversationId?: string | null;
+  outputFormat?: "text" | "json" | "stream-json" | null;
   attemptDir: string;
   stdoutPath: string;
   stderrPath: string;
@@ -88,6 +102,10 @@ export interface AntigravityAttemptStatus {
   summary: string;
   fullText?: string;
   runId: string | null;
+  conversationId?: string | null;
+  usage?: WorkerTokenUsage;
+  durationSeconds?: number | null;
+  numTurns?: number | null;
   files: string[];
   tests: string[];
   risks: string[];

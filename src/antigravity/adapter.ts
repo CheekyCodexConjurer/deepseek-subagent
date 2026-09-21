@@ -38,6 +38,8 @@ export interface AntigravityRunOptions {
   agentId?: string | undefined;
   jobId?: string | undefined;
   requestId?: string | undefined;
+  conversationId?: string | null | undefined;
+  outputFormat?: "text" | "json" | "stream-json" | null | undefined;
   onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
   onProgress?: ((progress: AntigravityStreamProgress) => void | Promise<void>) | undefined;
 }
@@ -169,6 +171,10 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     return {
       status: status.status,
       runId: status.runId,
+      conversationId: status.conversationId ?? manifest.conversationId ?? null,
+      ...(status.usage ? { usage: status.usage } : {}),
+      ...(status.durationSeconds !== undefined && status.durationSeconds !== null ? { durationSeconds: status.durationSeconds } : {}),
+      ...(status.numTurns !== undefined && status.numTurns !== null ? { numTurns: status.numTurns } : {}),
       summary: status.summary,
       fullText: typeof status.fullText === "string" ? status.fullText : (status.summary || ""),
       files: status.files,
@@ -214,6 +220,8 @@ export class AntigravityAdapter implements AntigravityProviderLike {
         sandbox: this.sandbox,
         addDirs: this.addDirs,
         dangerouslySkipPermissions: this.dangerouslySkipPermissions,
+        conversationId: options.conversationId,
+        outputFormat: options.outputFormat ?? "json",
       });
       return await this.runAttempt(manifest, options.signal, options.onHeartbeat, options.onProgress);
     }
@@ -228,6 +236,8 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       sandbox: this.sandbox,
       addDirs: this.addDirs,
       dangerouslySkipPermissions: this.dangerouslySkipPermissions,
+      conversationId: options.conversationId,
+      outputFormat: options.outputFormat ?? "json",
     });
     const captured = await runAgy(args, {
       command: this.command,
@@ -251,6 +261,10 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     return {
       status,
       runId: parsed.runId,
+      conversationId: parsed.conversationId ?? options.conversationId ?? null,
+      ...(parsed.usage ? { usage: parsed.usage } : {}),
+      ...(parsed.durationSeconds !== undefined && parsed.durationSeconds !== null ? { durationSeconds: parsed.durationSeconds } : {}),
+      ...(parsed.numTurns !== undefined && parsed.numTurns !== null ? { numTurns: parsed.numTurns } : {}),
       summary: parsed.summary,
       fullText: parsed.fullText,
       files: parsed.files,

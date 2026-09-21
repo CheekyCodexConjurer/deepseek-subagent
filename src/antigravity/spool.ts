@@ -37,6 +37,8 @@ export interface CreateAttemptInput {
   sandbox?: boolean | undefined;
   addDirs?: string[] | undefined;
   dangerouslySkipPermissions?: boolean | undefined;
+  conversationId?: string | null | undefined;
+  outputFormat?: "text" | "json" | "stream-json" | null | undefined;
   parentAttemptId?: string | null | undefined;
   maxOutputBytes?: number | undefined;
   fence?: number | null | undefined;
@@ -71,6 +73,8 @@ export class AntigravitySpool {
       sandbox,
       addDirs,
       dangerouslySkipPermissions,
+      conversationId: input.conversationId,
+      outputFormat: input.outputFormat ?? "json",
     });
 
     const promptPath = path.join(dir, "prompt.txt");
@@ -114,6 +118,8 @@ export class AntigravitySpool {
       sandbox,
       addDirs,
       dangerouslySkipPermissions,
+      conversationId: input.conversationId ?? null,
+      outputFormat: input.outputFormat ?? "json",
       attemptDir: dir,
       stdoutPath,
       stderrPath,

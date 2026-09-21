@@ -1,4 +1,4 @@
-import type { AntigravityResultStatus } from "./types.js";
+import type { AntigravityResultStatus, WorkerTokenUsage } from "./types.js";
 import type { EarlyExitSignal, EscalationProposal, EvidenceBundle, EvidenceItem } from "../types.js";
 import { parseEarlyExit, parseEscalation, parseEvidence } from "../result.js";
 import { redactSecrets, truncate } from "../security.js";
@@ -7,6 +7,10 @@ export interface ParsedAgyOutput {
   status: AntigravityResultStatus | null;
   hasJson: boolean;
   runId: string | null;
+  conversationId?: string | null;
+  usage?: WorkerTokenUsage;
+  durationSeconds?: number | null;
+  numTurns?: number | null;
   summary: string;
   fullText: string;
   files: string[];
@@ -56,7 +60,7 @@ function firstStringList(record: Record<string, unknown>, keys: string[]): strin
 }
 
 const CANDIDATE_MACHINE_KEY_REGEX =
-  /"(?:status|state|runId|run_id|taskId|task_id|sessionId|session_id|executionId|attemptId|attempt_id|reasoning|thought|thoughts|thinking|internal|diffSummary|diff_summary)"\s*:/i;
+  /"(?:status|state|runId|run_id|taskId|task_id|sessionId|session_id|conversationId|conversation_id|executionId|attemptId|attempt_id|reasoning|thought|thoughts|thinking|internal|diffSummary|diff_summary|response|usage)"\s*:/i;
 
 const PROTOCOL_ENVELOPE_KEYS = new Set([
   "status",
@@ -64,6 +68,8 @@ const PROTOCOL_ENVELOPE_KEYS = new Set([
   "result",
   "runId",
   "run_id",
+  "conversationId",
+  "conversation_id",
   "taskId",
   "task_id",
   "sessionId",
@@ -77,6 +83,12 @@ const PROTOCOL_ENVELOPE_KEYS = new Set([
   "output",
   "description",
   "message",
+  "response",
+  "usage",
+  "num_turns",
+  "numTurns",
+  "duration_seconds",
+  "durationSeconds",
   "fullText",
   "full_text",
   "rawAssistantText",
@@ -283,6 +295,27 @@ function extractRecognizedVisibleText(json: Record<string, unknown>, keys: strin
   return null;
 }
 
+function parseAgyUsage(raw: unknown): WorkerTokenUsage | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const inputTokens = num(obj.input_tokens ?? obj.inputTokens);
+  const outputTokens = num(obj.output_tokens ?? obj.outputTokens);
+  const thinkingTokens = num(obj.thinking_tokens ?? obj.thinkingTokens);
+  const cachedInputTokens = num(obj.cache_read_tokens ?? obj.cached_input_tokens ?? obj.cachedInputTokens);
+  const totalTokens = num(obj.total_tokens ?? obj.totalTokens) || (inputTokens + outputTokens + thinkingTokens);
+  if (inputTokens === 0 && outputTokens === 0 && thinkingTokens === 0 && cachedInputTokens === 0 && totalTokens === 0) {
+    return undefined;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    thinkingTokens,
+    cachedInputTokens,
+    totalTokens,
+  };
+}
+
 export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput {
   const json = extractAgyJson(stdout);
   const earlyExit = parseAgyEarlyExit(json, stdout);
@@ -327,15 +360,17 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     };
   }
   const rawStatus = firstString(json, ["status", "state", "result"]);
-  const rawRunId = firstString(json, ["runId", "run_id", "taskId", "task_id", "sessionId", "session_id", "executionId"]);
+  const rawConversationId = firstString(json, ["conversation_id", "conversationId"]);
+  const rawRunId = firstString(json, ["runId", "run_id", "taskId", "task_id", "sessionId", "session_id", "executionId"]) ?? rawConversationId;
   // Known machine envelope: extract ONLY recognized visible response fields.
   // Never fall back to raw JSON/stdout when recognized response is absent.
-  const recognizedSummary = extractRecognizedVisibleText(json, ["summary", "output", "description", "message", "result"]) ?? "";
+  const recognizedSummary = extractRecognizedVisibleText(json, ["summary", "output", "description", "message", "response", "result"]) ?? "";
   const recognizedFullText = extractRecognizedVisibleText(json, [
     "fullText",
     "full_text",
     "rawAssistantText",
     "raw_assistant_text",
+    "response",
     "output",
     "description",
     "message",
@@ -346,6 +381,9 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
   const rawTests = firstStringList(json, ["tests", "testResults", "test_results"]);
   const rawRisks = firstStringList(json, ["risks", "warnings"]);
   const rawDiff = firstString(json, ["diffSummary", "diff_summary", "diff"]) ?? "";
+  const usage = parseAgyUsage(json.usage);
+  const durationSeconds = typeof json.duration_seconds === "number" ? json.duration_seconds : (typeof json.durationSeconds === "number" ? json.durationSeconds : null);
+  const numTurns = typeof json.num_turns === "number" ? json.num_turns : (typeof json.numTurns === "number" ? json.numTurns : null);
 
   const redactedSummary = redactSecrets(recognizedSummary);
   const redactedFullText = redactSecrets(recognizedFullText);
@@ -354,6 +392,10 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     status: parseAgyStatus(rawStatus),
     hasJson: true,
     runId: rawRunId ? truncate(redactSecrets(rawRunId), 200) : null,
+    conversationId: rawConversationId ? truncate(redactSecrets(rawConversationId), 200) : (rawRunId ? truncate(redactSecrets(rawRunId), 200) : null),
+    ...(usage ? { usage } : {}),
+    ...(durationSeconds !== null ? { durationSeconds } : {}),
+    ...(numTurns !== null ? { numTurns } : {}),
     summary: truncate(redactedSummary, 4_000),
     fullText: truncate(redactedFullText, 2_000_000),
     files: rawFiles.slice(0, 100).map((f) => truncate(redactSecrets(f), 500)),

@@ -479,6 +479,30 @@ export class BridgeStore {
         }
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(22, ?)").run(new Date().toISOString());
       }
+      const v23Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 23").get() as Row | undefined;
+      if (!v23Migration) {
+        const agentCols = (this.db.prepare("PRAGMA table_info(agents)").all() as Row[]).map((c) => c.name);
+        if (!agentCols.includes("provider_conversation_id")) {
+          this.db.exec("ALTER TABLE agents ADD COLUMN provider_conversation_id TEXT;");
+        }
+        const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
+        if (!jobCols.includes("worker_input_tokens")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_input_tokens INTEGER DEFAULT 0;");
+        }
+        if (!jobCols.includes("worker_output_tokens")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_output_tokens INTEGER DEFAULT 0;");
+        }
+        if (!jobCols.includes("worker_thinking_tokens")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_thinking_tokens INTEGER DEFAULT 0;");
+        }
+        if (!jobCols.includes("worker_cached_input_tokens")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_cached_input_tokens INTEGER DEFAULT 0;");
+        }
+        if (!jobCols.includes("worker_total_tokens")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_total_tokens INTEGER DEFAULT 0;");
+        }
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(23, ?)").run(new Date().toISOString());
+      }
     });
   }
 
@@ -1128,6 +1152,72 @@ export class BridgeStore {
     return agent;
   }
 
+  setAgentProviderConversationId(id: string, providerConversationId: string): AgentRecord {
+    this.db.prepare("UPDATE agents SET provider_conversation_id = ?, updated_at = ? WHERE id = ?").run(
+      providerConversationId,
+      new Date().toISOString(),
+      id,
+    );
+    const agent = this.getAgent(id);
+    if (!agent) throw new Error("Agent disappeared: " + id);
+    return agent;
+  }
+
+  updateJobWorkerUsage(
+    id: string,
+    usage: { inputTokens?: number | null; outputTokens?: number | null; thinkingTokens?: number | null; cachedInputTokens?: number | null; totalTokens?: number | null },
+    expectedFence?: number | null,
+  ): JobRecord {
+    let sql = "UPDATE jobs SET worker_input_tokens = ?, worker_output_tokens = ?, worker_thinking_tokens = ?, worker_cached_input_tokens = ?, worker_total_tokens = ? WHERE id = ?";
+    const params: (number | string | null)[] = [
+      usage.inputTokens ?? 0,
+      usage.outputTokens ?? 0,
+      usage.thinkingTokens ?? 0,
+      usage.cachedInputTokens ?? 0,
+      usage.totalTokens ?? 0,
+      id,
+    ];
+    if (expectedFence !== undefined && expectedFence !== null) {
+      sql += " AND (fence IS NULL OR fence <= ?)";
+      params.push(expectedFence);
+    }
+    const info = this.db.prepare(sql).run(...params);
+    if (info.changes === 0) {
+      const existing = this.getJob(id);
+      if (!existing) throw new Error("Job disappeared: " + id);
+      if (expectedFence !== undefined && expectedFence !== null && existing.fence !== null && existing.fence !== undefined && expectedFence < existing.fence) {
+        throw new ConflictError("Stale write rejected: fence " + expectedFence + " is lower than current fence " + existing.fence, "state_conflict");
+      }
+      throw new ConflictError("Stale write rejected: fence is obsolete or job disappeared", "state_conflict");
+    }
+    const updated = this.getJob(id);
+    if (!updated) throw new Error("Job disappeared: " + id);
+    return updated;
+  }
+
+  getAgentPriorCumulativeWorkerTokens(agentId: string, currentJobId?: string): {
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    cachedInputTokens: number;
+    totalTokens: number;
+  } {
+    const jobs = this.listJobs().filter((j) => j.agentId === agentId && (!currentJobId || j.id !== currentJobId));
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let thinkingTokens = 0;
+    let cachedInputTokens = 0;
+    let totalTokens = 0;
+    for (const j of jobs) {
+      inputTokens += j.workerInputTokens ?? 0;
+      outputTokens += j.workerOutputTokens ?? 0;
+      thinkingTokens += j.workerThinkingTokens ?? 0;
+      cachedInputTokens += j.workerCachedInputTokens ?? 0;
+      totalTokens += j.workerTotalTokens ?? 0;
+    }
+    return { inputTokens, outputTokens, thinkingTokens, cachedInputTokens, totalTokens };
+  }
+
   countJobsWithCorrelationHints(): number {
 
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE hint_thread_id IS NOT NULL OR hint_turn_id IS NOT NULL").get() as Row;
@@ -1725,6 +1815,7 @@ export class BridgeStore {
       modelVariant: nullableString(row, "model_variant"),
       modelRoute: nullableString(row, "model_route"),
       parentAgentId: nullableString(row, "parent_agent_id"),
+      providerConversationId: nullableString(row, "provider_conversation_id"),
       status: stringValue(row, "status") as AgentStatus,
       createdAt: stringValue(row, "created_at"),
       updatedAt: stringValue(row, "updated_at"),
@@ -1784,6 +1875,11 @@ export class BridgeStore {
       exclusiveResources: row.exclusive_resources ? JSON.parse(stringValue(row, "exclusive_resources")) : null,
       queuedAt: nullableString(row, "queued_at"),
       dispatchedAt: nullableString(row, "dispatched_at"),
+      workerInputTokens: typeof row.worker_input_tokens === "number" || typeof row.worker_input_tokens === "bigint" ? Number(row.worker_input_tokens) : null,
+      workerOutputTokens: typeof row.worker_output_tokens === "number" || typeof row.worker_output_tokens === "bigint" ? Number(row.worker_output_tokens) : null,
+      workerThinkingTokens: typeof row.worker_thinking_tokens === "number" || typeof row.worker_thinking_tokens === "bigint" ? Number(row.worker_thinking_tokens) : null,
+      workerCachedInputTokens: typeof row.worker_cached_input_tokens === "number" || typeof row.worker_cached_input_tokens === "bigint" ? Number(row.worker_cached_input_tokens) : null,
+      workerTotalTokens: typeof row.worker_total_tokens === "number" || typeof row.worker_total_tokens === "bigint" ? Number(row.worker_total_tokens) : null,
     };
   }
 
