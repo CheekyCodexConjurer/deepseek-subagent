@@ -23,7 +23,7 @@ import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
 import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult, AntigravityStreamProgress } from "./antigravity/types.js";
 
-import { createCompactClaims, createDetailsRef, formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult } from "./result.js";
+import { createCompactClaims, createCompactWorkerResult, createDetailsRef, deriveTurnUsage, formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult, serializedBytes } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
@@ -2886,65 +2886,92 @@ export class BridgeService {
       const envelope = (result as { envelope?: ResultEnvelope }).envelope;
       const off = Math.max(0, offset ?? 0);
       const lim = Math.max(1, limit ?? 50);
+      const pageBudget = this.config.recoverPageMaxBytes;
+
+      const paginate = (name: string, items: string[], extra: Record<string, unknown> = {}): unknown => {
+        const page: string[] = [];
+        let cursor = off;
+        while (cursor < items.length && page.length < lim) {
+          const candidate = [...page, items[cursor] as string];
+          const payload = {
+            section: name,
+            items: candidate,
+            offset: off,
+            returnedCount: candidate.length,
+            totalCount: items.length,
+            hasMore: off + candidate.length < items.length,
+            nextOffset: off + candidate.length < items.length ? off + candidate.length : null,
+            ...extra,
+          };
+          if (page.length > 0 && serializedBytes(payload) > pageBudget) break;
+          page.push(items[cursor] as string);
+          cursor += 1;
+        }
+        const hasMore = off + page.length < items.length;
+        const payload = {
+          section: name,
+          items: page,
+          offset: off,
+          returnedCount: page.length,
+          totalCount: items.length,
+          hasMore,
+          nextOffset: hasMore ? off + page.length : null,
+          ...extra,
+        };
+        return {
+          ...payload,
+          serializedBytes: serializedBytes(payload),
+        };
+      };
 
       switch (section) {
-        case "summary":
-          return {
+        case "summary": {
+          // A summary recovery is small by contract: it returns the summary and
+          // minimal metadata only. The raw worker text is never attached to an
+          // apparently compact query; use section "raw" explicitly for that.
+          const summary = envelope?.summary ?? "";
+          const payload = {
             section: "summary",
-            summary: envelope?.summary ?? "",
-            rawAssistantText: (result as { rawAssistantText?: string }).rawAssistantText,
+            summary,
+            summaryTruncated: (result as { envelope?: ResultEnvelope }).envelope !== undefined && Boolean((result as { rawAssistantText?: string }).rawAssistantText) &&
+              ((result as { rawAssistantText?: string }).rawAssistantText as string).trim() !== summary.trim(),
+            status: envelope?.status ?? null,
+            jobId: envelope?.jobId ?? null,
+            agentId: envelope?.agentId ?? null,
           };
-        case "files": {
-          const files = envelope?.files ?? [];
-          return {
-            section: "files",
-            items: files.slice(off, off + lim),
-            offset: off,
-            limit: lim,
-            totalCount: files.length,
-            hasMore: off + lim < files.length,
-          };
+          return { ...payload, serializedBytes: serializedBytes(payload) };
         }
-        case "tests": {
-          const tests = envelope?.tests ?? [];
-          return {
-            section: "tests",
-            items: tests.slice(off, off + lim),
-            offset: off,
-            limit: lim,
-            totalCount: tests.length,
-            hasMore: off + lim < tests.length,
-          };
-        }
-        case "risks": {
-          const risks = envelope?.risks ?? [];
-          return {
-            section: "risks",
-            items: risks.slice(off, off + lim),
-            offset: off,
-            limit: lim,
-            totalCount: risks.length,
-            hasMore: off + lim < risks.length,
-          };
-        }
-        case "diff":
-          return {
+        case "files":
+          return paginate("files", envelope?.files ?? []);
+        case "tests":
+          return paginate("tests", envelope?.tests ?? []);
+        case "risks":
+          return paginate("risks", envelope?.risks ?? []);
+        case "unresolved":
+          return paginate("unresolved", envelope?.unresolved ?? []);
+        case "diff": {
+          const payload = {
             section: "diff",
             diffSummary: envelope?.diffSummary ?? "",
             diff: (result as { diff?: unknown }).diff,
           };
+          return { ...payload, serializedBytes: serializedBytes(payload) };
+        }
         case "evidence": {
           const evidence = envelope?.evidence;
           const items = evidence?.items ?? [];
-          return {
-            section: "evidence",
+          return paginate("evidence", items as unknown as string[], {
             summary: evidence?.summary,
-            items: items.slice(off, off + lim),
-            offset: off,
-            limit: lim,
-            totalCount: items.length,
-            hasMore: off + lim < items.length,
+            claimsCount: evidence?.claimsCount,
+          });
+        }
+        case "raw": {
+          const raw = (result as { rawAssistantText?: string }).rawAssistantText ?? "";
+          const payload = {
+            section: "raw",
+            rawAssistantText: raw,
           };
+          return { ...payload, serializedBytes: serializedBytes(payload) };
         }
       }
     }
@@ -3450,17 +3477,27 @@ export class BridgeService {
 
   private async followResultForJob(agent: AgentRecord, job: JobRecord): Promise<FollowResult> {
     let envelope: ResultEnvelope | null = null;
+    let projectionEnvelope: ResultEnvelope | null = null;
     if (job.resultPath) {
       try {
-        const persisted = JSON.parse(await readFile(job.resultPath, "utf8")) as { envelope?: ResultEnvelope };
-        envelope = persisted.envelope ?? null;
+        const persisted = JSON.parse(await readFile(job.resultPath, "utf8")) as { envelope?: unknown };
+        const raw = persisted.envelope as ResultEnvelope | undefined;
+        if (raw) {
+          envelope = raw;
+          // Only a complete, sanitized envelope may feed the compact transport
+          // projection. A partial or legacy stub still contributes its status
+          // but never leaks unsanitized fields into the follow payload.
+          projectionEnvelope = sanitizePersistedEnvelope(raw);
+        }
       } catch {
         envelope = null;
+        projectionEnvelope = null;
       }
     }
     const followStatus = envelope?.status ?? mapJobToFollowStatus(job.status);
     return this.followResultForState(agent, job, {
       ...(envelope ? { envelope } : {}),
+      ...(projectionEnvelope ? { projectionEnvelope } : {}),
       status: followStatus,
       resultAvailable: envelope !== null,
       deadlineReached: Boolean(job.gracefulFinalizeAttempted || envelope?.deadlineReached || followStatus === "timed_out"),
@@ -3481,12 +3518,14 @@ export class BridgeService {
       workerAborted?: boolean;
       resultAvailable?: boolean;
       envelope?: ResultEnvelope;
+      projectionEnvelope?: ResultEnvelope | null;
       error?: string;
       permissionId?: string | null;
       message?: string;
     } = {},
   ): Promise<FollowResult> {
     const envelope = overrides.envelope;
+    const projection = overrides.projectionEnvelope === undefined ? envelope : (overrides.projectionEnvelope ?? undefined);
     const status = overrides.status ?? envelope?.status ?? mapJobToFollowStatus(job.status);
     const progress = await this.progressSnapshot(agent, job, 10);
     const failure = overrides.error ?? job.error;
@@ -3500,15 +3539,23 @@ export class BridgeService {
     const earlyExit = envelope?.earlyExit ?? progress.earlyExit;
     const escalation = envelope?.escalation ?? progress.escalation;
     const semanticProgress = progress.semanticProgress;
-    const claims = envelope ? createCompactClaims(envelope) : undefined;
-    const detailsRef = envelope ? createDetailsRef(envelope) : undefined;
-    const tokens = (job.workerTotalTokens !== null && job.workerTotalTokens !== undefined) ? {
-      inputTokens: job.workerInputTokens ?? 0,
-      outputTokens: job.workerOutputTokens ?? 0,
-      thinkingTokens: job.workerThinkingTokens ?? 0,
-      cachedInputTokens: job.workerCachedInputTokens ?? 0,
-      totalTokens: job.workerTotalTokens ?? 0,
+    const tokens = (job.workerUsageSource === "observed" || job.workerUsageSource === "derived") ? {
+      inputTokens: job.workerInputTokens ?? null,
+      outputTokens: job.workerOutputTokens ?? null,
+      thinkingTokens: job.workerThinkingTokens ?? null,
+      cachedInputTokens: job.workerCachedInputTokens ?? null,
+      totalTokens: job.workerTotalTokens ?? null,
+      usageScope: job.workerUsageScope ?? "unknown",
+      usageSource: job.workerUsageSource ?? "unavailable",
     } : undefined;
+    const mandatoryEvidence = projection?.validationEvidence?.mandatory ?? [];
+    const claims = projection ? createCompactClaims(projection) : undefined;
+    const compact = projection ? createCompactWorkerResult(projection, {
+      maxBytes: this.config.compactFollowMaxBytes,
+      ...(tokens ? { tokens } : {}),
+      mandatoryEvidence,
+    }) : undefined;
+    const detailsRef = compact?.detailsRef ?? (projection ? createDetailsRef(projection) : undefined);
     return {
       agentId: agent.id,
       jobId: job.id,
@@ -3528,8 +3575,12 @@ export class BridgeService {
       ...(escalation ? { escalation } : {}),
       ...(semanticProgress ? { semanticProgress } : {}),
       ...(claims ? { claims } : {}),
+      ...(compact ? { compact } : {}),
+      ...(mandatoryEvidence.length > 0 ? { mandatoryEvidence } : {}),
+      ...(compact ? { decisionReady: compact.decisionReady } : {}),
       ...(detailsRef ? { detailsRef } : {}),
       ...(tokens ? { tokens } : {}),
+      continuationPersistent: Boolean(agent.providerConversationId),
     };
   }
 
@@ -3880,15 +3931,13 @@ export class BridgeService {
           this.store.setAgentProviderConversationId(agent.id, result.conversationId);
         }
         if (result.usage) {
-          const prior = this.store.getAgentPriorCumulativeWorkerTokens(agent.id, job.id);
-          const deltaUsage = {
-            inputTokens: Math.max(0, (result.usage.inputTokens ?? 0) - prior.inputTokens),
-            outputTokens: Math.max(0, (result.usage.outputTokens ?? 0) - prior.outputTokens),
-            thinkingTokens: Math.max(0, (result.usage.thinkingTokens ?? 0) - prior.thinkingTokens),
-            cachedInputTokens: Math.max(0, (result.usage.cachedInputTokens ?? 0) - prior.cachedInputTokens),
-            totalTokens: Math.max(0, (result.usage.totalTokens ?? 0) - prior.totalTokens),
-          };
-          this.store.updateJobWorkerUsage(job.id, deltaUsage, capturedFence);
+          const prior = this.store.getAgentPriorCumulativeWorkerTokens(
+            agent.id,
+            job.id,
+            result.usage.providerConversationId ?? null,
+          );
+          const turnUsage = deriveTurnUsage(result.usage, prior);
+          this.store.updateJobWorkerUsage(job.id, turnUsage, capturedFence);
         }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {
@@ -4079,15 +4128,13 @@ export class BridgeService {
           this.store.setAgentProviderConversationId(agent.id, result.conversationId);
         }
         if (result.usage) {
-          const prior = this.store.getAgentPriorCumulativeWorkerTokens(agent.id, job.id);
-          const deltaUsage = {
-            inputTokens: Math.max(0, (result.usage.inputTokens ?? 0) - prior.inputTokens),
-            outputTokens: Math.max(0, (result.usage.outputTokens ?? 0) - prior.outputTokens),
-            thinkingTokens: Math.max(0, (result.usage.thinkingTokens ?? 0) - prior.thinkingTokens),
-            cachedInputTokens: Math.max(0, (result.usage.cachedInputTokens ?? 0) - prior.cachedInputTokens),
-            totalTokens: Math.max(0, (result.usage.totalTokens ?? 0) - prior.totalTokens),
-          };
-          this.store.updateJobWorkerUsage(job.id, deltaUsage, capturedFence);
+          const prior = this.store.getAgentPriorCumulativeWorkerTokens(
+            agent.id,
+            job.id,
+            result.usage.providerConversationId ?? null,
+          );
+          const turnUsage = deriveTurnUsage(result.usage, prior);
+          this.store.updateJobWorkerUsage(job.id, turnUsage, capturedFence);
         }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {

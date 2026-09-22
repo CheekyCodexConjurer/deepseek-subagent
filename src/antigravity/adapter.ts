@@ -180,6 +180,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       files: status.files,
       tests: status.tests,
       risks: status.risks,
+      unresolved: status.unresolved ?? [],
       diffSummary: status.diffSummary,
       model: manifest.modelId,
       modelDisplayName: "Antigravity · " + manifest.modelId,
@@ -261,6 +262,8 @@ export class AntigravityAdapter implements AntigravityProviderLike {
     return {
       status,
       runId: parsed.runId,
+      // conversationId comes only from the provider's explicit conversation
+      // field (or a manifest created from one); never from a run identifier.
       conversationId: parsed.conversationId ?? options.conversationId ?? null,
       ...(parsed.usage ? { usage: parsed.usage } : {}),
       ...(parsed.durationSeconds !== undefined && parsed.durationSeconds !== null ? { durationSeconds: parsed.durationSeconds } : {}),
@@ -270,7 +273,11 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       files: parsed.files,
       tests: parsed.tests,
       risks: parsed.risks,
+      unresolved: parsed.unresolved,
       diffSummary: parsed.diffSummary,
+      providerExecutionStatus: parsed.providerExecutionStatus,
+      workerClaimedStatus: parsed.workerClaimedStatus,
+      validationEvidence: parsed.validationEvidence,
       model,
       modelDisplayName: "Antigravity · " + model,
       workspace: options.cwd,

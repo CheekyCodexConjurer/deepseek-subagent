@@ -5,11 +5,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { defaultConfigPath, loadConfig, saveConfig } from "./config.js";
+import { defaultConfigPath, DEFAULT_COMPACT_FOLLOW_MAX_BYTES, loadConfig, saveConfig } from "./config.js";
 import { BridgeHttpClient, BridgeHttpError, BridgeTransportError } from "./http-server.js";
 import { ConflictError, InvalidRequestError } from "./errors.js";
 import { resolveCodexTaskProvenance, type TaskProvenance } from "./codex/cli-resolver.js";
 import { canRead, ensurePrivateDir, isProcessAlive, newId, redactSecrets } from "./security.js";
+import { serializedBytes } from "./result.js";
 import type { BridgeConfig } from "./types.js";
 
 const DISPLAY_NAME = "SubAgents MCP";
@@ -26,6 +27,7 @@ export async function runMcp(configPath = defaultConfigPath()): Promise<void> {
   // memoized, and shared by concurrent first operations.
   const server = createMcpServer(client, {
     ensureReady: createLazyDaemonBootstrap(config, client),
+    compactFollowMaxBytes: config.compactFollowMaxBytes,
   });
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -286,6 +288,8 @@ export interface McpServerOptions {
   name?: string;
   env?: Record<string, string | undefined>;
   provenanceResolver?: () => TaskProvenance;
+  /** Serialized-byte ceiling enforced on every follow transport payload. */
+  compactFollowMaxBytes?: number;
 }
 
 export function createMcpServer(
@@ -302,6 +306,7 @@ export function createMcpServer(
     version: "0.1.0",
   });
   const readyClient = options.ensureReady ? new LazyReadyClient(client, options.ensureReady) : client;
+  const compactFollowMaxBytes = options.compactFollowMaxBytes ?? DEFAULT_COMPACT_FOLLOW_MAX_BYTES;
 
   const spawnInputSchema = {
     request_id: z.string().min(1).optional(),
@@ -399,7 +404,7 @@ export function createMcpServer(
     agentId: z.string().min(1).optional(),
     job_id: z.string().min(1).optional(),
     jobId: z.string().min(1).optional(),
-    section: z.enum(["summary", "files", "tests", "risks", "diff", "evidence", "full"]).optional(),
+    section: z.enum(["summary", "files", "tests", "risks", "unresolved", "diff", "evidence", "full", "raw"]).optional(),
     offset: z.number().int().min(0).optional(),
     limit: z.number().int().min(1).max(1000).optional(),
   };
@@ -693,17 +698,80 @@ export function createMcpServer(
   }).optional();
 
   const tokensOutputSchema = z.object({
-    inputTokens: z.number(),
-    outputTokens: z.number(),
-    thinkingTokens: z.number(),
-    cachedInputTokens: z.number(),
-    totalTokens: z.number(),
+    inputTokens: z.number().nullable(),
+    outputTokens: z.number().nullable(),
+    thinkingTokens: z.number().nullable(),
+    cachedInputTokens: z.number().nullable(),
+    totalTokens: z.number().nullable(),
+    usageScope: z.enum(["cumulative_conversation", "per_turn", "unknown"]),
+    usageSource: z.enum(["observed", "derived", "unavailable"]),
+  }).optional();
+
+  const mandatoryEvidenceOutputSchema = z.array(z.object({
+    kind: z.string(),
+    detail: z.string(),
+  })).optional();
+
+  const compactOutputSchema = z.object({
+    version: z.literal(1),
+    status: z.string(),
+    claims: z.object({
+      summary: z.string(),
+      files: z.array(z.string()),
+      tests: z.array(z.string()),
+      risks: z.array(z.string()),
+    }),
+    mandatoryEvidence: z.array(z.object({ kind: z.string(), detail: z.string() })),
+    receipt: z.object({
+      jobId: z.string(),
+      agentId: z.string(),
+      provider: z.string(),
+      model: z.string(),
+      status: z.string(),
+      completedAt: z.string(),
+      durationMs: z.number().nullable(),
+      filesCount: z.number(),
+      testsCount: z.number(),
+      outputHash: z.string(),
+    }).nullable(),
+    tokens: z.object({
+      inputTokens: z.number().nullable(),
+      outputTokens: z.number().nullable(),
+      thinkingTokens: z.number().nullable(),
+      cachedInputTokens: z.number().nullable(),
+      totalTokens: z.number().nullable(),
+      usageScope: z.enum(["cumulative_conversation", "per_turn", "unknown"]),
+      usageSource: z.enum(["observed", "derived", "unavailable"]),
+    }).nullable(),
+    decisionReady: z.boolean(),
+    decisionReason: z.string().nullable(),
+    detailsRef: z.object({
+      resultPath: z.string().optional(),
+      hasMoreDetails: z.boolean(),
+      availableSections: z.array(z.string()),
+      summaryTruncated: z.boolean().optional(),
+      filesTotal: z.number().optional(),
+      testsTotal: z.number().optional(),
+      risksTotal: z.number().optional(),
+      unresolvedTotal: z.number().optional(),
+      evidenceTotal: z.number().optional(),
+      mandatoryDetailCount: z.number().optional(),
+      mandatorySections: z.array(z.string()).optional(),
+    }),
   }).optional();
 
   const detailsRefOutputSchema = z.object({
     resultPath: z.string().optional(),
     hasMoreDetails: z.boolean(),
     availableSections: z.array(z.string()),
+    summaryTruncated: z.boolean().optional(),
+    filesTotal: z.number().optional(),
+    testsTotal: z.number().optional(),
+    risksTotal: z.number().optional(),
+    unresolvedTotal: z.number().optional(),
+    evidenceTotal: z.number().optional(),
+    mandatoryDetailCount: z.number().optional(),
+    mandatorySections: z.array(z.string()).optional(),
   }).optional();
 
   server.registerTool("subagents_follow", {
@@ -725,13 +793,17 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
       claims: claimsOutputSchema,
+      compact: compactOutputSchema,
+      mandatoryEvidence: mandatoryEvidenceOutputSchema,
+      decisionReady: z.boolean().optional(),
+      continuationPersistent: z.boolean().optional(),
       tokens: tokensOutputSchema,
       detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args, extra?.signal);
-      return followResult(result, false);
+      return followResult(result, false, compactFollowMaxBytes);
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
       return errorResult(error);
@@ -997,13 +1069,17 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
       claims: claimsOutputSchema,
+      compact: compactOutputSchema,
+      mandatoryEvidence: mandatoryEvidenceOutputSchema,
+      decisionReady: z.boolean().optional(),
+      continuationPersistent: z.boolean().optional(),
       tokens: tokensOutputSchema,
       detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
       const result = await readyClient.call<Record<string, unknown>>("/v1/jobs/follow", args, extra?.signal);
-      return followResult(result, true);
+      return followResult(result, true, compactFollowMaxBytes);
     } catch (error) {
       if (extra?.signal?.aborted) throw error;
       return errorResult(error);
@@ -1246,7 +1322,7 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
   };
 }
 
-function followResult(result: Record<string, unknown>, isAlias = false): {
+function followResult(result: Record<string, unknown>, isAlias = false, maxBytes = DEFAULT_COMPACT_FOLLOW_MAX_BYTES): {
   content: [{ type: "text"; text: string }];
   structuredContent: Record<string, unknown>;
 } {
@@ -1262,6 +1338,10 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
   const claims = result.claims as Record<string, unknown> | undefined;
   const detailsRef = result.detailsRef as Record<string, unknown> | undefined;
   const tokens = result.tokens as Record<string, unknown> | undefined;
+  const compact = result.compact as Record<string, unknown> | undefined;
+  const mandatoryEvidence = Array.isArray(result.mandatoryEvidence) ? result.mandatoryEvidence as unknown[] : undefined;
+  const decisionReady = typeof result.decisionReady === "boolean" ? result.decisionReady : undefined;
+  const continuationPersistent = typeof result.continuationPersistent === "boolean" ? result.continuationPersistent : undefined;
 
   const compactParts: string[] = [];
   if (receipt) {
@@ -1279,25 +1359,63 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
     compactParts.push(`stage: ${semanticProgress.stage}`);
   }
   if (tokens) {
-    compactParts.push(`tokens: ${tokens.totalTokens}`);
+    compactParts.push(`tokens: ${tokens.totalTokens === null || tokens.totalTokens === undefined ? "unavailable" : tokens.totalTokens}`);
+  }
+  if (mandatoryEvidence && mandatoryEvidence.length > 0) {
+    compactParts.push(`mandatoryEvidence: ${mandatoryEvidence.length}`);
+  }
+  if (decisionReady === false) {
+    compactParts.push("decisionReady: false (fetch details before depending on this result)");
   }
 
   const compactSuffix = compactParts.length > 0 ? " [" + compactParts.join(" | ") + "]" : "";
 
+  // Explicit allowlist: the raw result envelope and the full progress history
+  // are NEVER copied into the follow transport. The complete result stays in the
+  // private persisted result file and is fetched on demand via detailsRef.
   const baseStructured: Record<string, unknown> = {
-    ...result,
+    agentId: result.agentId,
+    jobId: result.jobId,
+    status: result.status,
+    resultAvailable: result.resultAvailable,
+    ...(result.permissionId !== undefined && result.permissionId !== null ? { permissionId: result.permissionId } : {}),
+    ...(result.message !== undefined ? { message: result.message } : {}),
+    ...(result.error !== undefined ? { error: result.error } : {}),
+    ...(result.deadlineReached !== undefined ? { deadlineReached: result.deadlineReached } : {}),
+    ...(result.gracefulFinalize !== undefined ? { gracefulFinalize: result.gracefulFinalize } : {}),
+    ...(result.partial !== undefined ? { partial: result.partial } : {}),
+    ...(result.workerAborted !== undefined ? { workerAborted: result.workerAborted } : {}),
     ...(receipt ? { receipt } : {}),
     ...(earlyExit ? { earlyExit } : {}),
     ...(escalation ? { escalation } : {}),
     ...(semanticProgress ? { semanticProgress } : {}),
     ...(claims ? { claims } : {}),
+    ...(compact ? { compact } : {}),
+    ...(mandatoryEvidence ? { mandatoryEvidence } : {}),
+    ...(decisionReady !== undefined ? { decisionReady } : {}),
+    ...(continuationPersistent !== undefined ? { continuationPersistent } : {}),
     ...(detailsRef ? { detailsRef } : {}),
     ...(tokens ? { tokens } : {}),
   };
 
-  if (claims) {
-    delete baseStructured.progress;
-    delete baseStructured.result;
+  // Hard transport invariant: the serialized follow payload never exceeds the
+  // configured byte budget. Optional decorations are dropped before anything
+  // that carries evidence, and a failure to fit fails closed.
+  let payload = baseStructured;
+  if (serializedBytes(payload) > maxBytes) {
+    const droppableDecorations = ["semanticProgress", "escalation", "earlyExit", "receipt", "tokens"];
+    for (const key of droppableDecorations) {
+      if (serializedBytes(payload) <= maxBytes) break;
+      delete payload[key];
+    }
+    if (serializedBytes(payload) > maxBytes) {
+      payload = {
+        ...payload,
+        decisionReady: false,
+        decisionReason: "transport_budget_exceeded",
+      };
+      delete payload.compact;
+    }
   }
 
   if (result.status === "needs_approval") {
@@ -1307,7 +1425,7 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
         text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.${compactSuffix}`,
       }],
       structuredContent: {
-        ...baseStructured,
+        ...payload,
         obligationState: "pending",
         nextRequiredAction,
       },
@@ -1319,7 +1437,7 @@ function followResult(result: Record<string, unknown>, isAlias = false): {
       text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.${compactSuffix}`,
     }],
     structuredContent: {
-      ...baseStructured,
+      ...payload,
       obligationState: "closed",
     },
   };

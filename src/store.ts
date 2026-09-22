@@ -21,10 +21,24 @@ import type {
   ParkBarrierRecord,
   ParkPredicateType,
   WakeOutboxRecord,
+  WorkerUsageScope,
+  WorkerUsageSource,
   WorkspaceStrategy,
 } from "./types.js";
 
 type Row = Record<string, unknown>;
+
+function parseUsageScope(value: unknown): WorkerUsageScope | null {
+  return value === "cumulative_conversation" || value === "per_turn" || value === "unknown"
+    ? value
+    : null;
+}
+
+function parseUsageSource(value: unknown): WorkerUsageSource | null {
+  return value === "observed" || value === "derived" || value === "unavailable"
+    ? value
+    : null;
+}
 
 function stringValue(row: Row, key: string): string {
   const value = row[key];
@@ -502,6 +516,23 @@ export class BridgeStore {
           this.db.exec("ALTER TABLE jobs ADD COLUMN worker_total_tokens INTEGER DEFAULT 0;");
         }
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(23, ?)").run(new Date().toISOString());
+      }
+      const v24Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 24").get() as Row | undefined;
+      if (!v24Migration) {
+        const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
+        // Usage semantics are persisted next to the numbers: a provider total
+        // without a known scope must never be arithmetically combined with
+        // other turns, and a missing field must stay NULL instead of 0.
+        if (!jobCols.includes("worker_usage_scope")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_usage_scope TEXT;");
+        }
+        if (!jobCols.includes("worker_usage_source")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_usage_source TEXT;");
+        }
+        if (!jobCols.includes("worker_provider_conversation_id")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_provider_conversation_id TEXT;");
+        }
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(24, ?)").run(new Date().toISOString());
       }
     });
   }
@@ -1165,16 +1196,30 @@ export class BridgeStore {
 
   updateJobWorkerUsage(
     id: string,
-    usage: { inputTokens?: number | null; outputTokens?: number | null; thinkingTokens?: number | null; cachedInputTokens?: number | null; totalTokens?: number | null },
+    usage: {
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      thinkingTokens?: number | null;
+      cachedInputTokens?: number | null;
+      totalTokens?: number | null;
+      usageScope?: WorkerUsageScope | null;
+      usageSource?: WorkerUsageSource | null;
+      providerConversationId?: string | null;
+    },
     expectedFence?: number | null,
   ): JobRecord {
-    let sql = "UPDATE jobs SET worker_input_tokens = ?, worker_output_tokens = ?, worker_thinking_tokens = ?, worker_cached_input_tokens = ?, worker_total_tokens = ? WHERE id = ?";
+    // NULL means "the provider did not report this", which is semantically
+    // different from zero and must not be coerced.
+    let sql = "UPDATE jobs SET worker_input_tokens = ?, worker_output_tokens = ?, worker_thinking_tokens = ?, worker_cached_input_tokens = ?, worker_total_tokens = ?, worker_usage_scope = ?, worker_usage_source = ?, worker_provider_conversation_id = ? WHERE id = ?";
     const params: (number | string | null)[] = [
-      usage.inputTokens ?? 0,
-      usage.outputTokens ?? 0,
-      usage.thinkingTokens ?? 0,
-      usage.cachedInputTokens ?? 0,
-      usage.totalTokens ?? 0,
+      usage.inputTokens ?? null,
+      usage.outputTokens ?? null,
+      usage.thinkingTokens ?? null,
+      usage.cachedInputTokens ?? null,
+      usage.totalTokens ?? null,
+      usage.usageScope ?? "unknown",
+      usage.usageSource ?? "unavailable",
+      usage.providerConversationId ?? null,
       id,
     ];
     if (expectedFence !== undefined && expectedFence !== null) {
@@ -1195,14 +1240,46 @@ export class BridgeStore {
     return updated;
   }
 
-  getAgentPriorCumulativeWorkerTokens(agentId: string, currentJobId?: string): {
+  /**
+   * Prior worker usage that is arithmetically comparable with the current turn.
+   *
+   * Comparability requires ALL of: the same agent, the same provider
+   * conversation id, and a provider scope of `cumulative_conversation`. When
+   * any of those is missing the totals are zeroed and `comparable` is false so
+   * the caller keeps the observed values instead of manufacturing a delta. This
+   * prevents a new conversation (or a provider that switched to per-turn
+   * reporting) from producing a bogus subtraction.
+   */
+  getAgentPriorCumulativeWorkerTokens(
+    agentId: string,
+    currentJobId?: string,
+    currentProviderConversationId?: string | null,
+  ): {
     inputTokens: number;
     outputTokens: number;
     thinkingTokens: number;
     cachedInputTokens: number;
     totalTokens: number;
+    comparable: boolean;
+    providerConversationId: string | null;
   } {
-    const jobs = this.listJobs().filter((j) => j.agentId === agentId && (!currentJobId || j.id !== currentJobId));
+    const empty = {
+      inputTokens: 0,
+      outputTokens: 0,
+      thinkingTokens: 0,
+      cachedInputTokens: 0,
+      totalTokens: 0,
+      comparable: false,
+      providerConversationId: currentProviderConversationId ?? null,
+    };
+    if (!currentProviderConversationId) return empty;
+    const jobs = this.listJobs().filter((j) =>
+      j.agentId === agentId &&
+      (!currentJobId || j.id !== currentJobId) &&
+      j.workerUsageScope === "cumulative_conversation" &&
+      j.workerProviderConversationId === currentProviderConversationId
+    );
+    if (jobs.length === 0) return { ...empty, comparable: true };
     let inputTokens = 0;
     let outputTokens = 0;
     let thinkingTokens = 0;
@@ -1215,7 +1292,7 @@ export class BridgeStore {
       cachedInputTokens += j.workerCachedInputTokens ?? 0;
       totalTokens += j.workerTotalTokens ?? 0;
     }
-    return { inputTokens, outputTokens, thinkingTokens, cachedInputTokens, totalTokens };
+    return { inputTokens, outputTokens, thinkingTokens, cachedInputTokens, totalTokens, comparable: true, providerConversationId: currentProviderConversationId };
   }
 
   countJobsWithCorrelationHints(): number {
@@ -1880,6 +1957,9 @@ export class BridgeStore {
       workerThinkingTokens: typeof row.worker_thinking_tokens === "number" || typeof row.worker_thinking_tokens === "bigint" ? Number(row.worker_thinking_tokens) : null,
       workerCachedInputTokens: typeof row.worker_cached_input_tokens === "number" || typeof row.worker_cached_input_tokens === "bigint" ? Number(row.worker_cached_input_tokens) : null,
       workerTotalTokens: typeof row.worker_total_tokens === "number" || typeof row.worker_total_tokens === "bigint" ? Number(row.worker_total_tokens) : null,
+      workerUsageScope: parseUsageScope(row.worker_usage_scope),
+      workerUsageSource: parseUsageSource(row.worker_usage_source),
+      workerProviderConversationId: nullableString(row, "worker_provider_conversation_id"),
     };
   }
 

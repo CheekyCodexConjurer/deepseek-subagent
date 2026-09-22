@@ -9,6 +9,19 @@ export const FOLLOW_MAX_GRACE_MINUTES = 10;
 export const FOLLOW_MAX_TOTAL_MINUTES = FOLLOW_MAX_WAIT_MINUTES + FOLLOW_MAX_GRACE_MINUTES;
 export const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 4_500;
 
+/**
+ * Bootstrap ceiling for the compact follow transport payload, measured as
+ * `Buffer.byteLength(JSON.stringify(compact), "utf8")`. Chosen so that a
+ * normal claims + mandatory-evidence envelope fits comfortably while a raw
+ * worker result (which can be megabytes) can never be smuggled through follow.
+ * It is a configured safety budget, not a universal constant: when mandatory
+ * evidence alone exceeds it the bridge fails closed with decision_ready=false
+ * instead of silently truncating.
+ */
+export const DEFAULT_COMPACT_FOLLOW_MAX_BYTES = 8_192;
+/** Bootstrap ceiling for one paginated recovery page, measured in real UTF-8 bytes. */
+export const DEFAULT_RECOVER_PAGE_MAX_BYTES = 16_384;
+
 export const DEFAULT_MODEL_ROUTE_NAME = "antigravity-flash-high";
 export const DEFAULT_PROVIDER_ID = "antigravity";
 
@@ -292,6 +305,8 @@ export function createDefaultConfig(overrides: Partial<BridgeConfig> = {}): Brid
     swarmCreditCeiling: boundedInteger(overrides.swarmCreditCeiling, 8, 1, 64),
     inactivityThresholdSeconds: overrides.inactivityThresholdSeconds ?? 300,
     advisoryCheckIntervalMs: overrides.advisoryCheckIntervalMs ?? 1000,
+    compactFollowMaxBytes: boundedInteger(overrides.compactFollowMaxBytes, DEFAULT_COMPACT_FOLLOW_MAX_BYTES, 1_024, 1_000_000),
+    recoverPageMaxBytes: boundedInteger(overrides.recoverPageMaxBytes, DEFAULT_RECOVER_PAGE_MAX_BYTES, 1_024, 4_000_000),
   };
 }
 
@@ -363,6 +378,8 @@ export async function loadConfig(configPath = defaultConfigPath()): Promise<Brid
         ? raw.workerMaxExecutionMinutes
         : (defaults.workerMaxExecutionMinutes ?? null),
       swarmCreditCeiling: boundedInteger(raw.swarmCreditCeiling, defaults.swarmCreditCeiling ?? 8, 1, 64),
+      compactFollowMaxBytes: boundedInteger(raw.compactFollowMaxBytes, defaults.compactFollowMaxBytes, 1_024, 1_000_000),
+      recoverPageMaxBytes: boundedInteger(raw.recoverPageMaxBytes, defaults.recoverPageMaxBytes, 1_024, 4_000_000),
     };
 
   } catch {

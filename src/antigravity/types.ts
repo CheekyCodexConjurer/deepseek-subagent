@@ -1,14 +1,25 @@
-import type { EarlyExitSignal, EscalationProposal, EvidenceBundle } from "../types.js";
+import type { EarlyExitSignal, EscalationProposal, EvidenceBundle, ValidationEvidence, WorkerClaimedStatus, WorkerUsageScope, WorkerUsageSource } from "../types.js";
 
 export type AntigravityResultStatus = "completed" | "completed_partial" | "timed_out" | "failed" | "aborted";
 
 export interface WorkerTokenUsage {
-  inputTokens: number;
-  outputTokens: number;
-  thinkingTokens: number;
-  cachedInputTokens: number;
-  totalTokens: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  totalTokens: number | null;
+  usageScope: WorkerUsageScope;
+  usageSource: WorkerUsageSource;
+  /** Provider conversation the usage belongs to, when known. */
+  providerConversationId?: string | null;
 }
+
+/**
+ * Provider execution status: what the CLI reported about the run itself.
+ * `success` only means the process returned normally; it is NOT a semantic
+ * approval of the work and MUST NOT be treated as one.
+ */
+export type ProviderExecutionStatus = "success" | "failure" | "unknown";
 
 /**
  * Result of a single Antigravity `agy` run, shaped after the bridge's
@@ -25,6 +36,7 @@ export interface AntigravityRunResult {
   files: string[];
   tests: string[];
   risks: string[];
+  unresolved?: string[];
   diffSummary: string;
   model: string;
   modelDisplayName: string;
@@ -33,6 +45,9 @@ export interface AntigravityRunResult {
   usage?: WorkerTokenUsage;
   durationSeconds?: number | null;
   numTurns?: number | null;
+  providerExecutionStatus?: ProviderExecutionStatus;
+  workerClaimedStatus?: WorkerClaimedStatus;
+  validationEvidence?: ValidationEvidence;
   evidence?: EvidenceBundle;
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
@@ -109,6 +124,7 @@ export interface AntigravityAttemptStatus {
   files: string[];
   tests: string[];
   risks: string[];
+  unresolved?: string[];
   diffSummary: string;
   error: string | null;
   completedAt: string;

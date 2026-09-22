@@ -445,6 +445,7 @@ export class AntigravitySupervisor {
       files: effectiveParsed?.files ?? [],
       tests: effectiveParsed?.tests ?? [],
       risks: effectiveParsed?.risks ?? [],
+      unresolved: effectiveParsed?.unresolved ?? [],
       diffSummary: effectiveParsed?.diffSummary ?? "none",
       error: error ? redactSecrets(error) : null,
       completedAt: new Date().toISOString(),

@@ -129,7 +129,7 @@ export interface AbortInput {
   reason?: string;
 }
 
-export type RecoverResultSection = "summary" | "files" | "tests" | "risks" | "diff" | "evidence" | "full";
+export type RecoverResultSection = "summary" | "files" | "tests" | "risks" | "unresolved" | "diff" | "evidence" | "full" | "raw";
 
 export interface RecoverResultInput {
   requestId?: string | undefined;
@@ -219,6 +219,9 @@ export interface JobRecord {
   workerThinkingTokens?: number | null;
   workerCachedInputTokens?: number | null;
   workerTotalTokens?: number | null;
+  workerUsageScope?: WorkerUsageScope | null;
+  workerUsageSource?: WorkerUsageSource | null;
+  workerProviderConversationId?: string | null;
 }
 
 export interface BatchRecord {
@@ -438,10 +441,117 @@ export interface WorkerClaims {
   risks: string[];
 }
 
+/**
+ * How a provider usage block relates to previous blocks observed for the same
+ * agent. `cumulative_conversation` means the numbers are running totals for one
+ * provider conversation; `per_turn` means they describe only this turn;
+ * `unknown` means the semantics could not be established from the installed
+ * provider version and MUST NOT be arithmetically combined with other blocks.
+ */
+export type WorkerUsageScope = "cumulative_conversation" | "per_turn" | "unknown";
+
+/**
+ * Where the numbers came from. `observed` = reported verbatim by the provider;
+ * `derived` = computed from observed fields with a documented rule;
+ * `unavailable` = the provider did not report it (stored as null, never zero).
+ */
+export type WorkerUsageSource = "observed" | "derived" | "unavailable";
+
+/**
+ * Semantic status claimed by the worker inside its own response text. This is a
+ * claim, not a verified fact: it is reported separately from the provider
+ * execution status and from the bridge's own validation evidence.
+ */
+export type WorkerClaimedStatus = "completed" | "failed" | "needs_approval" | "unknown";
+
+/** Deterministic classification of evidence that must never be silently dropped. */
+export type MandatoryEvidenceKind =
+  | "test_failed"
+  | "test_not_run"
+  | "permission_required"
+  | "unresolved"
+  | "worker_failure"
+  | "partial_completion"
+  | "scope_violation"
+  | "validation_absent"
+  | "blocking_risk"
+  | "claim_evidence_conflict"
+  | "operational_error";
+
+export interface MandatoryEvidenceItem {
+  kind: MandatoryEvidenceKind;
+  detail: string;
+}
+
+/**
+ * Evidence derived deterministically from the worker response and the provider
+ * envelope. It never upgrades a claim to a verified fact and never hides a
+ * failure behind a provider-level SUCCESS.
+ */
+export interface ValidationEvidence {
+  testsFailed: string[];
+  testsNotRun: string[];
+  testsPassed: string[];
+  blockingRisks: string[];
+  unresolved: string[];
+  scopeViolations: string[];
+  validationAbsent: boolean;
+  permissionRequired: boolean;
+  partial: boolean;
+  workerFailure: boolean;
+  /** True when the worker claims success but the evidence shows a failure. */
+  claimEvidenceConflict: boolean;
+  mandatory: MandatoryEvidenceItem[];
+}
+
+/**
+ * Compact transport projection delivered to the MCP parent. The bridge always
+ * keeps the complete result persisted locally; this projection is bounded by a
+ * configured serialized-byte budget so it can never grow with the worker output.
+ */
+export interface CompactWorkerResultV1 {
+  version: 1;
+  status: string;
+  claims: WorkerClaims;
+  mandatoryEvidence: MandatoryEvidenceItem[];
+  receipt: {
+    jobId: string;
+    agentId: string;
+    provider: string;
+    model: string;
+    status: string;
+    completedAt: string;
+    durationMs: number | null;
+    filesCount: number;
+    testsCount: number;
+    outputHash: string;
+  } | null;
+  tokens: {
+    inputTokens: number | null;
+    outputTokens: number | null;
+    thinkingTokens: number | null;
+    cachedInputTokens: number | null;
+    totalTokens: number | null;
+    usageScope: WorkerUsageScope;
+    usageSource: WorkerUsageSource;
+  } | null;
+  decisionReady: boolean;
+  decisionReason: string | null;
+  detailsRef: ResultDetailsRef;
+}
+
 export interface ResultDetailsRef {
   resultPath: string;
   hasMoreDetails: boolean;
   availableSections: string[];
+  summaryTruncated?: boolean;
+  filesTotal?: number;
+  testsTotal?: number;
+  risksTotal?: number;
+  unresolvedTotal?: number;
+  evidenceTotal?: number;
+  mandatoryDetailCount?: number;
+  mandatorySections?: string[];
 }
 
 export interface FollowResult {
@@ -461,12 +571,23 @@ export interface FollowResult {
   receipt?: ExecutionReceipt;
   claims?: WorkerClaims;
   detailsRef?: ResultDetailsRef;
+  /**
+   * True only when the bridge holds a provider conversation id confirmed by the
+   * provider itself. When false, a continuation cannot reuse provider memory and
+   * the bridge sends the full prompt instead of a delta.
+   */
+  continuationPersistent?: boolean;
+  compact?: CompactWorkerResultV1;
+  mandatoryEvidence?: MandatoryEvidenceItem[];
+  decisionReady?: boolean;
   tokens?: {
-    inputTokens: number;
-    outputTokens: number;
-    thinkingTokens: number;
-    cachedInputTokens: number;
-    totalTokens: number;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    thinkingTokens: number | null;
+    cachedInputTokens: number | null;
+    totalTokens: number | null;
+    usageScope: WorkerUsageScope;
+    usageSource: WorkerUsageSource;
   };
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
@@ -561,6 +682,7 @@ export interface ResultEnvelope {
   files: string[];
   tests: string[];
   risks: string[];
+  unresolved?: string[];
   diffSummary: string;
   fullResultPath: string;
   orchestratorInstruction: string;
@@ -578,6 +700,24 @@ export interface ResultEnvelope {
   evidence?: EvidenceBundle;
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
+  /**
+   * Provider execution outcome kept separate from the worker's own claim and
+   * from the bridge's validation evidence. A provider-level `success` is not a
+   * semantic approval.
+   */
+  providerExecutionStatus?: "success" | "failure" | "unknown";
+  workerClaimedStatus?: WorkerClaimedStatus;
+  validationEvidence?: ValidationEvidence;
+  usage?: {
+    inputTokens: number | null;
+    outputTokens: number | null;
+    thinkingTokens: number | null;
+    cachedInputTokens: number | null;
+    totalTokens: number | null;
+    usageScope: WorkerUsageScope;
+    usageSource: WorkerUsageSource;
+    providerConversationId?: string | null;
+  };
 }
 
 export interface BridgeConfig {
@@ -622,6 +762,15 @@ export interface BridgeConfig {
   swarmCreditCeiling?: number;
   inactivityThresholdSeconds?: number;
   advisoryCheckIntervalMs?: number;
+  /**
+   * Serialized-byte ceiling for the compact follow transport payload. The
+   * invariant is `Buffer.byteLength(JSON.stringify(compact), "utf8") <= this`.
+   * Bootstrap value validated against real follow envelopes; not a universal
+   * truth — operators may raise it for larger mandatory evidence.
+   */
+  compactFollowMaxBytes: number;
+  /** Serialized-byte ceiling for a single paginated recovery page. */
+  recoverPageMaxBytes: number;
 }
 
 

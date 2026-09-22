@@ -5,16 +5,22 @@ import { writePrivateFile, redactSecrets, redactUnknown, truncate } from "./secu
 import type { AntigravityRunResult } from "./antigravity/types.js";
 import type {
   AgentRecord,
+  CompactWorkerResultV1,
   EarlyExitSignal,
   EscalationProposal,
   EvidenceBundle,
   EvidenceItem,
   ExecutionReceipt,
   JobRecord,
+  MandatoryEvidenceItem,
   OpenCodeMessage,
   ResultDetailsRef,
   ResultEnvelope,
+  ValidationEvidence,
+  WorkerClaimedStatus,
   WorkerClaims,
+  WorkerUsageScope,
+  WorkerUsageSource,
 } from "./types.js";
 
 const PROTOCOL_HEADINGS = [
@@ -205,10 +211,21 @@ export async function persistAntigravityResult(
     files: result.files.slice(0, 100).map((value) => redactSecrets(value)),
     tests: result.tests.slice(0, 100).map((value) => redactSecrets(value)),
     risks: result.risks.slice(0, 100).map((value) => redactSecrets(value)),
+    unresolved: (result.unresolved ?? []).slice(0, 100).map((value) => redactSecrets(value)),
     diffSummary: truncate(redactSecrets(result.diffSummary), 10_000),
     fullResultPath: redactSecrets(resultPath),
     orchestratorInstruction: redactSecrets("Continue this agent only with subagents_continue after reviewing this result."),
     receipt,
+    ...(result.providerExecutionStatus ? { providerExecutionStatus: result.providerExecutionStatus } : {}),
+    ...(result.workerClaimedStatus ? { workerClaimedStatus: result.workerClaimedStatus } : {}),
+    ...(result.validationEvidence ? (() => {
+      const safe = projectSafeValidationEvidence(result.validationEvidence);
+      return safe ? { validationEvidence: safe } : {};
+    })() : {}),
+    ...(result.usage ? (() => {
+      const safe = projectSafeUsage(result.usage);
+      return safe ? { usage: safe } : {};
+    })() : {}),
     ...(result.evidence ? (() => {
       const safe = projectSafeEvidence(result.evidence);
       return safe ? { evidence: safe } : {};
@@ -230,7 +247,17 @@ export async function persistAntigravityResult(
       envelope,
       rawAssistantText,
       messages: [],
-      diff: { source: "antigravity", runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200) },
+      // Full local audit record: the compact transport projection is never a
+      // substitute for this file. Provider identity, usage semantics and the
+      // worker's own claim all stay persisted here.
+      diff: {
+        source: "antigravity",
+        runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200),
+        providerConversationId: result.conversationId ? truncate(redactSecrets(result.conversationId), 200) : null,
+        providerExecutionStatus: result.providerExecutionStatus ?? "unknown",
+        workerClaimedStatus: result.workerClaimedStatus ?? "unknown",
+        usage: result.usage ?? null,
+      },
       savedAt: new Date().toISOString(),
     }, null, 2) + "\n",
   );
@@ -361,7 +388,7 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
   ]) {
     if (typeof value[key] === "string") output[key] = truncate(redactSecrets(value[key]), 100_000);
   }
-  for (const key of ["files", "tests", "risks"]) {
+  for (const key of ["files", "tests", "risks", "unresolved"]) {
     if (Array.isArray(value[key])) {
       output[key] = value[key].filter((item): item is string => typeof item === "string").slice(0, 100).map((item) => redactSecrets(item));
     }
@@ -370,6 +397,16 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
   for (const key of ["deadlineReached", "gracefulFinalize", "partial", "workerAborted"]) {
     if (typeof value[key] === "boolean") output[key] = value[key];
   }
+  if (typeof value.providerExecutionStatus === "string") {
+    output.providerExecutionStatus = value.providerExecutionStatus;
+  }
+  if (typeof value.workerClaimedStatus === "string") {
+    output.workerClaimedStatus = value.workerClaimedStatus;
+  }
+  const validation = projectSafeValidationEvidence(value.validationEvidence);
+  if (validation) output.validationEvidence = validation;
+  const usage = projectSafeUsage(value.usage);
+  if (usage) output.usage = usage;
   if (value.fallback && typeof value.fallback === "object") {
     const fb = value.fallback as Record<string, unknown>;
     output.fallback = {
@@ -450,25 +487,370 @@ export function createExecutionReceipt(input: {
   };
 }
 
-export function createCompactClaims(envelope: ResultEnvelope): WorkerClaims {
+export interface ParsedWorkerProtocolText {
+  claimedStatus: WorkerClaimedStatus;
+  summary: string;
+  files: string[];
+  tests: string[];
+  risks: string[];
+  unresolved: string[];
+  changes: string[];
+}
+
+/**
+ * Parses the worker's own textual protocol headings out of the visible response
+ * text. The Antigravity worker is instructed to answer with STATUS/SUMMARY/
+ * ASSUMPTIONS/CHANGES/FILES/TESTS/RISKS/UNRESOLVED headings inside `response`;
+ * without this step a provider-level SUCCESS envelope with an empty top-level
+ * `tests` array would be reported to the parent as "no tests, no risks".
+ */
+export function parseWorkerProtocolText(text: string): ParsedWorkerProtocolText {
+  const statusValue = statusFirstToken(headingValue(text, "STATUS"));
+  const claimedStatus: WorkerClaimedStatus = statusValue === "failed" || statusValue === "failure" || statusValue === "error"
+    ? "failed"
+    : statusValue === "needs_approval" || statusValue === "approval_required" || statusValue === "permission_required"
+      ? "needs_approval"
+      : statusValue === "completed" || statusValue === "complete" || statusValue === "success" || statusValue === "done"
+        ? "completed"
+        : "unknown";
   return {
-    summary: truncate(envelope.summary || "", 1_000),
-    files: (envelope.files ?? []).slice(0, 10),
-    tests: (envelope.tests ?? []).slice(0, 10),
-    risks: (envelope.risks ?? []).slice(0, 5),
+    claimedStatus,
+    summary: headingValue(text, "SUMMARY"),
+    files: headingList(text, "FILES"),
+    tests: headingList(text, "TESTS"),
+    risks: headingList(text, "RISKS"),
+    unresolved: headingList(text, "UNRESOLVED"),
+    changes: headingList(text, "CHANGES"),
   };
 }
 
-export function createDetailsRef(envelope: ResultEnvelope): ResultDetailsRef {
-  const hasMore = (envelope.files?.length ?? 0) > 10 ||
-    (envelope.tests?.length ?? 0) > 10 ||
-    (envelope.risks?.length ?? 0) > 5 ||
-    (envelope.diffSummary && envelope.diffSummary.length > 0 && envelope.diffSummary !== "none") ||
-    (envelope.evidence && (envelope.evidence.items?.length ?? 0) > 0);
+const TEST_FAILURE_PATTERN = /\b(?:fail(?:ed|ure|ures|ing)?|error|errored|exception|broken|not\s+passing|did\s+not\s+pass)\b/i;
+const TEST_NOT_RUN_PATTERN = /\b(?:not\s+(?:run|executed|ran)|skipped|todo|unavailable|blocked|n\/a|no\s+tests?\s+(?:run|executed)|could\s+not\s+run|unable\s+to\s+run)\b/i;
+const TEST_PASS_PATTERN = /\b(?:pass(?:ed|es|ing)?|ok|success(?:ful)?|green)\b/i;
+const BLOCKING_RISK_PATTERN = /\b(?:blocker|blocking|critical|severe|fatal|regression|regress(?:ão|ao|ões|oes)|cr[íi]tic[oa]|bloqueador|bloqueante|grave|perda\s+de\s+dados|data\s+loss|security|seguran[çc]a)\b/i;
+const SCOPE_VIOLATION_PATTERN = /\b(?:out\s+of\s+scope|outside\s+(?:the\s+)?scope|unrelated\s+(?:file|change)|scope\s+(?:creep|violation)|beyond\s+(?:the\s+)?(?:requested|authorized)|fora\s+do\s+escopo|fora\s+de\s+escopo|escopo\s+indevido)\b/i;
+
+function nonNone(values: string[]): string[] {
+  return values.filter((value) => value.trim().length > 0 && !/^(?:none|n\/a|nothing|-)$/i.test(value.trim()));
+}
+
+/**
+ * Deterministically classifies the evidence that must never be dropped from the
+ * compact transport projection. Classification is textual and conservative: a
+ * false positive costs one extra detail fetch, a false negative would let the
+ * parent believe a failing run was green.
+ */
+export function classifyValidationEvidence(input: {
+  claimedStatus: WorkerClaimedStatus;
+  providerExecutionStatus?: string;
+  status?: string;
+  tests: string[];
+  risks: string[];
+  unresolved: string[];
+  files: string[];
+  diffSummary?: string;
+  validationAbsent?: boolean;
+  permissionRequired?: boolean;
+  error?: string | null;
+}): ValidationEvidence {
+  const tests = nonNone(input.tests);
+  const risks = nonNone(input.risks);
+  const unresolved = nonNone(input.unresolved);
+  const testsFailed = tests.filter((test) => TEST_FAILURE_PATTERN.test(test));
+  const testsPassed = tests.filter((test) => !TEST_FAILURE_PATTERN.test(test) && TEST_PASS_PATTERN.test(test));
+  const testsNotRun = tests.filter((test) => !TEST_FAILURE_PATTERN.test(test) && TEST_NOT_RUN_PATTERN.test(test));
+  const blockingRisks = risks.filter((risk) => BLOCKING_RISK_PATTERN.test(risk));
+  const scopeViolations = unresolved.filter((item) => SCOPE_VIOLATION_PATTERN.test(item));
+
+  const providerFailure = input.providerExecutionStatus === "failure";
+  const envelopeFailure = input.status === "failed" || input.status === "aborted" || input.status === "timed_out";
+  const partial = input.status === "completed_partial";
+  const workerFailure = input.claimedStatus === "failed" || providerFailure || envelopeFailure;
+  const permissionRequired = Boolean(input.permissionRequired) || input.claimedStatus === "needs_approval";
+  const validationAbsent = Boolean(input.validationAbsent) && tests.length === 0;
+  const claimEvidenceConflict = input.claimedStatus === "completed"
+    && (testsFailed.length > 0 || providerFailure || envelopeFailure || partial);
+
+  const mandatory: MandatoryEvidenceItem[] = [];
+  const push = (kind: MandatoryEvidenceItem["kind"], detail: string): void => {
+    const safe = truncate(redactSecrets(detail), 600);
+    if (safe.length === 0) return;
+    mandatory.push({ kind, detail: safe });
+  };
+  for (const test of testsFailed) push("test_failed", test);
+  for (const test of testsNotRun) push("test_not_run", test);
+  if (permissionRequired) push("permission_required", "The worker requested an explicit permission decision.");
+  for (const item of unresolved) push("unresolved", item);
+  if (workerFailure) push("worker_failure", input.error && input.error.trim().length > 0 ? input.error : "The worker did not complete successfully.");
+  if (partial) push("partial_completion", "The worker reported a partial completion.");
+  for (const item of scopeViolations) push("scope_violation", item);
+  if (validationAbsent) push("validation_absent", "No test evidence was reported for a task that required validation.");
+  for (const risk of blockingRisks) push("blocking_risk", risk);
+  if (claimEvidenceConflict) push("claim_evidence_conflict", "The worker claimed completion while the evidence shows a failure or partial result.");
+  if (input.error && input.error.trim().length > 0 && !workerFailure) push("operational_error", input.error);
+
+  return {
+    testsFailed,
+    testsNotRun,
+    testsPassed,
+    blockingRisks,
+    unresolved,
+    scopeViolations,
+    validationAbsent,
+    permissionRequired,
+    partial,
+    workerFailure,
+    claimEvidenceConflict,
+    mandatory,
+  };
+}
+
+export const COMPACT_SUMMARY_MAX_CHARS = 1_000;
+export const COMPACT_FILES_MAX = 10;
+export const COMPACT_TESTS_MAX = 10;
+export const COMPACT_RISKS_MAX = 5;
+const COMPACT_SUMMARY_MIN_CHARS = 160;
+const COMPACT_MIN_ITEM_CAP = 1;
+
+/** Real UTF-8 byte size of the serialized compact payload. */
+export function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+}
+
+export interface PriorUsage {
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  cachedInputTokens: number;
+  totalTokens: number;
+  comparable: boolean;
+  providerConversationId: string | null;
+}
+
+/**
+ * Derives the usage attributable to a single turn without inventing precision.
+ *
+ * Only a provider block that is explicitly scoped `cumulative_conversation` for
+ * the SAME provider conversation as the prior jobs may be differenced. In every
+ * other case the observed values are kept as-is (a new conversation, a reset, a
+ * per-turn provider, or an unknown scope), so a session reset can never produce
+ * a false delta and a missing field stays null instead of becoming zero.
+ */
+export function deriveTurnUsage(current: {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  totalTokens: number | null;
+  usageScope: WorkerUsageScope;
+  usageSource: WorkerUsageSource;
+  providerConversationId?: string | null;
+}, prior: PriorUsage): {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  totalTokens: number | null;
+  usageScope: WorkerUsageScope;
+  usageSource: WorkerUsageSource;
+  providerConversationId: string | null;
+} {
+  const sameConversation = Boolean(current.providerConversationId) &&
+    current.providerConversationId === prior.providerConversationId;
+  const canDifference = current.usageScope === "cumulative_conversation" && prior.comparable && sameConversation;
+  if (!canDifference) {
+    return {
+      inputTokens: current.inputTokens,
+      outputTokens: current.outputTokens,
+      thinkingTokens: current.thinkingTokens,
+      cachedInputTokens: current.cachedInputTokens,
+      totalTokens: current.totalTokens,
+      // Without a comparable baseline the block cannot be re-scoped to this
+      // turn: keep the provider's own scope rather than asserting per_turn.
+      usageScope: current.usageScope,
+      usageSource: "observed",
+      providerConversationId: current.providerConversationId ?? null,
+    };
+  }
+  const delta = (value: number | null, baseline: number): number | null =>
+    value === null ? null : Math.max(0, value - baseline);
+  return {
+    inputTokens: delta(current.inputTokens, prior.inputTokens),
+    outputTokens: delta(current.outputTokens, prior.outputTokens),
+    thinkingTokens: delta(current.thinkingTokens, prior.thinkingTokens),
+    cachedInputTokens: delta(current.cachedInputTokens, prior.cachedInputTokens),
+    totalTokens: delta(current.totalTokens, prior.totalTokens),
+    usageScope: "per_turn",
+    usageSource: "derived",
+    providerConversationId: current.providerConversationId ?? null,
+  };
+}
+
+export interface CompactWorkerResultOptions {
+  maxBytes: number;
+  tokens?: CompactWorkerResultV1["tokens"];
+  mandatoryEvidence?: MandatoryEvidenceItem[];
+  statusOverride?: string;
+  /** Worker claim vs evidence conflict already detected by the caller. */
+  decisionReady?: boolean;
+  decisionReason?: string | null;
+}
+
+/**
+ * Builds the versioned compact transport projection and enforces the serialized
+ * byte budget as a hard invariant. Optional content is shrunk before any
+ * mandatory evidence, and if the mandatory evidence alone cannot fit the
+ * payload fails closed with `decisionReady = false` and
+ * `decisionReason = "mandatory_evidence_overflow"` so the parent knows it must
+ * fetch the exact sections instead of assuming a green result.
+ */
+export function createCompactWorkerResult(
+  envelope: ResultEnvelope,
+  options: CompactWorkerResultOptions,
+): CompactWorkerResultV1 {
+  const mandatoryEvidence = (options.mandatoryEvidence ?? []).map((item) => ({
+    kind: item.kind,
+    detail: truncate(redactSecrets(item.detail), 600),
+  }));
+  const status = options.statusOverride ?? envelope.status;
+  const fullSummary = envelope.summary || "";
+  const allFiles = envelope.files ?? [];
+  const allTests = envelope.tests ?? [];
+  const allRisks = envelope.risks ?? [];
+
+  const build = (caps: { summary: number; files: number; tests: number; risks: number }): CompactWorkerResultV1 => {
+    const summary = truncate(fullSummary, caps.summary);
+    const claims: WorkerClaims = {
+      summary,
+      files: allFiles.slice(0, caps.files),
+      tests: allTests.slice(0, caps.tests),
+      risks: allRisks.slice(0, caps.risks),
+    };
+    const detailsRef = createDetailsRef(envelope, {
+      compactSummaryChars: summary.length,
+      mandatoryDetailCount: mandatoryEvidence.length,
+      mandatorySections: [...new Set(mandatoryEvidence.map((item) => item.kind))],
+    });
+    return {
+      version: 1,
+      status,
+      claims,
+      mandatoryEvidence,
+      receipt: envelope.receipt ? {
+        jobId: envelope.receipt.jobId,
+        agentId: envelope.receipt.agentId,
+        provider: envelope.receipt.provider,
+        model: envelope.receipt.model,
+        status: envelope.receipt.status,
+        completedAt: envelope.receipt.completedAt,
+        durationMs: envelope.receipt.durationMs,
+        filesCount: envelope.receipt.filesCount,
+        testsCount: envelope.receipt.testsCount,
+        outputHash: envelope.receipt.outputHash,
+      } : null,
+      tokens: options.tokens ?? (envelope.usage ? {
+        inputTokens: envelope.usage.inputTokens,
+        outputTokens: envelope.usage.outputTokens,
+        thinkingTokens: envelope.usage.thinkingTokens,
+        cachedInputTokens: envelope.usage.cachedInputTokens,
+        totalTokens: envelope.usage.totalTokens,
+        usageScope: envelope.usage.usageScope,
+        usageSource: envelope.usage.usageSource,
+      } : null),
+      decisionReady: options.decisionReady ?? true,
+      decisionReason: options.decisionReason ?? null,
+      detailsRef,
+    };
+  };
+
+  const caps = {
+    summary: COMPACT_SUMMARY_MAX_CHARS,
+    files: COMPACT_FILES_MAX,
+    tests: COMPACT_TESTS_MAX,
+    risks: COMPACT_RISKS_MAX,
+  };
+  let compact = build(caps);
+  if (serializedBytes(compact) <= options.maxBytes) return compact;
+
+  // Shrink optional content only. Mandatory evidence is never trimmed.
+  const shrinkOrder: Array<() => boolean> = [
+    () => (caps.risks > COMPACT_MIN_ITEM_CAP ? (caps.risks -= 1, true) : false),
+    () => (caps.tests > COMPACT_MIN_ITEM_CAP ? (caps.tests -= 1, true) : false),
+    () => (caps.files > COMPACT_MIN_ITEM_CAP ? (caps.files -= 1, true) : false),
+    () => (caps.summary > COMPACT_SUMMARY_MIN_CHARS ? (caps.summary = Math.max(COMPACT_SUMMARY_MIN_CHARS, Math.floor(caps.summary / 2)), true) : false),
+    () => (caps.risks > 0 ? (caps.risks = 0, true) : false),
+    () => (caps.tests > 0 ? (caps.tests = 0, true) : false),
+    () => (caps.files > 0 ? (caps.files = 0, true) : false),
+    () => (caps.summary > 0 ? (caps.summary = 0, true) : false),
+  ];
+  for (const step of shrinkOrder) {
+    while (step()) {
+      compact = build(caps);
+      if (serializedBytes(compact) <= options.maxBytes) return compact;
+    }
+  }
+
+  // Even the mandatory floor does not fit: fail closed, never silently drop.
+  return {
+    ...build({ summary: 0, files: 0, tests: 0, risks: 0 }),
+    decisionReady: false,
+    decisionReason: "mandatory_evidence_overflow",
+  };
+}
+
+export function createCompactClaims(envelope: ResultEnvelope): WorkerClaims {
+  return {
+    summary: truncate(envelope.summary || "", COMPACT_SUMMARY_MAX_CHARS),
+    files: (envelope.files ?? []).slice(0, COMPACT_FILES_MAX),
+    tests: (envelope.tests ?? []).slice(0, COMPACT_TESTS_MAX),
+    risks: (envelope.risks ?? []).slice(0, COMPACT_RISKS_MAX),
+  };
+}
+
+export interface DetailsRefOptions {
+  compactSummaryChars?: number;
+  mandatoryDetailCount?: number;
+  mandatorySections?: string[];
+}
+
+/**
+ * Truncation-aware pointer to the persisted full result. `hasMoreDetails` is
+ * true whenever ANY section was shortened for transport, including a truncated
+ * summary, so the parent can never be left believing the compact view is the
+ * whole story.
+ */
+export function createDetailsRef(envelope: ResultEnvelope, options: DetailsRefOptions = {}): ResultDetailsRef {
+  const filesTotal = envelope.files?.length ?? 0;
+  const testsTotal = envelope.tests?.length ?? 0;
+  const risksTotal = envelope.risks?.length ?? 0;
+  const unresolvedTotal = envelope.unresolved?.length ?? 0;
+  const evidenceTotal = envelope.evidence?.items?.length ?? 0;
+  const summaryLimit = options.compactSummaryChars ?? COMPACT_SUMMARY_MAX_CHARS;
+  const summaryTruncated = (envelope.summary?.length ?? 0) > summaryLimit;
+  const filesTruncated = filesTotal > COMPACT_FILES_MAX;
+  const testsTruncated = testsTotal > COMPACT_TESTS_MAX;
+  const risksTruncated = risksTotal > COMPACT_RISKS_MAX;
+  const diffAvailable = Boolean(envelope.diffSummary && envelope.diffSummary.length > 0 && envelope.diffSummary !== "none");
+  const evidenceAvailable = evidenceTotal > 0;
+  const unresolvedAvailable = unresolvedTotal > 0;
+  const mandatoryDetailCount = options.mandatoryDetailCount ?? (envelope.validationEvidence?.mandatory?.length ?? 0);
+  const mandatoryOverflow = mandatoryDetailCount > 0 && Boolean(options.mandatorySections && options.mandatorySections.length > 0);
+
+  const hasMore = summaryTruncated || filesTruncated || testsTruncated || risksTruncated ||
+    diffAvailable || evidenceAvailable || unresolvedAvailable;
+
   return {
     resultPath: envelope.fullResultPath,
     hasMoreDetails: Boolean(hasMore),
-    availableSections: ["summary", "files", "tests", "risks", "diff", "evidence", "full"],
+    availableSections: ["summary", "files", "tests", "risks", "diff", "evidence", "unresolved", "full"],
+    summaryTruncated,
+    filesTotal,
+    testsTotal,
+    risksTotal,
+    evidenceTotal,
+    ...(unresolvedTotal > 0 ? { unresolvedTotal } : {}),
+    mandatoryDetailCount,
+    ...(mandatoryOverflow ? { mandatorySections: options.mandatorySections } : {}),
   };
 }
 
@@ -541,6 +923,65 @@ function projectSafeEvidence(value: unknown): EvidenceBundle | null {
     claimsCount: typeof value.claimsCount === "number" ? value.claimsCount : items.length,
     ...(typeof value.collectedAt === "string" ? { collectedAt: redactSecrets(value.collectedAt) } : {}),
   };
+}
+
+const VALIDATION_LIST_KEYS = [
+  "testsFailed",
+  "testsNotRun",
+  "testsPassed",
+  "blockingRisks",
+  "unresolved",
+  "scopeViolations",
+] as const;
+
+function projectSafeValidationEvidence(value: unknown): ValidationEvidence | null {
+  if (!isRecord(value)) return null;
+  const output: Record<string, unknown> = {};
+  for (const key of VALIDATION_LIST_KEYS) {
+    if (Array.isArray(value[key])) {
+      output[key] = value[key]
+        .filter((item): item is string => typeof item === "string")
+        .slice(0, 100)
+        .map((item) => truncate(redactSecrets(item), 1_000));
+    }
+  }
+  for (const key of ["validationAbsent", "permissionRequired", "partial", "workerFailure", "claimEvidenceConflict"]) {
+    if (typeof value[key] === "boolean") output[key] = value[key];
+  }
+  if (Array.isArray(value.mandatory)) {
+    output.mandatory = value.mandatory
+      .filter((item): item is Record<string, unknown> => isRecord(item))
+      .slice(0, 100)
+      .map((item) => ({
+        kind: truncate(redactSecrets(String(item.kind ?? "operational_error")), 60),
+        detail: truncate(redactSecrets(String(item.detail ?? "")), 600),
+      }));
+  }
+  return output as unknown as ValidationEvidence;
+}
+
+function projectSafeUsage(value: unknown): ResultEnvelope["usage"] | null {
+  if (!isRecord(value)) return null;
+  const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.floor(v)) : null);
+  const scope = value.usageScope === "cumulative_conversation" || value.usageScope === "per_turn" || value.usageScope === "unknown"
+    ? value.usageScope
+    : "unknown";
+  const source = value.usageSource === "observed" || value.usageSource === "derived" || value.usageSource === "unavailable"
+    ? value.usageSource
+    : "unavailable";
+  const usage: NonNullable<ResultEnvelope["usage"]> = {
+    inputTokens: num(value.inputTokens),
+    outputTokens: num(value.outputTokens),
+    thinkingTokens: num(value.thinkingTokens),
+    cachedInputTokens: num(value.cachedInputTokens),
+    totalTokens: num(value.totalTokens),
+    usageScope: scope,
+    usageSource: source,
+    ...(typeof value.providerConversationId === "string" ? { providerConversationId: redactSecrets(value.providerConversationId) } : {}),
+  };
+  const allNull = usage.inputTokens === null && usage.outputTokens === null && usage.thinkingTokens === null &&
+    usage.cachedInputTokens === null && usage.totalTokens === null;
+  return allNull ? null : usage;
 }
 
 function projectSafeMessages(messages: unknown[]): unknown[] {

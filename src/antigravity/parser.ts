@@ -1,6 +1,18 @@
-import type { AntigravityResultStatus, WorkerTokenUsage } from "./types.js";
-import type { EarlyExitSignal, EscalationProposal, EvidenceBundle, EvidenceItem } from "../types.js";
-import { parseEarlyExit, parseEscalation, parseEvidence } from "../result.js";
+import type {
+  AntigravityResultStatus,
+  ProviderExecutionStatus,
+  WorkerTokenUsage,
+} from "./types.js";
+import type {
+  EarlyExitSignal,
+  EscalationProposal,
+  EvidenceBundle,
+  EvidenceItem,
+  MandatoryEvidenceItem,
+  ValidationEvidence,
+  WorkerClaimedStatus,
+} from "../types.js";
+import { classifyValidationEvidence, parseEarlyExit, parseEscalation, parseEvidence, parseWorkerProtocolText } from "../result.js";
 import { redactSecrets, truncate } from "../security.js";
 
 export interface ParsedAgyOutput {
@@ -16,7 +28,11 @@ export interface ParsedAgyOutput {
   files: string[];
   tests: string[];
   risks: string[];
+  unresolved: string[];
   diffSummary: string;
+  providerExecutionStatus: ProviderExecutionStatus;
+  workerClaimedStatus: WorkerClaimedStatus;
+  validationEvidence: ValidationEvidence;
   evidence?: EvidenceBundle;
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
@@ -295,25 +311,78 @@ function extractRecognizedVisibleText(json: Record<string, unknown>, keys: strin
   return null;
 }
 
-function parseAgyUsage(raw: unknown): WorkerTokenUsage | undefined {
+/**
+ * Parses the provider usage block without inventing precision.
+ *
+ * Observed contract for the installed Antigravity CLI (v1.2.0, captured live):
+ *   {"input_tokens":N,"output_tokens":N,"thinking_tokens":N,"cache_read_tokens":N,"total_tokens":N}
+ * `total_tokens` is reported by the provider and is preserved verbatim. When it
+ * is absent it is left null: thinking tokens are reported separately and there
+ * is no proven rule that they are disjoint from output tokens, so summing them
+ * could double count. Cached input is reported separately from input total and
+ * is never added into it. `cache_read_tokens` was observed to grow across turns
+ * of the same conversation while not being included in `total_tokens`.
+ *
+ * The observed numbers are running totals for one provider conversation
+ * (`cumulative_conversation`); that scope is only asserted when a conversation
+ * id is present.
+ */
+function parseAgyUsage(raw: unknown, providerConversationId: string | null): WorkerTokenUsage | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const obj = raw as Record<string, unknown>;
-  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : null);
   const inputTokens = num(obj.input_tokens ?? obj.inputTokens);
   const outputTokens = num(obj.output_tokens ?? obj.outputTokens);
   const thinkingTokens = num(obj.thinking_tokens ?? obj.thinkingTokens);
-  const cachedInputTokens = num(obj.cache_read_tokens ?? obj.cached_input_tokens ?? obj.cachedInputTokens);
-  const totalTokens = num(obj.total_tokens ?? obj.totalTokens) || (inputTokens + outputTokens + thinkingTokens);
-  if (inputTokens === 0 && outputTokens === 0 && thinkingTokens === 0 && cachedInputTokens === 0 && totalTokens === 0) {
-    return undefined;
-  }
+  const cachedInputTokens = num(obj.cache_read_tokens ?? obj.cache_read_tokens_total ?? obj.cached_input_tokens ?? obj.cachedInputTokens);
+  const reportedTotal = num(obj.total_tokens ?? obj.totalTokens);
+  const anyReported = inputTokens !== null || outputTokens !== null || thinkingTokens !== null ||
+    cachedInputTokens !== null || reportedTotal !== null;
+  if (!anyReported) return undefined;
   return {
     inputTokens,
     outputTokens,
     thinkingTokens,
     cachedInputTokens,
-    totalTokens,
+    totalTokens: reportedTotal,
+    usageScope: providerConversationId ? "cumulative_conversation" : "unknown",
+    usageSource: "observed",
+    providerConversationId,
   };
+}
+
+/** Merges a structured list with a textual-protocol list without duplicates. */
+function mergeUnique(structured: string[], textual: string[]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const item of [...structured, ...textual]) {
+    const key = item.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged.slice(0, 100);
+}
+
+function mergeSummary(structured: string, textual: string): string {
+  const structuredTrimmed = structured.trim();
+  const textualTrimmed = textual.trim();
+  if (structuredTrimmed.length === 0) return textualTrimmed;
+  if (textualTrimmed.length === 0) return structuredTrimmed;
+  if (structuredTrimmed === textualTrimmed) return structuredTrimmed;
+  // The structured field is authoritative; append the protocol summary only
+  // when it carries additional information.
+  if (structuredTrimmed.includes(textualTrimmed)) return structuredTrimmed;
+  if (textualTrimmed.includes(structuredTrimmed)) return textualTrimmed;
+  return structuredTrimmed + "\n\n" + textualTrimmed;
+}
+
+function providerExecutionStatusOf(rawStatus: string | null): ProviderExecutionStatus {
+  if (rawStatus === null) return "unknown";
+  const normalized = rawStatus.trim().toLowerCase();
+  if (["success", "succeeded", "ok", "completed", "complete", "done"].includes(normalized)) return "success";
+  if (["error", "failed", "failure", "cancelled", "canceled", "aborted", "timeout", "timed_out"].includes(normalized)) return "failure";
+  return "unknown";
 }
 
 export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput {
@@ -328,6 +397,16 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     const rawText = stdout.trim() || stderr.trim();
     if (isAmbiguousMachineEnvelope(rawText)) {
       // Malformed or ambiguous machine data: fail closed rather than exposing raw contents
+      const validationEvidence = classifyValidationEvidence({
+        claimedStatus: "unknown",
+        status: "failed",
+        tests: [],
+        risks: [],
+        unresolved: [],
+        files: [],
+        validationAbsent: true,
+        error: "Ambiguous machine envelope rejected",
+      });
       return {
         status: null,
         hasJson: false,
@@ -337,31 +416,51 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
         files: [],
         tests: [],
         risks: [],
+        unresolved: [],
         diffSummary: "",
+        providerExecutionStatus: "unknown",
+        workerClaimedStatus: "unknown",
+        validationEvidence,
         ...(evidence ? { evidence } : {}),
         ...(earlyExit ? { earlyExit } : {}),
         ...(escalation ? { escalation } : {}),
       };
     }
     const redacted = redactSecrets(rawText);
+    const protocol = parseWorkerProtocolText(redacted);
+    const validationEvidence = classifyValidationEvidence({
+      claimedStatus: protocol.claimedStatus,
+      status: protocol.claimedStatus === "failed" ? "failed" : "completed",
+      tests: protocol.tests,
+      risks: protocol.risks,
+      unresolved: protocol.unresolved,
+      files: protocol.files,
+    });
     return {
       status: null,
       hasJson: false,
       runId: null,
-      summary: truncate(redacted, 4_000),
+      summary: protocol.summary ? truncate(protocol.summary, 4_000) : truncate(redacted, 4_000),
       fullText: truncate(redacted, 2_000_000),
-      files: [],
-      tests: [],
-      risks: [],
+      files: protocol.files,
+      tests: protocol.tests,
+      risks: protocol.risks,
+      unresolved: protocol.unresolved,
       diffSummary: "",
+      providerExecutionStatus: "unknown",
+      workerClaimedStatus: protocol.claimedStatus,
+      validationEvidence,
       ...(evidence ? { evidence } : {}),
       ...(earlyExit ? { earlyExit } : {}),
       ...(escalation ? { escalation } : {}),
     };
   }
   const rawStatus = firstString(json, ["status", "state", "result"]);
+  // Conversation identity is ONLY accepted from an explicitly documented
+  // conversation field. runId/taskId/sessionId/executionId are execution
+  // identifiers and are never reused as a provider conversation id.
   const rawConversationId = firstString(json, ["conversation_id", "conversationId"]);
-  const rawRunId = firstString(json, ["runId", "run_id", "taskId", "task_id", "sessionId", "session_id", "executionId"]) ?? rawConversationId;
+  const rawRunId = firstString(json, ["runId", "run_id", "taskId", "task_id", "sessionId", "session_id", "executionId"]);
   // Known machine envelope: extract ONLY recognized visible response fields.
   // Never fall back to raw JSON/stdout when recognized response is absent.
   const recognizedSummary = extractRecognizedVisibleText(json, ["summary", "output", "description", "message", "response", "result"]) ?? "";
@@ -377,35 +476,84 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     "summary",
     "result",
   ]) ?? recognizedSummary;
+  // The worker answers with textual protocol headings inside the visible
+  // response; parse them so a provider SUCCESS envelope can never hide a
+  // failing test or an unresolved risk reported only in the response body.
+  const protocol = parseWorkerProtocolText(recognizedFullText);
   const rawFiles = firstStringList(json, ["files", "changedFiles", "changed_files"]);
   const rawTests = firstStringList(json, ["tests", "testResults", "test_results"]);
   const rawRisks = firstStringList(json, ["risks", "warnings"]);
+  const rawUnresolved = firstStringList(json, ["unresolved", "pending", "openItems", "open_items"]);
   const rawDiff = firstString(json, ["diffSummary", "diff_summary", "diff"]) ?? "";
-  const usage = parseAgyUsage(json.usage);
+  const providerExecutionStatus = providerExecutionStatusOf(rawStatus);
+  const usage = parseAgyUsage(json.usage, rawConversationId ? truncate(redactSecrets(rawConversationId), 200) : null);
   const durationSeconds = typeof json.duration_seconds === "number" ? json.duration_seconds : (typeof json.durationSeconds === "number" ? json.durationSeconds : null);
   const numTurns = typeof json.num_turns === "number" ? json.num_turns : (typeof json.numTurns === "number" ? json.numTurns : null);
 
   const redactedSummary = redactSecrets(recognizedSummary);
   const redactedFullText = redactSecrets(recognizedFullText);
+  // An explicit top-level `summary` field is authoritative; otherwise the
+  // worker's own SUMMARY heading is the intended summary and the recognized
+  // response text is only the fallback.
+  const explicitSummary = firstString(json, ["summary"]);
+  const summarySource = explicitSummary
+    ? redactSecrets(explicitSummary)
+    : (protocol.summary || redactedSummary);
+  const summary = truncate(redactSecrets(mergeSummary(summarySource, explicitSummary ? protocol.summary : "")), 4_000);
+  const files = mergeUnique(rawFiles, protocol.files);
+  const tests = mergeUnique(rawTests, protocol.tests);
+  const risks = mergeUnique(rawRisks, protocol.risks);
+  const unresolved = mergeUnique(rawUnresolved, protocol.unresolved);
+  const mappedStatus = parseAgyStatus(rawStatus);
+  const claimedStatus: WorkerClaimedStatus = protocol.claimedStatus !== "unknown"
+    ? protocol.claimedStatus
+    : mappedStatus === "failed" || mappedStatus === "aborted"
+      ? "failed"
+      : mappedStatus === "completed" || mappedStatus === "completed_partial"
+        ? "completed"
+        : "unknown";
+  const validationEvidence = classifyValidationEvidence({
+    claimedStatus,
+    providerExecutionStatus,
+    ...(mappedStatus ? { status: mappedStatus } : {}),
+    tests,
+    risks,
+    unresolved,
+    files,
+    diffSummary: rawDiff,
+  });
 
   return {
-    status: parseAgyStatus(rawStatus),
+    status: mappedStatus,
     hasJson: true,
     runId: rawRunId ? truncate(redactSecrets(rawRunId), 200) : null,
-    conversationId: rawConversationId ? truncate(redactSecrets(rawConversationId), 200) : (rawRunId ? truncate(redactSecrets(rawRunId), 200) : null),
+    // No fallback: without an explicit conversation field the provider
+    // conversation is unknown and continuation must not be assumed.
+    conversationId: rawConversationId ? truncate(redactSecrets(rawConversationId), 200) : null,
     ...(usage ? { usage } : {}),
     ...(durationSeconds !== null ? { durationSeconds } : {}),
     ...(numTurns !== null ? { numTurns } : {}),
-    summary: truncate(redactedSummary, 4_000),
+    summary,
     fullText: truncate(redactedFullText, 2_000_000),
-    files: rawFiles.slice(0, 100).map((f) => truncate(redactSecrets(f), 500)),
-    tests: rawTests.slice(0, 100).map((t) => truncate(redactSecrets(t), 1_000)),
-    risks: rawRisks.slice(0, 100).map((r) => truncate(redactSecrets(r), 1_000)),
+    files: files.map((f) => truncate(redactSecrets(f), 500)),
+    tests: tests.map((t) => truncate(redactSecrets(t), 1_000)),
+    risks: risks.map((r) => truncate(redactSecrets(r), 1_000)),
+    unresolved: unresolved.map((u) => truncate(redactSecrets(u), 1_000)),
     diffSummary: truncate(redactSecrets(rawDiff), 10_000),
+    providerExecutionStatus,
+    workerClaimedStatus: claimedStatus,
+    validationEvidence,
     ...(evidence ? { evidence } : {}),
     ...(earlyExit ? { earlyExit } : {}),
     ...(escalation ? { escalation } : {}),
   };
+}
+
+function firstParagraphOf(text: string): string {
+  return text
+    .split(/\r?\n\s*\r?\n/)
+    .map((part) => part.replace(/^\s*#+\s*/, "").trim())
+    .find((part) => part.length > 0 && !/^(STATUS|SUMMARY|ASSUMPTIONS|CHANGES|FILES|TESTS|RISKS|UNRESOLVED|EARLY_EXIT|ESCALATION|ESCALATION_PROPOSAL|EVIDENCE)\s*:/i.test(part)) ?? "";
 }
 
 /**
