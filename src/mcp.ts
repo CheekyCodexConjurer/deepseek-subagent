@@ -407,6 +407,8 @@ export function createMcpServer(
     section: z.enum(["summary", "files", "tests", "risks", "unresolved", "diff", "evidence", "full", "raw"]).optional(),
     offset: z.number().int().min(0).optional(),
     limit: z.number().int().min(1).max(1000).optional(),
+    limit_bytes: z.number().int().min(256).optional(),
+    limitBytes: z.number().int().min(256).optional(),
   };
 
   const parkInputSchema = {
@@ -690,27 +692,11 @@ export function createMcpServer(
     earlyExitTriggered: z.boolean().optional(),
   }).optional();
 
-  const claimsOutputSchema = z.object({
-    summary: z.string(),
-    files: z.array(z.string()),
-    tests: z.array(z.string()),
-    risks: z.array(z.string()),
+  const mandatoryEvidenceSummaryOutputSchema = z.object({
+    total: z.number(),
+    countsByKind: z.record(z.string(), z.number()),
+    firstRefs: z.array(z.string()),
   }).optional();
-
-  const tokensOutputSchema = z.object({
-    inputTokens: z.number().nullable(),
-    outputTokens: z.number().nullable(),
-    thinkingTokens: z.number().nullable(),
-    cachedInputTokens: z.number().nullable(),
-    totalTokens: z.number().nullable(),
-    usageScope: z.enum(["cumulative_conversation", "per_turn", "unknown"]),
-    usageSource: z.enum(["observed", "derived", "unavailable"]),
-  }).optional();
-
-  const mandatoryEvidenceOutputSchema = z.array(z.object({
-    kind: z.string(),
-    detail: z.string(),
-  })).optional();
 
   const compactOutputSchema = z.object({
     version: z.literal(1),
@@ -722,6 +708,11 @@ export function createMcpServer(
       risks: z.array(z.string()),
     }),
     mandatoryEvidence: z.array(z.object({ kind: z.string(), detail: z.string() })),
+    mandatoryEvidenceSummary: z.object({
+      total: z.number(),
+      countsByKind: z.record(z.string(), z.number()),
+      firstRefs: z.array(z.string()),
+    }).optional(),
     receipt: z.object({
       jobId: z.string(),
       agentId: z.string(),
@@ -742,6 +733,7 @@ export function createMcpServer(
       totalTokens: z.number().nullable(),
       usageScope: z.enum(["cumulative_conversation", "per_turn", "unknown"]),
       usageSource: z.enum(["observed", "derived", "unavailable"]),
+      counterResetDetected: z.boolean().optional(),
     }).nullable(),
     decisionReady: z.boolean(),
     decisionReason: z.string().nullable(),
@@ -757,21 +749,10 @@ export function createMcpServer(
       evidenceTotal: z.number().optional(),
       mandatoryDetailCount: z.number().optional(),
       mandatorySections: z.array(z.string()).optional(),
+      exactSection: z.string().optional(),
+      cursor: z.object({ offset: z.number(), limitBytes: z.number() }).nullable().optional(),
+      totalCount: z.number().optional(),
     }),
-  }).optional();
-
-  const detailsRefOutputSchema = z.object({
-    resultPath: z.string().optional(),
-    hasMoreDetails: z.boolean(),
-    availableSections: z.array(z.string()),
-    summaryTruncated: z.boolean().optional(),
-    filesTotal: z.number().optional(),
-    testsTotal: z.number().optional(),
-    risksTotal: z.number().optional(),
-    unresolvedTotal: z.number().optional(),
-    evidenceTotal: z.number().optional(),
-    mandatoryDetailCount: z.number().optional(),
-    mandatorySections: z.array(z.string()).optional(),
   }).optional();
 
   server.registerTool("subagents_follow", {
@@ -792,13 +773,11 @@ export function createMcpServer(
       earlyExit: earlyExitOutputSchema,
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
-      claims: claimsOutputSchema,
       compact: compactOutputSchema,
-      mandatoryEvidence: mandatoryEvidenceOutputSchema,
+      mandatoryEvidenceSummary: mandatoryEvidenceSummaryOutputSchema,
       decisionReady: z.boolean().optional(),
+      decisionReason: z.string().nullable().optional(),
       continuationPersistent: z.boolean().optional(),
-      tokens: tokensOutputSchema,
-      detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
@@ -919,6 +898,7 @@ export function createMcpServer(
         section: (args as any).section,
         offset: (args as any).offset,
         limit: (args as any).limit,
+        limitBytes: (args as any).limit_bytes ?? (args as any).limitBytes,
       };
       const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
@@ -1068,13 +1048,11 @@ export function createMcpServer(
       earlyExit: earlyExitOutputSchema,
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
-      claims: claimsOutputSchema,
       compact: compactOutputSchema,
-      mandatoryEvidence: mandatoryEvidenceOutputSchema,
+      mandatoryEvidenceSummary: mandatoryEvidenceSummaryOutputSchema,
       decisionReady: z.boolean().optional(),
+      decisionReason: z.string().nullable().optional(),
       continuationPersistent: z.boolean().optional(),
-      tokens: tokensOutputSchema,
-      detailsRef: detailsRefOutputSchema,
     },
   }, async (args, extra) => {
     try {
@@ -1196,6 +1174,7 @@ export function createMcpServer(
         section: (args as any).section,
         offset: (args as any).offset,
         limit: (args as any).limit,
+        limitBytes: (args as any).limit_bytes ?? (args as any).limitBytes,
       };
       const result = await readyClient.call<unknown>("/v1/jobs/recover", payload, extra?.signal);
       return {
@@ -1322,6 +1301,98 @@ function acceptedResult(result: Record<string, unknown>, isAlias = false): {
   };
 }
 
+/**
+ * Builds the canonical projection from a legacy bridge payload that still
+ * carries claims/tokens/detailsRef at the top level. Keeps old bridges
+ * compatible without emitting two copies of the same information.
+ */
+function legacyCompactFrom(result: Record<string, unknown>): Record<string, unknown> | undefined {
+  const claims = result.claims as Record<string, unknown> | undefined;
+  if (!claims) return undefined;
+  const tokens = result.tokens as Record<string, unknown> | undefined;
+  const detailsRef = result.detailsRef as Record<string, unknown> | undefined;
+  const mandatoryEvidence = Array.isArray(result.mandatoryEvidence) ? (result.mandatoryEvidence as unknown[]) : [];
+  return {
+    version: 1,
+    status: String(result.status ?? "unknown"),
+    claims,
+    mandatoryEvidence,
+    receipt: (result.receipt as Record<string, unknown> | undefined) ?? null,
+    tokens: tokens ?? null,
+    decisionReady: typeof result.decisionReady === "boolean" ? result.decisionReady : true,
+    decisionReason: null,
+    ...(detailsRef ? { detailsRef } : { detailsRef: { hasMoreDetails: false, availableSections: ["full"] } }),
+  };
+}
+
+/**
+ * Bytes the model actually sees for one MCP tool result: the textual content
+ * plus the structured content. Both cross the same boundary, so the budget must
+ * be enforced over the pair, not over `compact` alone.
+ */
+function modelVisibleBytes(text: string, structuredContent: unknown): number {
+  return Buffer.byteLength(JSON.stringify({ content: [{ type: "text", text }], structuredContent }), "utf8");
+}
+
+function shrinkCompactClaims(compact: Record<string, unknown>, level: number): Record<string, unknown> {
+  const claims = (compact.claims as Record<string, unknown> | undefined) ?? {};
+  const summary = typeof claims.summary === "string" ? claims.summary : "";
+  const files = Array.isArray(claims.files) ? (claims.files as unknown[]) : [];
+  const tests = Array.isArray(claims.tests) ? (claims.tests as unknown[]) : [];
+  const risks = Array.isArray(claims.risks) ? (claims.risks as unknown[]) : [];
+  const caps: Array<{ summary: number; files: number; tests: number; risks: number }> = [
+    { summary: 1_000, files: 10, tests: 10, risks: 5 },
+    { summary: 400, files: 3, tests: 3, risks: 2 },
+    { summary: 160, files: 1, tests: 1, risks: 1 },
+    { summary: 0, files: 0, tests: 0, risks: 0 },
+  ];
+  const cap = caps[Math.min(Math.max(0, level), caps.length - 1)]!;
+  return {
+    ...compact,
+    claims: {
+      summary: summary.slice(0, cap.summary),
+      files: files.slice(0, cap.files),
+      tests: tests.slice(0, cap.tests),
+      risks: risks.slice(0, cap.risks),
+    },
+  };
+}
+
+/**
+ * Replaces the mandatory evidence items with the budget-safe digest the bridge
+ * already prepared, or synthesizes one from the exposed summary. Never drops
+ * the fact that evidence exists.
+ */
+function digestMandatoryEvidence(compact: Record<string, unknown>, decisionReason: string): Record<string, unknown> {
+  const items = Array.isArray(compact.mandatoryEvidence) ? (compact.mandatoryEvidence as Array<Record<string, unknown>>) : [];
+  const countsByKind: Record<string, number> = {};
+  for (const item of items) {
+    const kind = typeof item?.kind === "string" ? item.kind : "unknown";
+    countsByKind[kind] = (countsByKind[kind] ?? 0) + 1;
+  }
+  const existingSummary = compact.mandatoryEvidenceSummary as Record<string, unknown> | undefined;
+  const summary = existingSummary ?? {
+    total: items.length,
+    countsByKind,
+    firstRefs: items.slice(0, 2).map((item, index) => `${typeof item?.kind === "string" ? item.kind : "unknown"}#${index}`),
+  };
+  const detailsRef = (compact.detailsRef as Record<string, unknown> | undefined) ?? {};
+  return {
+    ...compact,
+    claims: { summary: "", files: [], tests: [], risks: [] },
+    mandatoryEvidence: [],
+    mandatoryEvidenceSummary: summary,
+    decisionReady: false,
+    decisionReason,
+    detailsRef: {
+      ...detailsRef,
+      hasMoreDetails: true,
+      exactSection: "evidence",
+      totalCount: typeof summary.total === "number" ? summary.total : items.length,
+    },
+  };
+}
+
 function followResult(result: Record<string, unknown>, isAlias = false, maxBytes = DEFAULT_COMPACT_FOLLOW_MAX_BYTES): {
   content: [{ type: "text"; text: string }];
   structuredContent: Record<string, unknown>;
@@ -1335,112 +1406,120 @@ function followResult(result: Record<string, unknown>, isAlias = false, maxBytes
   const earlyExit = result.earlyExit as Record<string, unknown> | undefined;
   const escalation = result.escalation as Record<string, unknown> | undefined;
   const semanticProgress = (result.semanticProgress ?? (result.progress as Record<string, unknown> | undefined)?.semanticProgress) as Record<string, unknown> | undefined;
-  const claims = result.claims as Record<string, unknown> | undefined;
-  const detailsRef = result.detailsRef as Record<string, unknown> | undefined;
-  const tokens = result.tokens as Record<string, unknown> | undefined;
-  const compact = result.compact as Record<string, unknown> | undefined;
+  const compact = (result.compact as Record<string, unknown> | undefined) ?? legacyCompactFrom(result);
   const mandatoryEvidence = Array.isArray(result.mandatoryEvidence) ? result.mandatoryEvidence as unknown[] : undefined;
-  const decisionReady = typeof result.decisionReady === "boolean" ? result.decisionReady : undefined;
   const continuationPersistent = typeof result.continuationPersistent === "boolean" ? result.continuationPersistent : undefined;
+  const needsApproval = result.status === "needs_approval";
 
+  // Short, bounded human hint. The compact projection is the single canonical
+  // carrier of claims/evidence, so the text never duplicates it.
   const compactParts: string[] = [];
   if (receipt) {
     const duration = receipt.durationMs !== null && receipt.durationMs !== undefined ? `${receipt.durationMs}ms` : "n/a";
     compactParts.push(`receipt: ${receipt.status} (${duration})`);
   }
-  if (earlyExit?.triggered) {
-    compactParts.push(`earlyExit: ${earlyExit.reason || "triggered"}`);
-  }
+  if (earlyExit?.triggered) compactParts.push(`earlyExit: ${earlyExit.reason || "triggered"}`);
   if (escalation) {
     const route = escalation.recommendedRoute ? ` -> ${escalation.recommendedRoute}` : "";
     compactParts.push(`escalation: ${escalation.reason}${route}`);
   }
-  if (semanticProgress) {
-    compactParts.push(`stage: ${semanticProgress.stage}`);
-  }
+  if (semanticProgress) compactParts.push(`stage: ${semanticProgress.stage}`);
+  // Canonical source is compact.tokens; the top-level read is a compatibility
+  // fallback for a legacy bridge payload, never an additional copy in output.
+  const tokens = ((compact?.tokens as Record<string, unknown> | null | undefined) ?? (result.tokens as Record<string, unknown> | undefined)) as Record<string, unknown> | undefined;
   if (tokens) {
     compactParts.push(`tokens: ${tokens.totalTokens === null || tokens.totalTokens === undefined ? "unavailable" : tokens.totalTokens}`);
   }
-  if (mandatoryEvidence && mandatoryEvidence.length > 0) {
-    compactParts.push(`mandatoryEvidence: ${mandatoryEvidence.length}`);
-  }
-  if (decisionReady === false) {
-    compactParts.push("decisionReady: false (fetch details before depending on this result)");
-  }
+  if (mandatoryEvidence && mandatoryEvidence.length > 0) compactParts.push(`mandatoryEvidence: ${mandatoryEvidence.length}`);
+  if (compact?.decisionReady === false) compactParts.push("decisionReady: false (fetch details before depending on this result)");
 
-  const compactSuffix = compactParts.length > 0 ? " [" + compactParts.join(" | ") + "]" : "";
+  const buildText = (parts: string[]): string => {
+    const suffix = parts.length > 0 ? " [" + parts.join(" | ") + "]" : "";
+    if (needsApproval) {
+      return `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.${suffix}`;
+    }
+    return `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.${suffix}`;
+  };
 
-  // Explicit allowlist: the raw result envelope and the full progress history
-  // are NEVER copied into the follow transport. The complete result stays in the
-  // private persisted result file and is fetched on demand via detailsRef.
-  const baseStructured: Record<string, unknown> = {
+  // Lifecycle metadata that must survive whenever possible but is cheap enough
+  // to drop before any evidence. Tier-2 decorations are the first to go.
+  const lifecycle = (): Record<string, unknown> => ({
     agentId: result.agentId,
     jobId: result.jobId,
     status: result.status,
     resultAvailable: result.resultAvailable,
+    obligationState: needsApproval ? "pending" : "closed",
+    ...(needsApproval ? { nextRequiredAction } : {}),
     ...(result.permissionId !== undefined && result.permissionId !== null ? { permissionId: result.permissionId } : {}),
+    ...(continuationPersistent !== undefined ? { continuationPersistent } : {}),
+  });
+  const decorations = (): Record<string, unknown> => ({
     ...(result.message !== undefined ? { message: result.message } : {}),
     ...(result.error !== undefined ? { error: result.error } : {}),
     ...(result.deadlineReached !== undefined ? { deadlineReached: result.deadlineReached } : {}),
     ...(result.gracefulFinalize !== undefined ? { gracefulFinalize: result.gracefulFinalize } : {}),
     ...(result.partial !== undefined ? { partial: result.partial } : {}),
     ...(result.workerAborted !== undefined ? { workerAborted: result.workerAborted } : {}),
-    ...(receipt ? { receipt } : {}),
     ...(earlyExit ? { earlyExit } : {}),
     ...(escalation ? { escalation } : {}),
     ...(semanticProgress ? { semanticProgress } : {}),
-    ...(claims ? { claims } : {}),
-    ...(compact ? { compact } : {}),
-    ...(mandatoryEvidence ? { mandatoryEvidence } : {}),
-    ...(decisionReady !== undefined ? { decisionReady } : {}),
-    ...(continuationPersistent !== undefined ? { continuationPersistent } : {}),
-    ...(detailsRef ? { detailsRef } : {}),
-    ...(tokens ? { tokens } : {}),
+  });
+
+  const build = (text: string, structured: Record<string, unknown>): { content: [{ type: "text"; text: string }]; structuredContent: Record<string, unknown> } => ({
+    content: [{ type: "text", text }],
+    structuredContent: structured,
+  });
+
+  const decorate = (keys: string[], compactValue: Record<string, unknown> | undefined): Record<string, unknown> => {
+    const base = lifecycle();
+    const deco = decorations();
+    for (const key of Object.keys(deco)) {
+      if (keys.includes(key)) base[key] = deco[key];
+    }
+    if (compactValue) {
+      // The compact projection is the canonical carrier of evidence: when it is
+      // present the top level must not duplicate receipt/claims/evidence/tokens.
+      base.compact = compactValue;
+    } else if (keys.includes("receipt") && receipt) {
+      // Legacy responses without a compact projection keep the receipt visible.
+      base.receipt = receipt;
+    }
+    return base;
   };
 
-  // Hard transport invariant: the serialized follow payload never exceeds the
-  // configured byte budget. Optional decorations are dropped before anything
-  // that carries evidence, and a failure to fit fails closed.
-  let payload = baseStructured;
-  if (serializedBytes(payload) > maxBytes) {
-    const droppableDecorations = ["semanticProgress", "escalation", "earlyExit", "receipt", "tokens"];
-    for (const key of droppableDecorations) {
-      if (serializedBytes(payload) <= maxBytes) break;
-      delete payload[key];
+  const fullText = buildText(compactParts);
+  const tier2Keys = ["message", "error", "deadlineReached", "gracefulFinalize", "partial", "workerAborted", "earlyExit", "escalation", "semanticProgress", "receipt"];
+  const shortText = buildText(compactParts.slice(0, 2));
+  // Loss ladder, least to most aggressive. Evidence is always preserved before
+  // the compact projection itself is reduced to a digest, and the digest always
+  // comes before dropping the projection entirely.
+  const candidates: Array<{ text: string; structured: Record<string, unknown> }> = [];
+  if (compact) {
+    candidates.push({ text: fullText, structured: decorate(tier2Keys, compact) });
+    for (let level = 1; level <= 3; level += 1) {
+      candidates.push({ text: fullText, structured: decorate(tier2Keys, shrinkCompactClaims(compact, level)) });
     }
-    if (serializedBytes(payload) > maxBytes) {
-      payload = {
-        ...payload,
-        decisionReady: false,
-        decisionReason: "transport_budget_exceeded",
-      };
-      delete payload.compact;
+    for (let level = 0; level <= 3; level += 1) {
+      candidates.push({ text: shortText, structured: decorate([], shrinkCompactClaims(compact, level)) });
     }
+    // Digest first (keeps the FACT of the evidence + the exact section), then
+    // the absolute floor.
+    candidates.push({ text: shortText, structured: decorate([], digestMandatoryEvidence(compact, "transport_budget_exceeded")) });
   }
+  // No compact projection available: keep the lifecycle + signal decorations.
+  candidates.push({ text: fullText, structured: decorate(tier2Keys, undefined) });
+  candidates.push({ text: shortText, structured: decorate([], undefined) });
 
-  if (result.status === "needs_approval") {
-    return {
-      content: [{
-        type: "text",
-        text: `${displayName} follow requires explicit approval before continuing. Answer with ${nextRequiredAction}, providing permission_id and permission_reply, or end the obligation with ${abortTool} or ${closeTool}.${compactSuffix}`,
-      }],
-      structuredContent: {
-        ...payload,
-        obligationState: "pending",
-        nextRequiredAction,
-      },
-    };
+  for (const candidate of candidates) {
+    if (modelVisibleBytes(candidate.text, candidate.structured) <= maxBytes) return build(candidate.text, candidate.structured);
   }
-  return {
-    content: [{
-      type: "text",
-      text: `${displayName} follow returned a terminal result. The job obligation is closed; the ${isAlias ? "DeepSeek " : ""}agent itself remains open and continuable. Close it with ${closeTool} after reviewing the result.${compactSuffix}`,
-    }],
-    structuredContent: {
-      ...payload,
-      obligationState: "closed",
-    },
-  };
+  // Last resort: the smallest possible truthful envelope. It cannot exceed the
+  // budget because it contains no worker-derived content at all.
+  return build(shortText, {
+    ...lifecycle(),
+    decisionReady: false,
+    decisionReason: "transport_budget_exceeded",
+  });
 }
 
 function parkResult(result: Record<string, unknown>, isAlias = false): {

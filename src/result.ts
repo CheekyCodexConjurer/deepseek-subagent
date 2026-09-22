@@ -524,9 +524,112 @@ export function parseWorkerProtocolText(text: string): ParsedWorkerProtocolText 
   };
 }
 
-const TEST_FAILURE_PATTERN = /\b(?:fail(?:ed|ure|ures|ing)?|error|errored|exception|broken|not\s+passing|did\s+not\s+pass)\b/i;
-const TEST_NOT_RUN_PATTERN = /\b(?:not\s+(?:run|executed|ran)|skipped|todo|unavailable|blocked|n\/a|no\s+tests?\s+(?:run|executed)|could\s+not\s+run|unable\s+to\s+run)\b/i;
-const TEST_PASS_PATTERN = /\b(?:pass(?:ed|es|ing)?|ok|success(?:ful)?|green)\b/i;
+const TEST_FAILURE_PATTERN = /\b(?:fail(?:ed|ure|ures|ing)?|error|errored|exception|broken|not\s+passing|did\s+not\s+pass|falhou|falharam|falha|erro|erros)\b/i;
+const TEST_NOT_RUN_PATTERN = /\b(?:not\s+(?:run|executed|ran)|skipped|todo|unavailable|blocked|n\/a|no\s+tests?\s+(?:run|executed)|could\s+not\s+run|unable\s+to\s+run|não\s+executado|nao\s+executado|não\s+rodou|ignorado|pendente)\b/i;
+const TEST_PASS_PATTERN = /\b(?:pass(?:ed|es|ing)?|ok|success(?:ful)?|green|passou|passaram|aprovado|sucesso)\b/i;
+
+export type TestOutcome = "pass" | "fail" | "not_run" | "unknown";
+export interface TestClassification {
+  outcome: TestOutcome;
+  /** Short human-readable justification, deterministic and bounded. */
+  reason: string;
+}
+
+/**
+ * Deterministic test-outcome classifier.
+ *
+ * Priority: (1) structured result fields, (2) explicit counts and exit codes,
+ * (3) explicit pass/fail tokens with negation awareness, (4) unknown. Ambiguous
+ * text resolves to `unknown` (requires review) instead of guessing: a false pass
+ * hides a real failure, and a false fail makes the parent chase a green build.
+ *
+ * Notably `"627 tests passed, 0 failed"` is a PASS (a na├»ve `includes("failed")`
+ * check would report a failure), and Portuguese failure/success wording is
+ * recognised (`falhou`, `passaram`).
+ */
+export function classifyTestOutcome(entry: unknown): TestClassification {
+  // 1. Structured result when available.
+  if (isRecord(entry)) {
+    const structured = firstOutcomeToken(entry);
+    if (structured !== null) return structured;
+    const text = typeof entry.text === "string" ? entry.text : typeof entry.message === "string" ? entry.message : "";
+    const nested = classifyTestOutcome(text);
+    return nested;
+  }
+  if (typeof entry !== "string") return { outcome: "unknown", reason: "not a test result" };
+  const raw = entry.trim();
+  if (raw.length === 0) return { outcome: "unknown", reason: "empty" };
+
+  // 2. Exit codes are unambiguous.
+  const exitMatch = /\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/i.exec(raw);
+  if (exitMatch?.[1] !== undefined) {
+    const code = Number(exitMatch[1]);
+    return code === 0
+      ? { outcome: "pass", reason: "exit code 0" }
+      : { outcome: "fail", reason: `exit code ${exitMatch[1]}` };
+  }
+
+  // 3. Explicit counts. "N passed" / "M failed" in English and Portuguese.
+  const passedCount = firstCount(raw, [
+    /(\d+)\s+(?:tests?\s+|checks?\s+|specs?\s+|testes?\s+)?(?:passed|passing|passaram|aprovados)\b/i,
+    /(?:passed|passing|passaram|aprovados)\s*[:=]?\s*(\d+)\b/i,
+  ]);
+  const failedCount = firstCount(raw, [
+    /(\d+)\s+(?:tests?\s+|checks?\s+|specs?\s+|testes?\s+)?(?:failed|failing|failures?|falhas?|falharam|com\s+falha)\b/i,
+    /(?:failed|failing|failures?|falhas?|falharam)\s*[:=]?\s*(\d+)\b/i,
+  ]);
+  if (failedCount !== null) {
+    if (failedCount === 0) return { outcome: "pass", reason: "0 failures reported" };
+    return { outcome: "fail", reason: `${failedCount} failure(s) reported` };
+  }
+  if (passedCount !== null) return { outcome: "pass", reason: `${passedCount} passed` };
+
+  // 4. Negation-aware token scan. Remove negated failure phrases first so
+  //    "not failed", "no failures" and "sem falhas" cannot be read as failures.
+  const negated = raw
+    .replace(/\b(?:no|zero|0|not?|never)\s+(?:failures?|errors?|failed|failing)\b/gi, " ")
+    .replace(/\b(?:sem|nenhuma|nenhum)\s+(?:falhas?|erros?|falha)\b/gi, " ")
+    .replace(/\bnão\s+(?:falhou|falharam|houve\s+falha)\b/gi, " ");
+  if (TEST_FAILURE_PATTERN.test(negated)) return { outcome: "fail", reason: "explicit failure token" };
+  if (TEST_NOT_RUN_PATTERN.test(raw)) return { outcome: "not_run", reason: "explicit not-run/skipped token" };
+  if (TEST_PASS_PATTERN.test(raw)) return { outcome: "pass", reason: "explicit pass token" };
+  return { outcome: "unknown", reason: "no deterministic outcome signal" };
+}
+
+/** Extracts an explicit outcome from a structured test-result object. */
+function firstOutcomeToken(entry: Record<string, unknown>): TestClassification | null {
+  for (const key of ["outcome", "status", "result", "state", "passed", "success", "ok"]) {
+    const value = entry[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === "boolean") {
+      return value ? { outcome: "pass", reason: `${key}=true` } : { outcome: "fail", reason: `${key}=false` };
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["pass", "passed", "passing", "ok", "success", "succeeded", "green", "aprovado", "sucesso"].includes(normalized)) {
+        return { outcome: "pass", reason: `${key}=${normalized}` };
+      }
+      if (["fail", "failed", "failure", "error", "errored", "red", "falhou", "falha", "erro"].includes(normalized)) {
+        return { outcome: "fail", reason: `${key}=${normalized}` };
+      }
+      if (["skip", "skipped", "not_run", "pending", "todo", "ignorado"].includes(normalized)) {
+        return { outcome: "not_run", reason: `${key}=${normalized}` };
+      }
+    }
+  }
+  return null;
+}
+
+function firstCount(text: string, patterns: RegExp[]): number | null {
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match?.[1] !== undefined) {
+      const value = Number(match[1]);
+      if (Number.isFinite(value)) return value;
+    }
+  }
+  return null;
+}
 const BLOCKING_RISK_PATTERN = /\b(?:blocker|blocking|critical|severe|fatal|regression|regress(?:ão|ao|ões|oes)|cr[íi]tic[oa]|bloqueador|bloqueante|grave|perda\s+de\s+dados|data\s+loss|security|seguran[çc]a)\b/i;
 const SCOPE_VIOLATION_PATTERN = /\b(?:out\s+of\s+scope|outside\s+(?:the\s+)?scope|unrelated\s+(?:file|change)|scope\s+(?:creep|violation)|beyond\s+(?:the\s+)?(?:requested|authorized)|fora\s+do\s+escopo|fora\s+de\s+escopo|escopo\s+indevido)\b/i;
 
@@ -551,22 +654,41 @@ export function classifyValidationEvidence(input: {
   diffSummary?: string;
   validationAbsent?: boolean;
   permissionRequired?: boolean;
+  /**
+   * Actions the provider auto-denied (headless permission was never granted).
+   * An auto-denied action means the worker was BLOCKED: the run cannot be
+   * treated as complete just because the provider exited SUCCESS.
+   */
+  deniedActions?: string[];
+  /** True when the provider returned no visible response text at all. */
+  emptyResult?: boolean;
   error?: string | null;
 }): ValidationEvidence {
   const tests = nonNone(input.tests);
   const risks = nonNone(input.risks);
   const unresolved = nonNone(input.unresolved);
-  const testsFailed = tests.filter((test) => TEST_FAILURE_PATTERN.test(test));
-  const testsPassed = tests.filter((test) => !TEST_FAILURE_PATTERN.test(test) && TEST_PASS_PATTERN.test(test));
-  const testsNotRun = tests.filter((test) => !TEST_FAILURE_PATTERN.test(test) && TEST_NOT_RUN_PATTERN.test(test));
+  const deniedActions = (input.deniedActions ?? [])
+    .map((action) => String(action).trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  // Outcome classification replaces a naive keyword scan: "627 passed, 0 failed"
+  // must not be read as a failure, and ambiguous text must stay unknown.
+  const classified = tests.map((test) => ({ test, classification: classifyTestOutcome(test) }));
+  const testsFailed = classified.filter((item) => item.classification.outcome === "fail").map((item) => item.test);
+  const testsPassed = classified.filter((item) => item.classification.outcome === "pass").map((item) => item.test);
+  const testsNotRun = classified.filter((item) => item.classification.outcome === "not_run").map((item) => item.test);
+  const testsUnknown = classified.filter((item) => item.classification.outcome === "unknown").map((item) => item.test);
   const blockingRisks = risks.filter((risk) => BLOCKING_RISK_PATTERN.test(risk));
   const scopeViolations = unresolved.filter((item) => SCOPE_VIOLATION_PATTERN.test(item));
 
   const providerFailure = input.providerExecutionStatus === "failure";
   const envelopeFailure = input.status === "failed" || input.status === "aborted" || input.status === "timed_out";
   const partial = input.status === "completed_partial";
-  const workerFailure = input.claimedStatus === "failed" || providerFailure || envelopeFailure;
-  const permissionRequired = Boolean(input.permissionRequired) || input.claimedStatus === "needs_approval";
+  // A denied action or an entirely empty response means the provider claimed a
+  // normal exit while the work did not actually happen.
+  const emptyResult = Boolean(input.emptyResult) && tests.length === 0 && nonNone(unresolved).length === 0;
+  const workerFailure = input.claimedStatus === "failed" || providerFailure || envelopeFailure || deniedActions.length > 0 || emptyResult;
+  const permissionRequired = Boolean(input.permissionRequired) || input.claimedStatus === "needs_approval" || deniedActions.length > 0;
   const validationAbsent = Boolean(input.validationAbsent) && tests.length === 0;
   const claimEvidenceConflict = input.claimedStatus === "completed"
     && (testsFailed.length > 0 || providerFailure || envelopeFailure || partial);
@@ -579,12 +701,15 @@ export function classifyValidationEvidence(input: {
   };
   for (const test of testsFailed) push("test_failed", test);
   for (const test of testsNotRun) push("test_not_run", test);
-  if (permissionRequired) push("permission_required", "The worker requested an explicit permission decision.");
+  for (const test of testsUnknown) push("test_unclassified", test);
+  for (const action of deniedActions) push("action_denied", `The provider auto-denied '${action}' and never executed it.`);
+  if (permissionRequired && deniedActions.length === 0) push("permission_required", "The worker requested an explicit permission decision.");
   for (const item of unresolved) push("unresolved", item);
   if (workerFailure) push("worker_failure", input.error && input.error.trim().length > 0 ? input.error : "The worker did not complete successfully.");
   if (partial) push("partial_completion", "The worker reported a partial completion.");
   for (const item of scopeViolations) push("scope_violation", item);
   if (validationAbsent) push("validation_absent", "No test evidence was reported for a task that required validation.");
+  if (emptyResult) push("validation_absent", "The provider reported success but returned no visible result; nothing was accomplished or reported.");
   for (const risk of blockingRisks) push("blocking_risk", risk);
   if (claimEvidenceConflict) push("claim_evidence_conflict", "The worker claimed completion while the evidence shows a failure or partial result.");
   if (input.error && input.error.trim().length > 0 && !workerFailure) push("operational_error", input.error);
@@ -593,16 +718,36 @@ export function classifyValidationEvidence(input: {
     testsFailed,
     testsNotRun,
     testsPassed,
+    testsUnknown,
     blockingRisks,
     unresolved,
     scopeViolations,
     validationAbsent,
     permissionRequired,
+    deniedActions,
     partial,
     workerFailure,
+    emptyResult,
     claimEvidenceConflict,
     mandatory,
   };
+}
+
+/**
+ * Kinds that make a result unusable for an autonomous decision: the parent must
+ * intervene (grant permission, supply validation, or fetch details) instead of
+ * treating the run as finished work.
+ */
+const BLOCKING_EVIDENCE_KINDS: ReadonlySet<MandatoryEvidenceItem["kind"]> = new Set([
+  "permission_required",
+  "action_denied",
+  "worker_failure",
+  "partial_completion",
+  "validation_absent",
+]);
+
+export function hasBlockingEvidence(mandatory: MandatoryEvidenceItem[]): boolean {
+  return mandatory.some((item) => BLOCKING_EVIDENCE_KINDS.has(item.kind));
 }
 
 export const COMPACT_SUMMARY_MAX_CHARS = 1_000;
@@ -625,16 +770,36 @@ export interface PriorUsage {
   totalTokens: number;
   comparable: boolean;
   providerConversationId: string | null;
+  /** A previous turn in this conversation already observed a counter reset. */
+  counterResetObserved?: boolean;
+}
+
+export interface DerivedTurnUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  thinkingTokens: number | null;
+  cachedInputTokens: number | null;
+  totalTokens: number | null;
+  usageScope: WorkerUsageScope;
+  usageSource: WorkerUsageSource;
+  providerConversationId: string | null;
+  /** A cumulative counter went backwards: the provider conversation restarted. */
+  counterResetDetected: boolean;
 }
 
 /**
  * Derives the usage attributable to a single turn without inventing precision.
  *
- * Only a provider block that is explicitly scoped `cumulative_conversation` for
- * the SAME provider conversation as the prior jobs may be differenced. In every
- * other case the observed values are kept as-is (a new conversation, a reset, a
- * per-turn provider, or an unknown scope), so a session reset can never produce
- * a false delta and a missing field stays null instead of becoming zero.
+ * Only a provider block explicitly scoped `cumulative_conversation` for the
+ * SAME provider conversation as the prior jobs may be differenced, and only
+ * while every cumulative counter is monotonically non-decreasing. If ANY
+ * observed cumulative counter went backwards the provider session restarted:
+ * the observed values are kept verbatim, `counterResetDetected` is set, and no
+ * delta is produced (a reset must never be reported as zero spend).
+ *
+ * Differencing is per field: a field that is missing on either side stays null
+ * instead of becoming zero, so partial provider blocks never fabricate
+ * precision for the fields they do report.
  */
 export function deriveTurnUsage(current: {
   inputTokens: number | null;
@@ -645,19 +810,14 @@ export function deriveTurnUsage(current: {
   usageScope: WorkerUsageScope;
   usageSource: WorkerUsageSource;
   providerConversationId?: string | null;
-}, prior: PriorUsage): {
-  inputTokens: number | null;
-  outputTokens: number | null;
-  thinkingTokens: number | null;
-  cachedInputTokens: number | null;
-  totalTokens: number | null;
-  usageScope: WorkerUsageScope;
-  usageSource: WorkerUsageSource;
-  providerConversationId: string | null;
-} {
+}, prior: PriorUsage): DerivedTurnUsage {
   const sameConversation = Boolean(current.providerConversationId) &&
     current.providerConversationId === prior.providerConversationId;
-  const canDifference = current.usageScope === "cumulative_conversation" && prior.comparable && sameConversation;
+  const canDifference = current.usageScope === "cumulative_conversation" &&
+    prior.comparable &&
+    sameConversation &&
+    !prior.counterResetObserved;
+
   if (!canDifference) {
     return {
       inputTokens: current.inputTokens,
@@ -670,8 +830,33 @@ export function deriveTurnUsage(current: {
       usageScope: current.usageScope,
       usageSource: "observed",
       providerConversationId: current.providerConversationId ?? null,
+      counterResetDetected: false,
     };
   }
+
+  const pairs: Array<[number | null, number]> = [
+    [current.inputTokens, prior.inputTokens],
+    [current.outputTokens, prior.outputTokens],
+    [current.thinkingTokens, prior.thinkingTokens],
+    [current.cachedInputTokens, prior.cachedInputTokens],
+    [current.totalTokens, prior.totalTokens],
+  ];
+  const resetDetected = pairs.some(([value, baseline]) => value !== null && value < baseline);
+  if (resetDetected) {
+    return {
+      inputTokens: current.inputTokens,
+      outputTokens: current.outputTokens,
+      thinkingTokens: current.thinkingTokens,
+      cachedInputTokens: current.cachedInputTokens,
+      totalTokens: current.totalTokens,
+      usageScope: "unknown",
+      usageSource: "observed",
+      providerConversationId: current.providerConversationId ?? null,
+      counterResetDetected: true,
+    };
+  }
+
+  // Per-field differencing: unknown stays unknown on either side.
   const delta = (value: number | null, baseline: number): number | null =>
     value === null ? null : Math.max(0, value - baseline);
   return {
@@ -683,7 +868,61 @@ export function deriveTurnUsage(current: {
     usageScope: "per_turn",
     usageSource: "derived",
     providerConversationId: current.providerConversationId ?? null,
+    counterResetDetected: false,
   };
+}
+
+/**
+ * Splits a string into a byte-bounded UTF-8 safe chunk.
+ *
+ * Never splits a multi-byte character: the end offset is walked back off any
+ * UTF-8 continuation byte. `offset` and `nextOffset` are BYTE offsets, so a
+ * caller can page through a multi-megabyte field deterministically.
+ */
+export function chunkUtf8(text: string, offset: number, maxBytes: number): {
+  chunk: string;
+  offset: number;
+  returnedBytes: number;
+  totalBytes: number;
+  hasMore: boolean;
+  nextOffset: number;
+} {
+  const buffer = Buffer.from(text, "utf8");
+  const totalBytes = buffer.length;
+  const start = Math.max(0, Math.min(offset, totalBytes));
+  const budget = Math.max(0, maxBytes);
+  let end = Math.min(start + budget, totalBytes);
+  if (end < totalBytes) {
+    // Back off any UTF-8 continuation byte so the cut lands on a lead byte.
+    while (end > start && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  }
+  const chunk = buffer.subarray(start, end).toString("utf8");
+  const hasMore = end < totalBytes;
+  return {
+    chunk,
+    offset: start,
+    returnedBytes: end - start,
+    totalBytes,
+    hasMore,
+    nextOffset: hasMore ? end : totalBytes,
+  };
+}
+
+/**
+ * Adds `serializedBytes` to a payload and iterates until the reported value
+ * equals the real byte length of the final serialization. A single pre-insert
+ * measurement is wrong by the width of the field itself, which drifts over
+ * 10k/100k boundaries.
+ */
+export function withStableSerializedBytes<T extends Record<string, unknown>>(payload: T, key = "serializedBytes"): T & { serializedBytes: number } {
+  let size = serializedBytes({ ...payload, [key]: 0 });
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = { ...payload, [key]: size } as T & { serializedBytes: number };
+    const measured = serializedBytes(candidate);
+    if (measured === size) return candidate;
+    size = measured;
+  }
+  return { ...payload, [key]: size } as T & { serializedBytes: number };
 }
 
 export interface CompactWorkerResultOptions {
@@ -756,9 +995,10 @@ export function createCompactWorkerResult(
         totalTokens: envelope.usage.totalTokens,
         usageScope: envelope.usage.usageScope,
         usageSource: envelope.usage.usageSource,
+        ...(envelope.usage.counterResetDetected ? { counterResetDetected: true } : {}),
       } : null),
-      decisionReady: options.decisionReady ?? true,
-      decisionReason: options.decisionReason ?? null,
+      decisionReady: options.decisionReady ?? (!hasBlockingEvidence(mandatoryEvidence)),
+      decisionReason: options.decisionReason ?? (hasBlockingEvidence(mandatoryEvidence) ? "blocking_evidence_requires_action" : null),
       detailsRef,
     };
   };
@@ -790,12 +1030,66 @@ export function createCompactWorkerResult(
     }
   }
 
-  // Even the mandatory floor does not fit: fail closed, never silently drop.
-  return {
-    ...build({ summary: 0, files: 0, tests: 0, risks: 0 }),
-    decisionReady: false,
-    decisionReason: "mandatory_evidence_overflow",
+  // Even the mandatory floor does not fit. Never silently drop it and never
+  // dump the bulk: replace the items with a budget-safe digest and fail closed
+  // so the parent fetches the exact section on demand.
+  const countsByKind: Record<string, number> = {};
+  for (const item of mandatoryEvidence) {
+    countsByKind[item.kind] = (countsByKind[item.kind] ?? 0) + 1;
+  }
+  const overflowDetailsRef = createDetailsRef(envelope, {
+    compactSummaryChars: 0,
+    mandatoryDetailCount: mandatoryEvidence.length,
+    mandatorySections: Object.keys(countsByKind),
+  });
+  const minimal = (firstRefs: string[], dropReceipt: boolean, dropTokens: boolean): CompactWorkerResultV1 => {
+    const base = build({ summary: 0, files: 0, tests: 0, risks: 0 });
+    return {
+      ...base,
+      claims: { summary: "", files: [], tests: [], risks: [] },
+      mandatoryEvidence: [],
+      mandatoryEvidenceSummary: {
+        total: mandatoryEvidence.length,
+        countsByKind,
+        firstRefs,
+      },
+      receipt: dropReceipt ? null : base.receipt,
+      tokens: dropTokens ? null : base.tokens,
+      decisionReady: false,
+      decisionReason: "mandatory_evidence_overflow",
+      detailsRef: {
+        ...overflowDetailsRef,
+        hasMoreDetails: true,
+        exactSection: "evidence",
+        cursor: { offset: 0, limitBytes: options.maxBytes },
+        totalCount: mandatoryEvidence.length,
+      },
+    };
   };
+
+  // firstRefs are identifiers, never the detail body; shrink them (and then the
+  // decorations) until the minimal response itself respects the budget.
+  const buildRefs = (limit: number): string[] => {
+    const refs: string[] = [];
+    for (let index = 0; index < mandatoryEvidence.length && refs.length < limit; index += 1) {
+      const item = mandatoryEvidence[index]!;
+      refs.push(`${item.kind}#${index}`);
+    }
+    return refs;
+  };
+  const ladder: Array<[number, boolean, boolean]> = [
+    [Math.min(mandatoryEvidence.length, 5), false, false],
+    [Math.min(mandatoryEvidence.length, 2), false, false],
+    [1, false, false],
+    [0, false, false],
+    [0, true, false],
+    [0, true, true],
+  ];
+  for (const [limit, dropReceipt, dropTokens] of ladder) {
+    const candidate = minimal(buildRefs(limit), dropReceipt, dropTokens);
+    if (serializedBytes(candidate) <= options.maxBytes) return candidate;
+  }
+  return minimal([], true, true);
 }
 
 export function createCompactClaims(envelope: ResultEnvelope): WorkerClaims {
@@ -929,9 +1223,11 @@ const VALIDATION_LIST_KEYS = [
   "testsFailed",
   "testsNotRun",
   "testsPassed",
+  "testsUnknown",
   "blockingRisks",
   "unresolved",
   "scopeViolations",
+  "deniedActions",
 ] as const;
 
 function projectSafeValidationEvidence(value: unknown): ValidationEvidence | null {
@@ -945,7 +1241,7 @@ function projectSafeValidationEvidence(value: unknown): ValidationEvidence | nul
         .map((item) => truncate(redactSecrets(item), 1_000));
     }
   }
-  for (const key of ["validationAbsent", "permissionRequired", "partial", "workerFailure", "claimEvidenceConflict"]) {
+  for (const key of ["validationAbsent", "permissionRequired", "partial", "workerFailure", "emptyResult", "claimEvidenceConflict"]) {
     if (typeof value[key] === "boolean") output[key] = value[key];
   }
   if (Array.isArray(value.mandatory)) {
@@ -978,6 +1274,7 @@ function projectSafeUsage(value: unknown): ResultEnvelope["usage"] | null {
     usageScope: scope,
     usageSource: source,
     ...(typeof value.providerConversationId === "string" ? { providerConversationId: redactSecrets(value.providerConversationId) } : {}),
+    ...(value.counterResetDetected === true ? { counterResetDetected: true } : {}),
   };
   const allNull = usage.inputTokens === null && usage.outputTokens === null && usage.thinkingTokens === null &&
     usage.cachedInputTokens === null && usage.totalTokens === null;

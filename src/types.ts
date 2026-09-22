@@ -138,6 +138,8 @@ export interface RecoverResultInput {
   section?: RecoverResultSection | undefined;
   offset?: number | undefined;
   limit?: number | undefined;
+  /** Per-page serialized-byte ceiling (clamped to recoverPageMaxBytes). */
+  limitBytes?: number | undefined;
 }
 
 export interface AgentRecord {
@@ -220,6 +222,7 @@ export interface JobRecord {
   workerCachedInputTokens?: number | null;
   workerTotalTokens?: number | null;
   workerUsageScope?: WorkerUsageScope | null;
+  workerCounterReset?: boolean | null;
   workerUsageSource?: WorkerUsageSource | null;
   workerProviderConversationId?: string | null;
 }
@@ -468,7 +471,9 @@ export type WorkerClaimedStatus = "completed" | "failed" | "needs_approval" | "u
 export type MandatoryEvidenceKind =
   | "test_failed"
   | "test_not_run"
+  | "test_unclassified"
   | "permission_required"
+  | "action_denied"
   | "unresolved"
   | "worker_failure"
   | "partial_completion"
@@ -484,6 +489,19 @@ export interface MandatoryEvidenceItem {
 }
 
 /**
+ * Budget-safe digest of mandatory evidence used when the full items cannot fit
+ * the transport budget. It never drops the FACT of the evidence, only the bulk:
+ * the parent learns how many of each kind exist and gets the first references
+ * so it can fetch the exact section on demand.
+ */
+export interface MandatoryEvidenceSummary {
+  total: number;
+  countsByKind: Record<string, number>;
+  /** The strictly necessary leading references/IDs, bounded by the budget. */
+  firstRefs: string[];
+}
+
+/**
  * Evidence derived deterministically from the worker response and the provider
  * envelope. It never upgrades a claim to a verified fact and never hides a
  * failure behind a provider-level SUCCESS.
@@ -492,13 +510,19 @@ export interface ValidationEvidence {
   testsFailed: string[];
   testsNotRun: string[];
   testsPassed: string[];
+  /** Test lines whose outcome could not be determined deterministically. */
+  testsUnknown: string[];
   blockingRisks: string[];
   unresolved: string[];
   scopeViolations: string[];
   validationAbsent: boolean;
   permissionRequired: boolean;
+  /** Provider-reported actions that were auto-denied and never ran. */
+  deniedActions: string[];
   partial: boolean;
   workerFailure: boolean;
+  /** The provider claimed success but produced no visible result at all. */
+  emptyResult: boolean;
   /** True when the worker claims success but the evidence shows a failure. */
   claimEvidenceConflict: boolean;
   mandatory: MandatoryEvidenceItem[];
@@ -514,6 +538,11 @@ export interface CompactWorkerResultV1 {
   status: string;
   claims: WorkerClaims;
   mandatoryEvidence: MandatoryEvidenceItem[];
+  /**
+   * Present only when `mandatoryEvidence` had to be replaced by a budget-safe
+   * digest. Its presence is itself the signal that details are required.
+   */
+  mandatoryEvidenceSummary?: MandatoryEvidenceSummary;
   receipt: {
     jobId: string;
     agentId: string;
@@ -534,6 +563,8 @@ export interface CompactWorkerResultV1 {
     totalTokens: number | null;
     usageScope: WorkerUsageScope;
     usageSource: WorkerUsageSource;
+    /** True when a cumulative provider counter went backwards (session reset). */
+    counterResetDetected?: boolean;
   } | null;
   decisionReady: boolean;
   decisionReason: string | null;
@@ -552,6 +583,12 @@ export interface ResultDetailsRef {
   evidenceTotal?: number;
   mandatoryDetailCount?: number;
   mandatorySections?: string[];
+  /** The exact recovery section to fetch for the blocking evidence. */
+  exactSection?: string;
+  /** Where to resume the fetch for that section. */
+  cursor?: { offset: number; limitBytes: number } | null;
+  /** Total items (or bytes) of the exact section. */
+  totalCount?: number;
 }
 
 export interface FollowResult {
@@ -588,6 +625,7 @@ export interface FollowResult {
     totalTokens: number | null;
     usageScope: WorkerUsageScope;
     usageSource: WorkerUsageSource;
+    counterResetDetected?: boolean;
   };
   earlyExit?: EarlyExitSignal;
   escalation?: EscalationProposal;
@@ -717,6 +755,7 @@ export interface ResultEnvelope {
     usageScope: WorkerUsageScope;
     usageSource: WorkerUsageSource;
     providerConversationId?: string | null;
+    counterResetDetected?: boolean;
   };
 }
 

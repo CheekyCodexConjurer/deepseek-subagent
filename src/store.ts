@@ -534,6 +534,17 @@ export class BridgeStore {
         }
         this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(24, ?)").run(new Date().toISOString());
       }
+      const v25Migration = this.db.prepare("SELECT 1 AS found FROM schema_migrations WHERE version = 25").get() as Row | undefined;
+      if (!v25Migration) {
+        const jobCols = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
+        // Records that a cumulative provider counter went backwards for this
+        // turn. Later turns in the same conversation must not difference against
+        // a baseline that a session reset has already invalidated.
+        if (!jobCols.includes("worker_counter_reset")) {
+          this.db.exec("ALTER TABLE jobs ADD COLUMN worker_counter_reset INTEGER DEFAULT 0;");
+        }
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES(25, ?)").run(new Date().toISOString());
+      }
     });
   }
 
@@ -1205,12 +1216,13 @@ export class BridgeStore {
       usageScope?: WorkerUsageScope | null;
       usageSource?: WorkerUsageSource | null;
       providerConversationId?: string | null;
+      counterResetDetected?: boolean | null;
     },
     expectedFence?: number | null,
   ): JobRecord {
     // NULL means "the provider did not report this", which is semantically
     // different from zero and must not be coerced.
-    let sql = "UPDATE jobs SET worker_input_tokens = ?, worker_output_tokens = ?, worker_thinking_tokens = ?, worker_cached_input_tokens = ?, worker_total_tokens = ?, worker_usage_scope = ?, worker_usage_source = ?, worker_provider_conversation_id = ? WHERE id = ?";
+    let sql = "UPDATE jobs SET worker_input_tokens = ?, worker_output_tokens = ?, worker_thinking_tokens = ?, worker_cached_input_tokens = ?, worker_total_tokens = ?, worker_usage_scope = ?, worker_usage_source = ?, worker_provider_conversation_id = ?, worker_counter_reset = ? WHERE id = ?";
     const params: (number | string | null)[] = [
       usage.inputTokens ?? null,
       usage.outputTokens ?? null,
@@ -1220,6 +1232,7 @@ export class BridgeStore {
       usage.usageScope ?? "unknown",
       usage.usageSource ?? "unavailable",
       usage.providerConversationId ?? null,
+      usage.counterResetDetected === true ? 1 : 0,
       id,
     ];
     if (expectedFence !== undefined && expectedFence !== null) {
@@ -1262,6 +1275,7 @@ export class BridgeStore {
     totalTokens: number;
     comparable: boolean;
     providerConversationId: string | null;
+    counterResetObserved: boolean;
   } {
     const empty = {
       inputTokens: 0,
@@ -1271,15 +1285,19 @@ export class BridgeStore {
       totalTokens: 0,
       comparable: false,
       providerConversationId: currentProviderConversationId ?? null,
+      counterResetObserved: false,
     };
     if (!currentProviderConversationId) return empty;
-    const jobs = this.listJobs().filter((j) =>
+    const allForConversation = this.listJobs().filter((j) =>
       j.agentId === agentId &&
-      (!currentJobId || j.id !== currentJobId) &&
-      j.workerUsageScope === "cumulative_conversation" &&
       j.workerProviderConversationId === currentProviderConversationId
     );
-    if (jobs.length === 0) return { ...empty, comparable: true };
+    const counterResetObserved = allForConversation.some((j) => j.workerCounterReset === true);
+    const jobs = allForConversation.filter((j) =>
+      (!currentJobId || j.id !== currentJobId) &&
+      j.workerUsageScope === "cumulative_conversation"
+    );
+    if (jobs.length === 0) return { ...empty, comparable: true, counterResetObserved };
     let inputTokens = 0;
     let outputTokens = 0;
     let thinkingTokens = 0;
@@ -1292,7 +1310,7 @@ export class BridgeStore {
       cachedInputTokens += j.workerCachedInputTokens ?? 0;
       totalTokens += j.workerTotalTokens ?? 0;
     }
-    return { inputTokens, outputTokens, thinkingTokens, cachedInputTokens, totalTokens, comparable: true, providerConversationId: currentProviderConversationId };
+    return { inputTokens, outputTokens, thinkingTokens, cachedInputTokens, totalTokens, comparable: true, providerConversationId: currentProviderConversationId, counterResetObserved };
   }
 
   countJobsWithCorrelationHints(): number {
@@ -1960,6 +1978,7 @@ export class BridgeStore {
       workerUsageScope: parseUsageScope(row.worker_usage_scope),
       workerUsageSource: parseUsageSource(row.worker_usage_source),
       workerProviderConversationId: nullableString(row, "worker_provider_conversation_id"),
+      workerCounterReset: row.worker_counter_reset === 1 || row.worker_counter_reset === true ? true : (row.worker_counter_reset === 0 || row.worker_counter_reset === false ? false : null),
     };
   }
 

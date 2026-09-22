@@ -29,6 +29,8 @@ export interface ParsedAgyOutput {
   tests: string[];
   risks: string[];
   unresolved: string[];
+  /** Provider-reported actions that were auto-denied and never executed. */
+  deniedActions: string[];
   diffSummary: string;
   providerExecutionStatus: ProviderExecutionStatus;
   workerClaimedStatus: WorkerClaimedStatus;
@@ -377,6 +379,31 @@ function mergeSummary(structured: string, textual: string): string {
   return structuredTrimmed + "\n\n" + textualTrimmed;
 }
 
+/**
+ * Reads the provider's `denied_actions` list. The installed CLI reports actions
+ * it auto-denied because headless mode cannot prompt (observed live on agy
+ * 1.2.7: `[{"action":"command","display_name":"RunCommand"}]`). A denied action
+ * means the worker was BLOCKED even though `status` says SUCCESS, so it must be
+ * surfaced as evidence instead of being silently ignored.
+ */
+function parseDeniedActions(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const actions: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item.trim().length > 0) {
+      actions.push(truncate(redactSecrets(item.trim()), 200));
+      continue;
+    }
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const record = item as Record<string, unknown>;
+      const label = [record.display_name, record.displayName, record.action, record.name, record.tool]
+        .find((value) => typeof value === "string" && value.trim().length > 0);
+      if (typeof label === "string") actions.push(truncate(redactSecrets(label.trim()), 200));
+    }
+  }
+  return actions.slice(0, 20);
+}
+
 function providerExecutionStatusOf(rawStatus: string | null): ProviderExecutionStatus {
   if (rawStatus === null) return "unknown";
   const normalized = rawStatus.trim().toLowerCase();
@@ -417,6 +444,7 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
         tests: [],
         risks: [],
         unresolved: [],
+        deniedActions: [],
         diffSummary: "",
         providerExecutionStatus: "unknown",
         workerClaimedStatus: "unknown",
@@ -446,6 +474,7 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
       tests: protocol.tests,
       risks: protocol.risks,
       unresolved: protocol.unresolved,
+      deniedActions: [],
       diffSummary: "",
       providerExecutionStatus: "unknown",
       workerClaimedStatus: protocol.claimedStatus,
@@ -521,6 +550,8 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     unresolved,
     files,
     diffSummary: rawDiff,
+    deniedActions: parseDeniedActions(json.denied_actions ?? json.deniedActions),
+    emptyResult: recognizedFullText.trim().length === 0,
   });
 
   return {
@@ -539,6 +570,7 @@ export function parseAgyOutput(stdout: string, stderr: string): ParsedAgyOutput 
     tests: tests.map((t) => truncate(redactSecrets(t), 1_000)),
     risks: risks.map((r) => truncate(redactSecrets(r), 1_000)),
     unresolved: unresolved.map((u) => truncate(redactSecrets(u), 1_000)),
+    deniedActions: parseDeniedActions(json.denied_actions ?? json.deniedActions),
     diffSummary: truncate(redactSecrets(rawDiff), 10_000),
     providerExecutionStatus,
     workerClaimedStatus: claimedStatus,

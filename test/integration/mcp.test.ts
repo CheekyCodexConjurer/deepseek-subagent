@@ -2127,7 +2127,7 @@ test("deepseek_recover_result and subagents_recover_result recover by request_id
     assert.equal(result1.isError, undefined);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.pathname, "/v1/jobs/recover");
-    assert.deepEqual(calls[0]?.body, { requestId: "req_rec_1", agentId: undefined, jobId: undefined, section: undefined, offset: undefined, limit: undefined });
+    assert.deepEqual(calls[0]?.body, { requestId: "req_rec_1", agentId: undefined, jobId: undefined, section: undefined, offset: undefined, limit: undefined, limitBytes: undefined });
     const structured1 = result1.structuredContent as Record<string, unknown>;
     assert.deepEqual(structured1.result, fakeResult);
 
@@ -2139,7 +2139,7 @@ test("deepseek_recover_result and subagents_recover_result recover by request_id
     assert.equal(result2.isError, undefined);
     assert.equal(calls.length, 2);
     assert.equal(calls[1]?.pathname, "/v1/jobs/recover");
-    assert.deepEqual(calls[1]?.body, { requestId: "req_rec_2", agentId: undefined, jobId: undefined, section: undefined, offset: undefined, limit: undefined });
+    assert.deepEqual(calls[1]?.body, { requestId: "req_rec_2", agentId: undefined, jobId: undefined, section: undefined, offset: undefined, limit: undefined, limitBytes: undefined });
     const structured2 = result2.structuredContent as Record<string, unknown>;
     assert.deepEqual(structured2.result, fakeResult);
   } finally {
@@ -2189,7 +2189,7 @@ test("deepseek_recover_result and subagents_recover_result recover by legacy age
     });
     assert.equal(result1.isError, undefined);
     assert.equal(calls[0]?.pathname, "/v1/jobs/recover");
-    assert.deepEqual(calls[0]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy", section: undefined, offset: undefined, limit: undefined });
+    assert.deepEqual(calls[0]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy", section: undefined, offset: undefined, limit: undefined, limitBytes: undefined });
 
     const result2 = await client.callTool({
       name: "subagents_recover_result",
@@ -2197,7 +2197,7 @@ test("deepseek_recover_result and subagents_recover_result recover by legacy age
     });
     assert.equal(result2.isError, undefined);
     assert.equal(calls[1]?.pathname, "/v1/jobs/recover");
-    assert.deepEqual(calls[1]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy", section: undefined, offset: undefined, limit: undefined });
+    assert.deepEqual(calls[1]?.body, { requestId: undefined, agentId: "agent_legacy", jobId: "job_legacy", section: undefined, offset: undefined, limit: undefined, limitBytes: undefined });
   } finally {
     await client.close();
     await server.close();

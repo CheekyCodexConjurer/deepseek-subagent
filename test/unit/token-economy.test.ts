@@ -643,9 +643,14 @@ test("token economy: MCP subagents_follow strips envelope and progress and stays
 
     const structured = res.structuredContent as Record<string, unknown>;
     assert.equal(structured.obligationState, "closed");
-    assert.deepEqual(structured.claims, mockFollowResponse.claims);
-    assert.deepEqual(structured.tokens, mockFollowResponse.tokens);
-    assert.equal(structured.decisionReady, true);
+    // Single canonical source: claims/tokens live inside the compact projection.
+    const compactResult = structured.compact as Record<string, unknown>;
+    assert.deepEqual(compactResult.claims, mockFollowResponse.claims);
+    assert.deepEqual(compactResult.tokens, mockFollowResponse.tokens);
+    assert.equal(compactResult.decisionReady, true);
+    assert.equal(structured.claims, undefined, "claims must not be duplicated at the top level");
+    assert.equal(structured.tokens, undefined, "tokens must not be duplicated at the top level");
+    assert.equal(structured.detailsRef, undefined, "detailsRef must not be duplicated at the top level");
 
     // Bulky envelope/progress must be stripped; the complete result stays persisted.
     assert.equal(structured.result, undefined, "Bulky result envelope must be stripped");
@@ -653,8 +658,9 @@ test("token economy: MCP subagents_follow strips envelope and progress and stays
     assert.equal(JSON.stringify(structured).includes("veryLargePayload"), false);
     assert.equal(JSON.stringify(structured).includes("did step"), false);
 
-    const bytes = serializedBytes(structured);
-    assert.ok(bytes <= BUDGET, `MCP follow payload must respect the byte budget (got ${bytes})`);
+    // The invariant is over what the model actually sees: content + structuredContent.
+    const visible = Buffer.byteLength(JSON.stringify({ content: res.content, structuredContent: structured }), "utf8");
+    assert.ok(visible <= BUDGET, `MCP model-visible follow payload must respect the byte budget (got ${visible})`);
     assert.equal(JSON.stringify(structured).includes("FAILED"), true, "Mandatory evidence must survive");
   } finally {
     await client.close();
@@ -692,11 +698,61 @@ test("token economy: MCP follow fails closed when even the evidence cannot fit t
   try {
     const res = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_mcp_2" } });
     const structured = res.structuredContent as Record<string, unknown>;
-    const bytes = serializedBytes(structured);
-    assert.ok(bytes <= 512, `payload must respect the budget (got ${bytes})`);
-    assert.equal(structured.decisionReady, false);
-    assert.equal(structured.decisionReason, "transport_budget_exceeded");
-    assert.equal(structured.compact, undefined, "The oversized compact projection must be dropped");
+    const visible = Buffer.byteLength(JSON.stringify({ content: res.content, structuredContent: structured }), "utf8");
+    // Requirement: decisionReady=false must never coexist with an over-budget payload.
+    assert.ok(visible <= 512, `model-visible payload must respect the budget (got ${visible})`);
+    const serialized = JSON.stringify(structured);
+    assert.equal(serialized.includes("S".repeat(2_000)), false, "The oversized summary must never be transported");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("token economy: mandatory evidence overflow stays inside the budget and points at the exact section", async () => {
+  const hugeEvidence = Array.from({ length: 20 }, (_, i) => ({
+    kind: "test_failed",
+    detail: `case_${i}: ` + "D".repeat(900),
+  }));
+  const mockFollowResponse = {
+    agentId: "agent_mcp_3",
+    jobId: "job_mcp_3",
+    status: "completed",
+    resultAvailable: true,
+    compact: {
+      version: 1,
+      status: "completed",
+      claims: { summary: "summary", files: [], tests: [], risks: [] },
+      mandatoryEvidence: hugeEvidence,
+      receipt: null,
+      tokens: null,
+      decisionReady: false,
+      decisionReason: "mandatory_evidence_overflow",
+      detailsRef: {
+        resultPath: "/p",
+        hasMoreDetails: true,
+        availableSections: ["evidence", "full"],
+        mandatoryDetailCount: hugeEvidence.length,
+        mandatorySections: ["test_failed"],
+      },
+    },
+  };
+  const bridgeClient = { call: async () => mockFollowResponse } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient, { compactFollowMaxBytes: BUDGET });
+  const client = new Client({ name: "test-client-3", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const res = await client.callTool({ name: "subagents_follow", arguments: { agent_id: "agent_mcp_3" } });
+    const structured = res.structuredContent as Record<string, unknown>;
+    const visible = Buffer.byteLength(JSON.stringify({ content: res.content, structuredContent: structured }), "utf8");
+    assert.ok(visible <= BUDGET, `overflow response must respect the budget (got ${visible})`);
+    const serialized = JSON.stringify(structured);
+    assert.equal(serialized.includes("D".repeat(900)), false, "Evidence bulk must not be dumped");
+    // The FACT of the evidence must survive: a digest plus the exact section pointer.
+    assert.match(serialized, /mandatoryEvidenceSummary|mandatory_evidence_overflow|test_failed/);
+    assert.match(serialized, /"exactSection":"evidence"/);
   } finally {
     await client.close();
     await server.close();

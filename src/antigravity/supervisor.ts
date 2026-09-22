@@ -425,10 +425,16 @@ export class AntigravitySupervisor {
     await this.flushProgressDurable();
     const effectiveParsed = parsed ?? (stdout.trim() || stderr.trim() ? parseAgyOutput(stdout, stderr) : null);
     const fallbackText = error ? truncate(redactSecrets(error), 4_000) : "";
-    const summary = effectiveParsed ? (effectiveParsed.summary || fallbackText) : fallbackText;
+    // The provider can exit SUCCESS with an EMPTY response when it auto-denied a
+    // required action; stderr carries the only explanation. Surface it instead
+    // of persisting a blank summary that reads like a silent success.
+    const stderrHint = stderr.trim().length > 0 ? truncate(redactSecrets(stderr.trim()), 2_000) : "";
+    const summary = effectiveParsed
+      ? (effectiveParsed.summary || fallbackText || stderrHint)
+      : (fallbackText || stderrHint);
     const fullText = effectiveParsed
-      ? (effectiveParsed.fullText || (error ? truncate(redactSecrets(error), 2_000_000) : ""))
-      : (error ? truncate(redactSecrets(error), 2_000_000) : "");
+      ? (effectiveParsed.fullText || (error ? truncate(redactSecrets(error), 2_000_000) : stderrHint))
+      : (error ? truncate(redactSecrets(error), 2_000_000) : stderrHint);
 
     const statusPayload: AntigravityAttemptStatus = {
       schemaVersion: 1,
@@ -446,7 +452,11 @@ export class AntigravitySupervisor {
       tests: effectiveParsed?.tests ?? [],
       risks: effectiveParsed?.risks ?? [],
       unresolved: effectiveParsed?.unresolved ?? [],
+      deniedActions: effectiveParsed?.deniedActions ?? [],
       diffSummary: effectiveParsed?.diffSummary ?? "none",
+      ...(effectiveParsed?.providerExecutionStatus ? { providerExecutionStatus: effectiveParsed.providerExecutionStatus } : {}),
+      ...(effectiveParsed?.workerClaimedStatus ? { workerClaimedStatus: effectiveParsed.workerClaimedStatus } : {}),
+      ...(effectiveParsed?.validationEvidence ? { validationEvidence: effectiveParsed.validationEvidence } : {}),
       error: error ? redactSecrets(error) : null,
       completedAt: new Date().toISOString(),
       stdout,

@@ -23,7 +23,7 @@ import { FOLLOW_MAX_TOTAL_MINUTES } from "./config.js";
 
 import type { AntigravityAttemptManifest, AntigravityHeartbeat, AntigravityRunResult, AntigravityStreamProgress } from "./antigravity/types.js";
 
-import { createCompactClaims, createCompactWorkerResult, createDetailsRef, deriveTurnUsage, formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult, serializedBytes } from "./result.js";
+import { chunkUtf8, createCompactClaims, createCompactWorkerResult, createDetailsRef, deriveTurnUsage, formatHumanResult, persistAntigravityResult, sanitizePersistedEnvelope, sanitizePersistedResult, serializedBytes, withStableSerializedBytes } from "./result.js";
 import { ConflictError, InvalidRequestError, NotFoundError, RouteOverrideDeniedError, UnknownAgentError, UnknownJobError } from "./errors.js";
 import { evaluateRetentionPolicy, runRetentionPrune, type RetentionPolicyState } from "./retention.js";
 import type {
@@ -2829,6 +2829,7 @@ export class BridgeService {
     let section: RecoverResultSection | undefined;
     let offset: number | undefined;
     let limit: number | undefined;
+    let limitBytes: number | undefined;
     let isLegacyPositional = false;
 
     if (typeof input === "string") {
@@ -2842,6 +2843,7 @@ export class BridgeService {
       section = input.section;
       offset = input.offset;
       limit = input.limit;
+      limitBytes = input.limitBytes;
     }
 
     const hasRequestId = typeof requestId === "string" && requestId.trim().length > 0;
@@ -2886,14 +2888,56 @@ export class BridgeService {
       const envelope = (result as { envelope?: ResultEnvelope }).envelope;
       const off = Math.max(0, offset ?? 0);
       const lim = Math.max(1, limit ?? 50);
-      const pageBudget = this.config.recoverPageMaxBytes;
+      // A byte budget is authoritative: `limit` alone cannot bound the payload
+      // because a single item may itself be larger than the whole page budget.
+      const pageBudget = Math.max(512, Math.min(limitBytes ?? this.config.recoverPageMaxBytes, this.config.recoverPageMaxBytes));
+      const rawAssistantText = (result as { rawAssistantText?: string }).rawAssistantText ?? "";
 
       const paginate = (name: string, items: string[], extra: Record<string, unknown> = {}): unknown => {
         const page: string[] = [];
         let cursor = off;
+        // Oversized single item: never emit it whole. Return a UTF-8 safe byte
+        // chunk of that one item plus the cursor needed to resume it.
+        while (cursor < items.length) {
+          const item = items[cursor] as string;
+          const itemProbe = withStableSerializedBytes({
+            section: name,
+            items: [item],
+            offset: cursor,
+            returnedCount: 1,
+            totalCount: items.length,
+            hasMore: cursor + 1 < items.length,
+            nextOffset: cursor + 1 < items.length ? cursor + 1 : null,
+            ...extra,
+          });
+          if (serializedBytes(itemProbe) <= pageBudget) break;
+          if (page.length > 0) break;
+          const itemBytes = Buffer.byteLength(item, "utf8");
+          const chunk = chunkUtf8(item, Math.max(0, (extra.chunkOffset as number | undefined) ?? 0), Math.max(256, Math.floor(pageBudget / 2)));
+          const chunkedProbe = withStableSerializedBytes({
+            section: name,
+            items: [chunk.chunk],
+            offset: cursor,
+            returnedCount: 1,
+            totalCount: items.length,
+            hasMore: true,
+            nextOffset: cursor,
+            itemTooLarge: true,
+            itemIndex: cursor,
+            itemByteLength: itemBytes,
+            chunkOffset: chunk.offset,
+            chunkBytes: chunk.returnedBytes,
+            nextChunkOffset: chunk.nextOffset,
+            ...extra,
+          });
+          // The chunk itself is bounded by half the page budget, so this fits.
+          return serializedBytes(chunkedProbe) <= pageBudget ? chunkedProbe : { ...chunkedProbe, items: [], returnedCount: 0 };
+        }
+        // Accept items one at a time, measuring the FINAL serialized payload
+        // (including the serializedBytes field itself) before committing.
         while (cursor < items.length && page.length < lim) {
           const candidate = [...page, items[cursor] as string];
-          const payload = {
+          const candidatePayload = withStableSerializedBytes({
             section: name,
             items: candidate,
             offset: off,
@@ -2902,13 +2946,13 @@ export class BridgeService {
             hasMore: off + candidate.length < items.length,
             nextOffset: off + candidate.length < items.length ? off + candidate.length : null,
             ...extra,
-          };
-          if (page.length > 0 && serializedBytes(payload) > pageBudget) break;
+          });
+          if (page.length > 0 && serializedBytes(candidatePayload) > pageBudget) break;
           page.push(items[cursor] as string);
           cursor += 1;
         }
         const hasMore = off + page.length < items.length;
-        const payload = {
+        return withStableSerializedBytes({
           section: name,
           items: page,
           offset: off,
@@ -2917,11 +2961,21 @@ export class BridgeService {
           hasMore,
           nextOffset: hasMore ? off + page.length : null,
           ...extra,
-        };
-        return {
-          ...payload,
-          serializedBytes: serializedBytes(payload),
-        };
+        });
+      };
+
+      const chunkedSection = (name: string, text: string, extra: Record<string, unknown> = {}): unknown => {
+        const chunk = chunkUtf8(text, off, Math.max(256, Math.floor(pageBudget / 2)));
+        return withStableSerializedBytes({
+          section: name,
+          ...(name === "raw" ? { rawAssistantText: chunk.chunk } : { text: chunk.chunk }),
+          offset: chunk.offset,
+          returnedBytes: chunk.returnedBytes,
+          totalBytes: chunk.totalBytes,
+          hasMore: chunk.hasMore,
+          nextOffset: chunk.nextOffset,
+          ...extra,
+        });
       };
 
       switch (section) {
@@ -2930,16 +2984,20 @@ export class BridgeService {
           // minimal metadata only. The raw worker text is never attached to an
           // apparently compact query; use section "raw" explicitly for that.
           const summary = envelope?.summary ?? "";
-          const payload = {
-            section: "summary",
-            summary,
-            summaryTruncated: (result as { envelope?: ResultEnvelope }).envelope !== undefined && Boolean((result as { rawAssistantText?: string }).rawAssistantText) &&
-              ((result as { rawAssistantText?: string }).rawAssistantText as string).trim() !== summary.trim(),
+          const summaryMeta = {
             status: envelope?.status ?? null,
             jobId: envelope?.jobId ?? null,
             agentId: envelope?.agentId ?? null,
           };
-          return { ...payload, serializedBytes: serializedBytes(payload) };
+          const whole = withStableSerializedBytes({ section: "summary", summary, summaryTruncated: false, ...summaryMeta });
+          if (serializedBytes(whole) <= pageBudget) {
+            return withStableSerializedBytes({
+              ...whole,
+              summaryTruncated: rawAssistantText.trim().length > 0 && rawAssistantText.trim() !== summary.trim(),
+            });
+          }
+          // A pathological summary is byte-chunked rather than returned whole.
+          return chunkedSection("summary", summary, { summaryTruncated: true, ...summaryMeta });
         }
         case "files":
           return paginate("files", envelope?.files ?? []);
@@ -2950,12 +3008,23 @@ export class BridgeService {
         case "unresolved":
           return paginate("unresolved", envelope?.unresolved ?? []);
         case "diff": {
-          const payload = {
+          const diffSummary = envelope?.diffSummary ?? "";
+          const serializedDiff = typeof (result as { diff?: unknown }).diff === "string"
+            ? ((result as { diff?: unknown }).diff as string)
+            : JSON.stringify((result as { diff?: unknown }).diff ?? "", null, 2);
+          const whole = withStableSerializedBytes({ section: "diff", diffSummary, diff: serializedDiff });
+          if (serializedBytes(whole) <= pageBudget) return whole;
+          const chunk = chunkUtf8(serializedDiff, off, Math.max(256, Math.floor(pageBudget / 2)));
+          return withStableSerializedBytes({
             section: "diff",
-            diffSummary: envelope?.diffSummary ?? "",
-            diff: (result as { diff?: unknown }).diff,
-          };
-          return { ...payload, serializedBytes: serializedBytes(payload) };
+            diffSummary: truncate(redactSecrets(diffSummary), 500),
+            diff: chunk.chunk,
+            offset: chunk.offset,
+            returnedBytes: chunk.returnedBytes,
+            totalBytes: chunk.totalBytes,
+            hasMore: chunk.hasMore,
+            nextOffset: chunk.nextOffset,
+          });
         }
         case "evidence": {
           const evidence = envelope?.evidence;
@@ -2966,12 +3035,9 @@ export class BridgeService {
           });
         }
         case "raw": {
-          const raw = (result as { rawAssistantText?: string }).rawAssistantText ?? "";
-          const payload = {
-            section: "raw",
-            rawAssistantText: raw,
-          };
-          return { ...payload, serializedBytes: serializedBytes(payload) };
+          // The complete worker text is never returned by an apparently compact
+          // query; this explicitly named mode is still byte-bounded.
+          return chunkedSection("raw", rawAssistantText);
         }
       }
     }
@@ -3547,6 +3613,7 @@ export class BridgeService {
       totalTokens: job.workerTotalTokens ?? null,
       usageScope: job.workerUsageScope ?? "unknown",
       usageSource: job.workerUsageSource ?? "unavailable",
+      ...(job.workerCounterReset === true ? { counterResetDetected: true } : {}),
     } : undefined;
     const mandatoryEvidence = projection?.validationEvidence?.mandatory ?? [];
     const claims = projection ? createCompactClaims(projection) : undefined;
@@ -3938,6 +4005,9 @@ export class BridgeService {
           );
           const turnUsage = deriveTurnUsage(result.usage, prior);
           this.store.updateJobWorkerUsage(job.id, turnUsage, capturedFence);
+          if (turnUsage.counterResetDetected) {
+            this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Worker usage counter reset detected: the provider conversation restarted mid-sequence; the observed totals were kept without deriving a delta");
+          }
         }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {
@@ -4135,6 +4205,9 @@ export class BridgeService {
           );
           const turnUsage = deriveTurnUsage(result.usage, prior);
           this.store.updateJobWorkerUsage(job.id, turnUsage, capturedFence);
+          if (turnUsage.counterResetDetected) {
+            this.recordActivity(agent, this.store.getJob(job.id) ?? job, "error", "Worker usage counter reset detected: the provider conversation restarted mid-sequence; the observed totals were kept without deriving a delta");
+          }
         }
         if (stored.envelope.earlyExit?.triggered) {
           this.store.setJobEarlyExit(job.id, {

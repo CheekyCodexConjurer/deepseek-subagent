@@ -37,6 +37,8 @@ export interface AntigravityRunResult {
   tests: string[];
   risks: string[];
   unresolved?: string[];
+  /** Provider-reported actions that were auto-denied and never executed. */
+  deniedActions?: string[];
   diffSummary: string;
   model: string;
   modelDisplayName: string;
@@ -125,7 +127,17 @@ export interface AntigravityAttemptStatus {
   tests: string[];
   risks: string[];
   unresolved?: string[];
+  /** Provider-reported actions that were auto-denied and never executed. */
+  deniedActions?: string[];
   diffSummary: string;
+  /**
+   * Evidence carried end-to-end from the parser through the supervisor status
+   * file so the persisted envelope keeps the provider/worker/evidence split.
+   * Without these the attempt path silently reduced every run to "completed".
+   */
+  providerExecutionStatus?: ProviderExecutionStatus;
+  workerClaimedStatus?: WorkerClaimedStatus;
+  validationEvidence?: ValidationEvidence;
   error: string | null;
   completedAt: string;
   stdout: string;

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseAgyOutput } from "../../src/antigravity/parser.js";
+import { hasBlockingEvidence } from "../../src/result.js";
 
 /**
  * Regression for the REAL Antigravity CLI JSON envelope captured live from the
@@ -182,4 +183,49 @@ test("agy real JSON: unknown provider status fails closed instead of claiming co
   assert.equal(parsed.status, null);
   assert.equal(parsed.providerExecutionStatus, "unknown");
   assert.equal(parsed.hasJson, true);
+});
+
+test("agy real JSON: SUCCESS with an auto-denied action and empty response never looks green", () => {
+  // Captured live from agy 1.2.7 running headless without command permission.
+  const envelope = JSON.stringify({
+    conversation_id: "26105946-3757-4ef4-aeaf-b7675be12834",
+    status: "SUCCESS",
+    response: "",
+    duration_seconds: 13.58,
+    num_turns: 1,
+    usage: { input_tokens: 25731, output_tokens: 904, thinking_tokens: 557, cache_read_tokens: 48895, total_tokens: 26635 },
+    denied_actions: [{ action: "command", display_name: "RunCommand" }],
+  });
+  const parsed = parseAgyOutput(envelope, "");
+
+  assert.equal(parsed.providerExecutionStatus, "success");
+  assert.equal(parsed.deniedActions.length, 1);
+  assert.equal(parsed.deniedActions[0], "RunCommand");
+
+  const kinds = parsed.validationEvidence.mandatory.map((item) => item.kind);
+  assert.ok(kinds.includes("action_denied"), "A denied action must be mandatory evidence");
+  assert.ok(kinds.includes("worker_failure"), "An empty response must count as a worker failure");
+  assert.equal(parsed.validationEvidence.emptyResult, true);
+  assert.equal(parsed.validationEvidence.permissionRequired, true);
+  assert.equal(parsed.validationEvidence.workerFailure, true);
+  assert.equal(hasBlockingEvidence(parsed.validationEvidence.mandatory), true);
+});
+
+test("agy real JSON: denied actions are surfaced for every shape the CLI may emit", () => {
+  for (const denied of [
+    [{ action: "command", display_name: "RunCommand" }],
+    [{ action: "command", displayName: "RunCommand" }],
+    [{ action: "command" }],
+    ["RunCommand"],
+  ]) {
+    const envelope = JSON.stringify({
+      conversation_id: "conv_denied_shape",
+      status: "SUCCESS",
+      response: "STATUS: completed\nSUMMARY: done",
+      denied_actions: denied,
+    });
+    const parsed = parseAgyOutput(envelope, "");
+    assert.equal(parsed.deniedActions.length, 1, `shape ${JSON.stringify(denied)} must yield one action`);
+    assert.ok(parsed.validationEvidence.mandatory.some((item) => item.kind === "action_denied"));
+  }
 });
