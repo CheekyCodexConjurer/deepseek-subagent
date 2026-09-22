@@ -19,15 +19,17 @@ import { AntigravityAdapter } from "../../src/antigravity/adapter.js";
 import { AGY_COMMAND, AGY_MAX_PROMPT_LENGTH } from "../../src/antigravity/args.js";
 import { AntigravitySpool } from "../../src/antigravity/spool.js";
 import { runRetentionPrune } from "../../src/retention.js";
+import { sanitizePersistedResult } from "../../src/result.js";
 import type { CodexBinding, JobRecord, OpenCodeClientLike, OpenCodeEvent, OpenCodeMessage, ResultEnvelope } from "../../src/types.js";
 
 const execFileAsync = promisify(execFile);
 
 const agyFixturePath = fileURLToPath(new URL("../fixtures/agy.cjs", import.meta.url));
 
-function agyFixtureSpawn(behavior: string, calls: string[] = [], prompts: string[] = []) {
+function agyFixtureSpawn(behavior: string, calls: string[] = [], prompts: string[] = [], argvSeen: string[][] = []) {
   return (command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv; shell: false; windowsHide: boolean; stdio: ReadonlyArray<"ignore" | "pipe"> }) => {
     calls.push(command);
+    argvSeen.push([...args]);
     const promptIndex = args.indexOf("-p");
     if (promptIndex >= 0) prompts.push(args[promptIndex + 1] ?? "");
     return spawn(process.execPath, [agyFixturePath, ...args], {
@@ -719,6 +721,221 @@ test("visual context is redacted and truncated deterministically before dispatch
     assert.match(prompt, /\[visual context was truncated at the configured limit\]/);
     assert.match(prompt, /Direct observations:/);
     assert.match(prompt, /Interpretation:\nNone provided\./);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn carries a versioned work order through the real prompt, persisted result, and compact follow", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-work-order-spawn-"));
+  const store = await BridgeStore.open(directory);
+  const calls: string[] = [];
+  const prompts: string[] = [];
+  const argvSeen: string[][] = [];
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("work-order", calls, prompts, argvSeen) }),
+  });
+  const workOrder = {
+    schemaVersion: 1,
+    contractVersion: 1,
+    objective: "Verify the requested bridge behavior.",
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    contextRefs: ["README.md#execution-contract"],
+    designDecisions: ["Keep existing MCP callers compatible."],
+    invariants: ["Do not report unrun validation as passed."],
+    acceptanceCriteria: [{ id: "AC-01", description: "The change is proven by the requested test." }],
+    validationCommands: ["npm test -- --runInBand"],
+    escalationConditions: ["Escalate if the required test cannot run safely."],
+  };
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_work_order_spawn",
+      topic: "Work order bridge contract",
+      task: "Implement the supplied work order.",
+      cwd: directory,
+      mode: "analyze",
+      workOrder: workOrder as any,
+    });
+    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    assert.equal(calls.length, 1);
+    assert.match(prompts[0] ?? "", /WORK ORDER CONTRACT/);
+    assert.match(prompts[0] ?? "", /AC-01/);
+    assert.match(prompts[0] ?? "", /Do not report unrun validation as passed/);
+    const evaluation = (followed.compact as any)?.workOrderEvaluation;
+    assert.equal(evaluation.contractVersion, 1);
+    assert.equal(evaluation.complete, true);
+    assert.deepEqual(evaluation.criteria, [{
+      id: "AC-01",
+      outcome: "satisfied",
+      evidenceRefs: ["ev_work_order_test"],
+      evidenceRefsResolved: true,
+    }]);
+    assert.notEqual(evaluation.resultHash, (followed.compact as any).receipt.outputHash);
+    assert.equal(evaluation.resultHashVersion, 1);
+    assert.equal(followed.compact?.decisionReady, true);
+    const persisted = (followed.result as any).envelope;
+    assert.deepEqual(persisted.workOrder, workOrder);
+    assert.deepEqual(persisted.workOrderEvaluation, evaluation);
+    const recovered = await service.recoverResult({ jobId: accepted.jobId, agentId: accepted.agentId, section: "work_order" }) as any;
+    assert.equal(recovered.section, "work_order");
+    assert.match(recovered.text, /AC-01/);
+    assert.ok(recovered.serializedBytes <= createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }).recoverPageMaxBytes);
+
+    await assert.rejects(service.continueJob({
+      requestId: "request_work_order_bad_confirmation",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Continue using an unconfirmed order.",
+      confirmedContractVersion: 9,
+    }), /does not match the prior result version/);
+    assert.equal(calls.length, 1, "a mismatched confirmation must fail before dispatch");
+
+    const unconfirmed = await service.continueJob({
+      requestId: "request_work_order_unconfirmed_continuation",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Continue, but do not assume prior provider memory.",
+    });
+    const unconfirmedFollow = await service.follow({ agentId: unconfirmed.agentId, jobId: unconfirmed.jobId });
+    assert.equal(calls.length, 2);
+    assert.match(prompts[1] ?? "", /No prior provider memory is assumed/);
+    assert.ok(!argvSeen[1]?.includes("--conversation"), "an unconfirmed work order must start without prior provider memory");
+    assert.equal((unconfirmedFollow.compact as any)?.workOrderEvaluation?.confirmedPreviousContractVersion, undefined);
+
+    const confirmed = await service.continueJob({
+      requestId: "request_work_order_confirmed_continuation",
+      agentId: accepted.agentId,
+      relation: "continuation",
+      task: "Continue after reviewing contract version one.",
+      workOrder: workOrder as any,
+      confirmedContractVersion: 1,
+    });
+    const confirmedFollow = await service.follow({ agentId: confirmed.agentId, jobId: confirmed.jobId });
+    assert.equal(calls.length, 3);
+    assert.match(prompts[2] ?? "", /confirmed baseline contract version 1/i);
+    assert.match(prompts[2] ?? "", /AC-01/);
+    assert.doesNotMatch(prompts[2] ?? "", /WORK ORDER JSON|Verify the requested bridge behavior/);
+    assert.ok(argvSeen[2]?.includes("--conversation"), "confirmed delta continuation may reuse the confirmed provider conversation");
+    const confirmedEvaluation = (confirmedFollow.compact as any)?.workOrderEvaluation;
+    assert.equal(confirmedEvaluation.confirmedPreviousContractVersion, 1);
+    assert.notEqual(confirmedEvaluation.resultHash, (confirmedFollow.compact as any).receipt.outputHash);
+    assert.equal(confirmedEvaluation.resultHashVersion, 1);
+
+    const persistedDocument = JSON.parse(await readFile(persisted.fullResultPath, "utf8")) as Record<string, any>;
+    assert.equal(evaluation.resultHash, persistedDocument.envelope.workOrderEvaluation.resultHash);
+    assert.equal(persistedDocument.envelope.workOrderEvaluation.gitDiffAvailable, false);
+    assert.equal(persistedDocument.envelope.workOrderEvaluation.diffAvailability, "summary_only");
+    for (const mutate of [
+      (document: Record<string, any>) => { document.rawAssistantText += " altered"; },
+      (document: Record<string, any>) => { document.envelope.diffSummary += " altered"; },
+      (document: Record<string, any>) => { document.envelope.evidence.items[0].claim += " altered"; },
+      (document: Record<string, any>) => { document.envelope.status = "failed"; },
+      (document: Record<string, any>) => { document.diff.providerExecutionStatus = "failure"; },
+    ]) {
+      const altered = JSON.parse(JSON.stringify(persistedDocument)) as Record<string, any>;
+      mutate(altered);
+      const recovered = sanitizePersistedResult(altered) as Record<string, any>;
+      assert.equal(recovered.envelope?.workOrderEvaluation, undefined, "any change to persisted result inputs must invalidate the exact artifact hash");
+    }
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("work order follow keeps denied and not-run evidence and fails decision readiness", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-work-order-denied-"));
+  const store = await BridgeStore.open(directory);
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("work-order-blocked") }),
+  });
+  const workOrder = {
+    schemaVersion: 1,
+    contractVersion: 1,
+    objective: "Verify blocked work is represented honestly.",
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    contextRefs: [],
+    designDecisions: [],
+    invariants: ["Denied work remains visible."],
+    acceptanceCriteria: [{ id: "AC-01", description: "Validation ran successfully." }],
+    validationCommands: ["npm test"],
+    escalationConditions: ["Escalate when the provider denies validation."],
+  };
+  try {
+    await service.start();
+    const accepted = await service.spawn({
+      requestId: "request_work_order_denied",
+      topic: "Blocked validation",
+      task: "Run the validation command.",
+      cwd: directory,
+      mode: "analyze",
+      workOrder: workOrder as any,
+    });
+    const followed = await service.follow({ agentId: accepted.agentId, jobId: accepted.jobId });
+    const compact = followed.compact as any;
+    assert.equal(compact.workOrderEvaluation.criteria[0].outcome, "not_run");
+    assert.equal(compact.workOrderEvaluation.criteria[0].evidenceRefsResolved, true);
+    assert.equal(compact.decisionReady, false);
+    assert.ok(compact.mandatoryEvidence.some((item: any) => item.kind === "action_denied"));
+    assert.ok(compact.mandatoryEvidence.some((item: any) => item.kind === "test_not_run"));
+    const envelope = (followed.result as any).envelope;
+    assert.equal(envelope.workOrderEvaluation.criteria[0].outcome, "not_run");
+    assert.ok(envelope.validationEvidence.deniedActions.length > 0);
+  } finally {
+    await service.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("spawn batch carries each item's own work order through dispatch and result persistence", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "deepseek-work-order-batch-"));
+  const store = await BridgeStore.open(directory);
+  const calls: string[] = [];
+  const prompts: string[] = [];
+  const service = new BridgeService(createDefaultConfig({ dataDir: directory, configPath: path.join(directory, "config.json") }), {
+    store,
+    antigravity: new AntigravityAdapter({ command: "node", spawnFn: agyFixtureSpawn("work-order", calls, prompts) }),
+  });
+  const makeOrder = (objective: string) => ({
+    schemaVersion: 1,
+    contractVersion: 1,
+    objective,
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    contextRefs: [],
+    designDecisions: [],
+    invariants: ["Result belongs to its own item."],
+    acceptanceCriteria: [{ id: "AC-01", description: "The item reports its criterion." }],
+    validationCommands: ["npm test"],
+    escalationConditions: ["Escalate on a blocked run."],
+  });
+  try {
+    await service.start();
+    const batch = await service.spawnBatch({
+      batchRequestId: "batch_work_order_contracts",
+      items: [
+        { requestId: "request_batch_order_one", topic: "Order one", task: "Work one.", cwd: directory, mode: "analyze", workOrder: makeOrder("First item's objective.") as any },
+        { requestId: "request_batch_order_two", topic: "Order two", task: "Work two.", cwd: directory, mode: "analyze", workOrder: makeOrder("Second item's objective.") as any },
+      ],
+    });
+    const followed = await Promise.all(batch.items.map((item) => service.follow({ agentId: item.agentId, jobId: item.jobId })));
+    assert.equal(calls.length, 2);
+    assert.ok(prompts.some((prompt) => prompt.includes("First item's objective.")));
+    assert.ok(prompts.some((prompt) => prompt.includes("Second item's objective.")));
+    assert.deepEqual(followed.map((result) => (result.result as any).envelope.workOrder.objective).sort(), [
+      "First item's objective.",
+      "Second item's objective.",
+    ]);
+    assert.ok(followed.every((result) => (result.compact as any).workOrderEvaluation.criteria[0].outcome === "satisfied"));
   } finally {
     await service.stop();
     store.close();

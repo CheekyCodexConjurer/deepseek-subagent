@@ -151,6 +151,38 @@ test("MCP exposes SubAgents MCP canonical identity, nine canonical tools and dee
   }
 });
 
+test("MCP accepts an optional versioned work order on spawn, each batch item, and continue", async () => {
+  const config = createDefaultConfig({
+    dataDir: "C:\\\\deepseek-test-data",
+    configPath: "C:\\\\deepseek-test-data\\\\config.json",
+  });
+  const server = createMcpServer(new BridgeHttpClient(config));
+  const client = new Client({ name: "work-order-schema-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const tools = (await client.listTools()).tools;
+    const properties = (name: string) => (tools.find((tool) => tool.name === name)?.inputSchema as {
+      properties?: Record<string, any>;
+    } | undefined)?.properties ?? {};
+    const workOrderFields = [
+      "schema_version", "contract_version", "objective", "scope", "ownership", "context_refs",
+      "design_decisions", "invariants", "acceptance_criteria", "validation_commands", "escalation_conditions",
+    ];
+    const spawnOrder = properties("subagents_spawn").work_order;
+    assert.ok(spawnOrder, "spawn must expose the optional versioned work order");
+    for (const field of workOrderFields) assert.ok(spawnOrder.properties?.[field], `spawn work_order must expose ${field}`);
+    assert.ok(properties("subagents_spawn_batch").items?.items?.properties?.work_order, "each batch item must accept its own work order");
+    assert.ok(properties("subagents_continue").work_order, "continue must accept a replacement or reiterated work order");
+    assert.equal(properties("subagents_continue").confirmed_contract_version?.type, "integer");
+    assert.equal(properties("subagents_continue").confirmed_contract_version?.default, undefined);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("MCP startup recovers an offline local daemon before exposing tools", async () => {
   const config = createDefaultConfig({
     dataDir: "C:\\\\deepseek-test-data",
@@ -562,6 +594,200 @@ test("MCP follow terminal results close the obligation", async () => {
       assert.equal(structured.jobId, "job_1");
       assert.equal(structured.status, expectedStatus);
       assert.equal(structured.resultAvailable, true);
+    }
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP Client validates every lifecycle decoration emitted by subagents_follow", async () => {
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/follow") {
+        return {
+          agentId: "agent_schema_1",
+          jobId: "job_schema_1",
+          status: "failed",
+          resultAvailable: true,
+          message: "fixture follow message",
+          error: "fixture worker error",
+          deadlineReached: true,
+          gracefulFinalize: true,
+          partial: true,
+          workerAborted: true,
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "follow-output-schema-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    await client.listTools();
+    const result = await client.callTool({
+      name: "subagents_follow",
+      arguments: { agent_id: "agent_schema_1", job_id: "job_schema_1" },
+    });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.structuredContent, {
+      agentId: "agent_schema_1",
+      jobId: "job_schema_1",
+      status: "failed",
+      resultAvailable: true,
+      obligationState: "closed",
+      message: "fixture follow message",
+      error: "fixture worker error",
+      deadlineReached: true,
+      gracefulFinalize: true,
+      partial: true,
+      workerAborted: true,
+    });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP Client validates continuation output scheduling metadata", async () => {
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/continue") {
+        return {
+          accepted: true,
+          status: "accepted",
+          topic: "continuation schema",
+          modelDisplayName: "fixture model",
+          agentId: "agent_continue_schema",
+          jobId: "job_continue_schema",
+          state: "Starting",
+          priority: 37,
+          exclusiveResources: ["repo:/tmp/smoke"],
+        };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "continue-output-schema-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    await client.listTools();
+    for (const [name, nextRequiredAction] of [
+      ["subagents_continue", "subagents_follow"],
+      ["deepseek_continue", "deepseek_follow"],
+    ]) {
+      const result = await client.callTool({ name, arguments: { agent_id: "agent_continue_schema", task: "continue" } });
+      assert.equal(result.isError, undefined);
+      const structured = result.structuredContent as Record<string, unknown>;
+      assert.equal(structured.priority, 37);
+      assert.deepEqual(structured.exclusiveResources, ["repo:/tmp/smoke"]);
+      assert.equal(structured.nextRequiredAction, nextRequiredAction);
+    }
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("MCP Client validates the real dispatch and result output shapes for both tool names", async () => {
+  const bridgeClient = {
+    call: async (pathname: string) => {
+      if (pathname === "/v1/jobs/spawn" || pathname === "/v1/jobs/continue") {
+        return {
+          accepted: true,
+          status: "accepted",
+          topic: "surface schema",
+          modelDisplayName: "fixture model",
+          agentId: "agent_surface_schema",
+          jobId: "job_surface_schema",
+          state: "Starting",
+          priority: 37,
+          exclusiveResources: ["repo:/tmp/smoke"],
+        };
+      }
+      if (pathname === "/v1/jobs/spawn-batch") {
+        return {
+          accepted: true,
+          batchId: "batch_surface_schema",
+          batchRequestId: "batch_request_surface_schema",
+          items: [{ agentId: "agent_surface_schema", jobId: "job_surface_schema", status: "accepted" }],
+          jobIds: ["job_surface_schema"],
+        };
+      }
+      if (pathname === "/v1/jobs/follow") {
+        return {
+          agentId: "agent_surface_schema",
+          jobId: "job_surface_schema",
+          status: "failed",
+          resultAvailable: true,
+          message: "fixture follow message",
+          error: "fixture worker error",
+          deadlineReached: true,
+          gracefulFinalize: true,
+          partial: true,
+          workerAborted: true,
+        };
+      }
+      if (pathname === "/v1/jobs/recover") {
+        return { section: "work_order", text: "persisted work order AC-01", serializedBytes: 42, hasMore: false };
+      }
+      throw new Error("Unexpected endpoint: " + pathname);
+    },
+  } as unknown as BridgeHttpClient;
+  const server = createMcpServer(bridgeClient);
+  const client = new Client({ name: "dispatch-result-output-schema-client", version: "1.0.0" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    await client.listTools();
+    for (const legacy of [false, true]) {
+      const prefix = legacy ? "deepseek" : "subagents";
+      const spawn = await client.callTool({ name: `${prefix}_spawn`, arguments: { topic: "schema", task: "spawn" } });
+      assert.equal(spawn.isError, undefined);
+      assert.equal((spawn.structuredContent as Record<string, unknown>).priority, 37);
+      assert.deepEqual((spawn.structuredContent as Record<string, unknown>).exclusiveResources, ["repo:/tmp/smoke"]);
+
+      const batch = await client.callTool({
+        name: `${prefix}_spawn_batch`,
+        arguments: { items: [{ topic: "schema", task: "batch" }] },
+      });
+      assert.equal(batch.isError, undefined);
+      assert.deepEqual((batch.structuredContent as Record<string, unknown>).jobIds, ["job_surface_schema"]);
+
+      const continued = await client.callTool({
+        name: `${prefix}_continue`,
+        arguments: { agent_id: "agent_surface_schema", task: "continue" },
+      });
+      assert.equal(continued.isError, undefined);
+      assert.equal((continued.structuredContent as Record<string, unknown>).priority, 37);
+      assert.deepEqual((continued.structuredContent as Record<string, unknown>).exclusiveResources, ["repo:/tmp/smoke"]);
+
+      const followed = await client.callTool({
+        name: `${prefix}_follow`,
+        arguments: { agent_id: "agent_surface_schema", job_id: "job_surface_schema" },
+      });
+      assert.equal(followed.isError, undefined);
+      const followStructured = followed.structuredContent as Record<string, unknown>;
+      assert.equal(followStructured.error, "fixture worker error");
+      assert.equal(followStructured.deadlineReached, true);
+      assert.equal(followStructured.gracefulFinalize, true);
+      assert.equal(followStructured.partial, true);
+      assert.equal(followStructured.workerAborted, true);
+
+      const recovered = await client.callTool({
+        name: `${prefix}_recover_result`,
+        arguments: { agent_id: "agent_surface_schema", job_id: "job_surface_schema", section: "work_order" },
+      });
+      assert.equal(recovered.isError, undefined);
+      assert.equal((recovered.structuredContent as Record<string, any>).result.section, "work_order");
+      assert.match((recovered.structuredContent as Record<string, any>).result.text, /AC-01/);
     }
   } finally {
     await client.close();

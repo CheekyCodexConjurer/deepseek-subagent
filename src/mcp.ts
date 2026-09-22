@@ -12,6 +12,7 @@ import { resolveCodexTaskProvenance, type TaskProvenance } from "./codex/cli-res
 import { canRead, ensurePrivateDir, isProcessAlive, newId, redactSecrets } from "./security.js";
 import { serializedBytes } from "./result.js";
 import type { BridgeConfig } from "./types.js";
+import { workOrderV1McpSchema } from "./work-order.js";
 
 const DISPLAY_NAME = "SubAgents MCP";
 const LEGACY_DISPLAY_NAME = "DeepSeek Sub-Agent";
@@ -319,6 +320,7 @@ export function createMcpServer(
     visual_context: z.string().optional(),
     priority: z.number().int().min(1).max(100).optional(),
     exclusive_resources: z.array(z.string().min(1)).optional(),
+    work_order: workOrderV1McpSchema.optional(),
     thread_id: z.string().optional(),
     turn_id: z.string().optional(),
   };
@@ -334,6 +336,7 @@ export function createMcpServer(
     visual_context: z.string().optional(),
     priority: z.number().int().min(1).max(100).optional(),
     exclusive_resources: z.array(z.string().min(1)).optional(),
+    work_order: workOrderV1McpSchema.optional(),
     thread_id: z.string().optional(),
     turn_id: z.string().optional(),
   });
@@ -373,6 +376,8 @@ export function createMcpServer(
     permission_reply: z.enum(["once", "always", "reject"]).optional(),
     permission_message: z.string().max(2_000).optional(),
     allow_respawn: z.boolean().optional(),
+    work_order: workOrderV1McpSchema.optional(),
+    confirmed_contract_version: z.number().int().min(1).max(1_000_000).optional(),
   };
 
   const consultInputSchema = {
@@ -404,7 +409,7 @@ export function createMcpServer(
     agentId: z.string().min(1).optional(),
     job_id: z.string().min(1).optional(),
     jobId: z.string().min(1).optional(),
-    section: z.enum(["summary", "files", "tests", "risks", "unresolved", "diff", "evidence", "full", "raw"]).optional(),
+    section: z.enum(["summary", "files", "tests", "risks", "unresolved", "diff", "evidence", "work_order", "full", "raw"]).optional(),
     offset: z.number().int().min(0).optional(),
     limit: z.number().int().min(1).max(1000).optional(),
     limit_bytes: z.number().int().min(256).optional(),
@@ -608,6 +613,8 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("subagents_follow"),
+      priority: z.number().optional(),
+      exclusiveResources: z.array(z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -698,6 +705,23 @@ export function createMcpServer(
     firstRefs: z.array(z.string()),
   }).optional();
 
+  const resultDetailsRefOutputSchema = z.object({
+    resultPath: z.string().optional(),
+    hasMoreDetails: z.boolean(),
+    availableSections: z.array(z.string()),
+    summaryTruncated: z.boolean().optional(),
+    filesTotal: z.number().optional(),
+    testsTotal: z.number().optional(),
+    risksTotal: z.number().optional(),
+    unresolvedTotal: z.number().optional(),
+    evidenceTotal: z.number().optional(),
+    mandatoryDetailCount: z.number().optional(),
+    mandatorySections: z.array(z.string()).optional(),
+    exactSection: z.string().optional(),
+    cursor: z.object({ offset: z.number(), limitBytes: z.number() }).nullable().optional(),
+    totalCount: z.number().optional(),
+  });
+
   const compactOutputSchema = z.object({
     version: z.literal(1),
     status: z.string(),
@@ -737,22 +761,27 @@ export function createMcpServer(
     }).nullable(),
     decisionReady: z.boolean(),
     decisionReason: z.string().nullable(),
-    detailsRef: z.object({
-      resultPath: z.string().optional(),
-      hasMoreDetails: z.boolean(),
-      availableSections: z.array(z.string()),
-      summaryTruncated: z.boolean().optional(),
-      filesTotal: z.number().optional(),
-      testsTotal: z.number().optional(),
-      risksTotal: z.number().optional(),
-      unresolvedTotal: z.number().optional(),
-      evidenceTotal: z.number().optional(),
-      mandatoryDetailCount: z.number().optional(),
-      mandatorySections: z.array(z.string()).optional(),
-      exactSection: z.string().optional(),
-      cursor: z.object({ offset: z.number(), limitBytes: z.number() }).nullable().optional(),
-      totalCount: z.number().optional(),
-    }),
+    workOrderEvaluation: z.object({
+      schemaVersion: z.literal(1),
+      contractVersion: z.number(),
+      resultHash: z.string(),
+      resultHashVersion: z.literal(1).optional(),
+      diffAvailability: z.enum(["unavailable", "summary_only", "literal_git_diff"]).optional(),
+      gitDiffAvailable: z.boolean().optional(),
+      resultTextTruncated: z.boolean().optional(),
+      diffSummaryTruncated: z.boolean().optional(),
+      source: z.literal("worker_report"),
+      complete: z.boolean(),
+      criteria: z.array(z.object({
+        id: z.string(),
+        outcome: z.enum(["satisfied", "not_satisfied", "blocked", "not_run", "unknown"]),
+        evidenceRefs: z.array(z.string()),
+        evidenceRefsResolved: z.boolean(),
+      })),
+      issues: z.array(z.string()),
+      confirmedPreviousContractVersion: z.number().optional(),
+    }).optional(),
+    detailsRef: resultDetailsRefOutputSchema,
   }).optional();
 
   server.registerTool("subagents_follow", {
@@ -767,6 +796,11 @@ export function createMcpServer(
       resultAvailable: z.boolean(),
       permissionId: z.string().nullable().optional(),
       message: z.string().optional(),
+      error: z.string().optional(),
+      deadlineReached: z.boolean().optional(),
+      gracefulFinalize: z.boolean().optional(),
+      partial: z.boolean().optional(),
+      workerAborted: z.boolean().optional(),
       obligationState: z.union([z.literal("pending"), z.literal("closed")]),
       nextRequiredAction: z.literal("subagents_continue").optional(),
       receipt: receiptOutputSchema,
@@ -774,6 +808,7 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
       compact: compactOutputSchema,
+      detailsRef: resultDetailsRefOutputSchema.optional(),
       mandatoryEvidenceSummary: mandatoryEvidenceSummaryOutputSchema,
       decisionReady: z.boolean().optional(),
       decisionReason: z.string().nullable().optional(),
@@ -991,6 +1026,8 @@ export function createMcpServer(
       state: z.string(),
       obligationState: z.literal("pending"),
       nextRequiredAction: z.literal("deepseek_follow"),
+      priority: z.number().optional(),
+      exclusiveResources: z.array(z.string()).optional(),
     },
   }, async (args, extra) => {
     try {
@@ -1042,6 +1079,11 @@ export function createMcpServer(
       resultAvailable: z.boolean(),
       permissionId: z.string().nullable().optional(),
       message: z.string().optional(),
+      error: z.string().optional(),
+      deadlineReached: z.boolean().optional(),
+      gracefulFinalize: z.boolean().optional(),
+      partial: z.boolean().optional(),
+      workerAborted: z.boolean().optional(),
       obligationState: z.union([z.literal("pending"), z.literal("closed")]),
       nextRequiredAction: z.literal("deepseek_continue").optional(),
       receipt: receiptOutputSchema,
@@ -1049,6 +1091,7 @@ export function createMcpServer(
       escalation: escalationOutputSchema,
       semanticProgress: semanticProgressOutputSchema,
       compact: compactOutputSchema,
+      detailsRef: resultDetailsRefOutputSchema.optional(),
       mandatoryEvidenceSummary: mandatoryEvidenceSummaryOutputSchema,
       decisionReady: z.boolean().optional(),
       decisionReason: z.string().nullable().optional(),
@@ -1515,10 +1558,31 @@ function followResult(result: Record<string, unknown>, isAlias = false, maxBytes
   }
   // Last resort: the smallest possible truthful envelope. It cannot exceed the
   // budget because it contains no worker-derived content at all.
+  const compactDetails = compact?.detailsRef as Record<string, unknown> | undefined;
+  const availableSections = Array.isArray(compactDetails?.availableSections)
+    ? (compactDetails.availableSections as unknown[]).filter((section): section is string => typeof section === "string")
+    : [];
+  const workOrderNeedsRecovery = Boolean(compact?.workOrderEvaluation) || availableSections.includes("work_order");
+  const mandatoryNeedsRecovery = Boolean(compact && (
+    (Array.isArray(compact.mandatoryEvidence) && compact.mandatoryEvidence.length > 0)
+    || compact.mandatoryEvidenceSummary
+  ));
+  const recoverySections = [
+    ...(mandatoryNeedsRecovery ? ["evidence"] : []),
+    ...(workOrderNeedsRecovery ? ["work_order"] : []),
+  ];
   return build(shortText, {
     ...lifecycle(),
     decisionReady: false,
-    decisionReason: "transport_budget_exceeded",
+    decisionReason: workOrderNeedsRecovery ? "work_order_transport_overflow" : "transport_budget_exceeded",
+    ...(recoverySections.length > 0 ? {
+      detailsRef: {
+        hasMoreDetails: true,
+        availableSections: recoverySections,
+        exactSection: mandatoryNeedsRecovery ? "evidence" : "work_order",
+        cursor: { offset: 0, limitBytes: maxBytes },
+      },
+    } : {}),
   });
 }
 

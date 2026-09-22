@@ -44,6 +44,36 @@ fail-closed.
    `subagents_recover_result` only when a known persisted job result needs
    explicit delivery recovery.
 
+## Optional versioned work order
+
+`subagents_spawn` accepts an optional `work_order`; each item in
+`subagents_spawn_batch` accepts its own. It carries the objective, scope,
+ownership, context references, design decisions, invariants, acceptance
+criteria with stable IDs, validation commands, and escalation conditions.
+Existing calls may omit it.
+
+When continuing an agent that has a persisted work order, send
+`confirmed_contract_version` only after reviewing that exact prior version.
+For an unchanged confirmed contract, the bridge sends only the task and a
+compact contract-version/criterion-ID reference. A changed contract advances
+its version by one and sends only changed fields. Without confirmation, the
+bridge repeats the complete active contract in a full prompt and starts a
+fresh provider conversation; a delta never assumes missing provider memory.
+
+The worker reports one outcome for every criterion and cites evidence IDs.
+Follow includes a versioned SHA-256 hash over the complete persisted artifact:
+visible result text, available diff data, evidence, status, and audit metadata.
+This is separate from legacy receipt `outputHash`, which remains a summary and
+diff-summary correlation value. The Antigravity bridge currently has no
+literal Git patch; `diffAvailability` is `summary_only` or `unavailable`.
+Mark a criterion `requires_git_diff: true` when it depends on an exact patch;
+that criterion stays blocked and escalates until a literal Git diff is
+available. Truncated persisted result text makes criteria unverified and
+`decisionReady` false. Fetch the full contract and evaluation with
+`subagents_recover_result` section `work_order`; oversized sections return
+UTF-8-safe chunks with a byte cursor. Denied actions and failed or unrun
+validation remain visible as mandatory evidence.
+
 ## Failure and compatibility rules
 
 - Never retry a timeout, transport error, invalid result, or unavailable

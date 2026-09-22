@@ -21,9 +21,143 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../../src/mcp.js";
 import type { BridgeHttpClient } from "../../src/http-server.js";
 import type { AntigravityRunResult } from "../../src/antigravity/types.js";
-import type { ResultEnvelope, ValidationEvidence } from "../../src/types.js";
+import type { ResultEnvelope, ValidationEvidence, WorkOrderEvaluationV1 } from "../../src/types.js";
+import { evaluateWorkOrder, parseWorkOrderContract } from "../../src/work-order.js";
 
 const BUDGET = 8_192;
+
+test("work order accepts omitted optional sections without dropping required criteria", () => {
+  const order = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 1,
+    objective: "Check the narrow change.",
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    acceptance_criteria: [{ id: "AC-01", description: "Requested test passes." }],
+  });
+  assert.deepEqual(order.contextRefs, []);
+  assert.deepEqual(order.designDecisions, []);
+  assert.deepEqual(order.invariants, []);
+  assert.deepEqual(order.validationCommands, []);
+  assert.deepEqual(order.escalationConditions, []);
+  assert.equal(order.acceptanceCriteria[0]?.id, "AC-01");
+});
+
+test("work order delta repeats only confirmed version and criterion IDs", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "work-order-confirmed-delta-"));
+  const workOrder = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 4,
+    objective: "FULL_OBJECTIVE_MUST_STAY_IN_PRIOR_CONVERSATION",
+    scope: ["FULL_SCOPE_MUST_STAY_IN_PRIOR_CONVERSATION"],
+    ownership: ["src/owned.ts"],
+    context_refs: ["FULL_CONTEXT_REF_MUST_STAY_IN_PRIOR_CONVERSATION"],
+    design_decisions: ["FULL_DESIGN_DECISION_MUST_STAY_IN_PRIOR_CONVERSATION"],
+    invariants: ["FULL_INVARIANT_MUST_STAY_IN_PRIOR_CONVERSATION"],
+    acceptance_criteria: [
+      { id: "AC-01", description: "FULL_CRITERION_TEXT_MUST_STAY_IN_PRIOR_CONVERSATION" },
+      { id: "AC-02", description: "FULL_SECOND_CRITERION_TEXT_MUST_STAY_IN_PRIOR_CONVERSATION", requires_git_diff: true },
+    ],
+    validation_commands: ["FULL_COMMAND_MUST_STAY_IN_PRIOR_CONVERSATION"],
+    escalation_conditions: ["FULL_ESCALATION_MUST_STAY_IN_PRIOR_CONVERSATION"],
+  });
+  try {
+    const delta = await buildWorkerPrompt(
+      { task: "Continue with this narrow correction.", workOrder, previousWorkOrder: workOrder, confirmedWorkOrderVersion: 4 },
+      tmpDir,
+      { maxLength: 100_000, isContinuation: true },
+    );
+    assert.match(delta, /contract version 4/i);
+    assert.match(delta, /AC-01.*AC-02/s);
+    assert.match(delta, /Do not repeat|do not restate/i);
+    assert.match(delta, /Literal Git diff required for AC-02/i);
+    assert.doesNotMatch(delta, /FULL_OBJECTIVE|FULL_SCOPE|FULL_CONTEXT_REF|FULL_DESIGN_DECISION|FULL_INVARIANT|FULL_CRITERION_TEXT|FULL_COMMAND|FULL_ESCALATION/);
+    assert.ok(delta.length < 1_000, "confirmed continuation must carry a compact contract reference");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("changed confirmed work order sends only its changed fields in the continuation delta", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "work-order-version-delta-"));
+  const previous = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 4,
+    objective: "UNCHANGED_OBJECTIVE",
+    scope: ["UNCHANGED_SCOPE"],
+    ownership: ["src/owned.ts"],
+    invariants: ["UNCHANGED_INVARIANT"],
+    acceptance_criteria: [{ id: "AC-01", description: "UNCHANGED_CRITERION" }],
+  });
+  const revised = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 5,
+    objective: "REVISED_OBJECTIVE_ONLY",
+    scope: ["UNCHANGED_SCOPE"],
+    ownership: ["src/owned.ts"],
+    invariants: ["UNCHANGED_INVARIANT"],
+    acceptance_criteria: [{ id: "AC-01", description: "UNCHANGED_CRITERION" }],
+  });
+  try {
+    const delta = await buildWorkerPrompt({
+      task: "Apply the revised objective.",
+      workOrder: revised,
+      previousWorkOrder: previous,
+      confirmedWorkOrderVersion: 4,
+    }, tmpDir, { maxLength: 100_000, isContinuation: true });
+    assert.match(delta, /version 5 replaces confirmed version 4/);
+    assert.match(delta, /REVISED_OBJECTIVE_ONLY/);
+    assert.doesNotMatch(delta, /UNCHANGED_SCOPE|UNCHANGED_INVARIANT|UNCHANGED_CRITERION/);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("criterion requiring literal Git diff stays blocked when bridge has only a diff summary", () => {
+  const workOrder = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 1,
+    objective: "Review changed code.",
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    acceptance_criteria: [{ id: "AC-DIFF", description: "Review the exact patch.", requires_git_diff: true }],
+  });
+  const evaluation = evaluateWorkOrder({
+    text: 'WORK_ORDER_OUTCOMES_JSON: {"contract_version":1,"criteria":[{"id":"AC-DIFF","outcome":"satisfied","evidence_refs":["ev_test"]}]}',
+    workOrder,
+    resultHash: "artifact-hash",
+    evidence: { items: [{ id: "ev_test", type: "test", claim: "Tests passed" }] },
+    diffAvailability: "summary_only",
+  });
+  assert.equal(evaluation.criteria[0]?.outcome, "blocked");
+  assert.equal(evaluation.gitDiffAvailable, false);
+  assert.equal(evaluation.diffAvailability, "summary_only");
+  assert.ok(evaluation.issues.includes("git_diff_unavailable:AC-DIFF"));
+  assert.equal(evaluation.complete, false);
+});
+
+test("criteria stay unverified when persisted result text was truncated", () => {
+  const workOrder = parseWorkOrderContract({
+    schema_version: 1,
+    contract_version: 1,
+    objective: "Verify the full final report.",
+    scope: ["src/example.ts"],
+    ownership: ["src/example.ts"],
+    acceptance_criteria: [{ id: "AC-01", description: "The final test report is complete." }],
+  });
+  const evaluation = evaluateWorkOrder({
+    text: 'WORK_ORDER_OUTCOMES_JSON: {"contract_version":1,"criteria":[{"id":"AC-01","outcome":"satisfied","evidence_refs":["ev_test"]}]}',
+    workOrder,
+    resultHash: "artifact-hash",
+    evidence: { items: [{ id: "ev_test", type: "test", claim: "Tests passed" }] },
+    diffAvailability: "summary_only",
+    resultTextTruncated: true,
+  });
+  assert.equal(evaluation.criteria[0]?.outcome, "unknown");
+  assert.equal(evaluation.resultTextTruncated, true);
+  assert.ok(evaluation.issues.includes("result_text_truncated"));
+  assert.equal(evaluation.complete, false);
+});
 
 function makeEnvelope(overrides: Partial<ResultEnvelope> = {}): ResultEnvelope {
   return {
@@ -323,6 +457,57 @@ test("token economy: provider SUCCESS with a failing test never presents as all 
   assert.equal(compact.decisionReady, true, "The evidence is present, so a decision can still be made");
   assert.ok(compact.mandatoryEvidence.some((item) => item.kind === "test_failed"), "Mandatory evidence must be present");
   assert.ok(serializedBytes(compact) <= BUDGET);
+});
+
+test("token economy: work-order evaluations stay complete or point to the full byte-paginated result", () => {
+  const criteria = Array.from({ length: 12 }, (_, index) => ({
+    id: `AC-${String(index + 1).padStart(2, "0")}`,
+    description: `Criterion ${index + 1}`,
+  }));
+  const evaluation: WorkOrderEvaluationV1 = {
+    schemaVersion: 1,
+    contractVersion: 1,
+    resultHash: "hash",
+    source: "worker_report",
+    complete: true,
+    criteria: criteria.map((criterion, index) => ({
+      id: criterion.id,
+      outcome: "satisfied",
+      evidenceRefs: [`ev_${index}_` + "x".repeat(56)],
+      evidenceRefsResolved: true,
+    })),
+    issues: [],
+  };
+  const envelope = makeEnvelope({
+    workOrder: {
+      schemaVersion: 1,
+      contractVersion: 1,
+      objective: "Evaluate all criteria without silent truncation.",
+      scope: ["src/example.ts"],
+      ownership: ["src/example.ts"],
+      contextRefs: [],
+      designDecisions: [],
+      invariants: [],
+      acceptanceCriteria: criteria,
+      validationCommands: [],
+      escalationConditions: [],
+    },
+    workOrderEvaluation: evaluation,
+  });
+  const standard = createCompactWorkerResult(envelope, { maxBytes: BUDGET });
+  assert.deepEqual(standard.workOrderEvaluation?.criteria, evaluation.criteria);
+  assert.equal(standard.workOrderEvaluation?.resultHash, standard.receipt?.outputHash);
+
+  const constrained = createCompactWorkerResult(envelope, { maxBytes: 1_024 });
+  assert.ok(serializedBytes(constrained) <= 1_024);
+  if (constrained.workOrderEvaluation) {
+    assert.deepEqual(constrained.workOrderEvaluation.criteria, evaluation.criteria);
+  } else {
+    assert.equal(constrained.decisionReady, false);
+    assert.equal(constrained.decisionReason, "work_order_transport_overflow");
+    assert.equal(constrained.detailsRef.exactSection, "work_order");
+    assert.ok(constrained.detailsRef.availableSections.includes("work_order"));
+  }
 });
 
 test("token economy: detailsRef detects a truncated summary and reports counts", () => {

@@ -17,6 +17,7 @@ import type {
   AntigravityRecoveryClaim,
   AntigravityStreamProgress,
 } from "./types.js";
+import type { WorkOrderContractV1 } from "../types.js";
 
 export const ANTIGRAVITY_HEARTBEAT_TTL_MS = 10_000;
 export const ANTIGRAVITY_DEFAULT_MAX_OUTPUT_BYTES = 1_048_576;
@@ -38,6 +39,8 @@ export interface CreateAttemptInput {
   addDirs?: string[] | undefined;
   dangerouslySkipPermissions?: boolean | undefined;
   conversationId?: string | null | undefined;
+  workOrder?: WorkOrderContractV1 | undefined;
+  confirmedPreviousContractVersion?: number | undefined;
   outputFormat?: "text" | "json" | "stream-json" | null | undefined;
   parentAttemptId?: string | null | undefined;
   maxOutputBytes?: number | undefined;
@@ -119,6 +122,8 @@ export class AntigravitySpool {
       addDirs,
       dangerouslySkipPermissions,
       conversationId: input.conversationId ?? null,
+      ...(input.workOrder ? { workOrder: input.workOrder } : {}),
+      ...(input.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: input.confirmedPreviousContractVersion }),
       outputFormat: input.outputFormat ?? "json",
       attemptDir: dir,
       stdoutPath,

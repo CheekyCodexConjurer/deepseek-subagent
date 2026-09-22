@@ -6,6 +6,7 @@ import { BridgeError, InvalidRequestError } from "./errors.js";
 import { BridgeBusyError, FollowCancelledError, BridgeService } from "./service.js";
 import type { AcceptedBatchOperation, AgentMode, BatchItemInput, ConsultInput, ContinueInput, FollowInput, ParkInput, ParkPredicateType, ParkReceipt, SpawnBatchInput, SpawnInput, WorkspaceStrategy } from "./types.js";
 import type { BridgeConfig } from "./types.js";
+import { parseWorkOrderContract } from "./work-order.js";
 
 // The follow endpoint holds the HTTP response open until the worker finishes.
 // A valid follow window can be 60 minutes of work plus 10 minutes of graceful
@@ -207,7 +208,7 @@ export class BridgeHttpServer {
     }
     if (method === "POST" && url.pathname === "/v1/jobs/recover") {
       const value = asRecord(body);
-      const section = value.section !== undefined ? enumValue(value.section, ["summary", "files", "tests", "risks", "diff", "evidence", "full"], "section") : undefined;
+      const section = value.section !== undefined ? enumValue(value.section, ["summary", "files", "tests", "risks", "unresolved", "diff", "evidence", "work_order", "full", "raw"], "section") : undefined;
       const offset = value.offset !== undefined ? integerInRange(value.offset, 0, 1_000_000, "offset") : undefined;
       const limit = value.limit !== undefined ? integerInRange(value.limit, 1, 1_000, "limit") : undefined;
       const result = await this.service.recoverResult({
@@ -485,6 +486,7 @@ function toSpawnInput(body: unknown): SpawnInput {
   const trustedThreadId = optionalString(value.trustedThreadId ?? value.trusted_thread_id);
   const priority = typeof value.priority === "number" ? value.priority : undefined;
   const exclusiveResources = optionalArray(value.exclusiveResources ?? value.exclusive_resources);
+  const workOrder = value.workOrder ?? value.work_order;
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     topic: requiredString(value.topic, "topic"),
@@ -501,6 +503,7 @@ function toSpawnInput(body: unknown): SpawnInput {
     ...(trustedThreadId ? { trustedThreadId } : {}),
     ...(priority !== undefined ? { priority } : {}),
     ...(exclusiveResources ? { exclusiveResources } : {}),
+    ...(workOrder !== undefined ? { workOrder: parseWorkOrderContract(workOrder) } : {}),
   };
 }
 
@@ -528,6 +531,7 @@ function toSpawnBatchInput(body: unknown): SpawnBatchInput {
     const topic = optionalString(item.topic);
     const visualContext = optionalString(item.visualContext ?? item.visual_context);
     const modelRoute = optionalString(item.modelRoute ?? item.model_route);
+    const workOrder = item.workOrder ?? item.work_order;
     return {
       task: requiredString(item.task, "task"),
       ...(requestId ? { requestId } : {}),
@@ -544,6 +548,7 @@ function toSpawnBatchInput(body: unknown): SpawnBatchInput {
       ...(turnId ? { turnId } : {}),
       ...(visualContext ? { visualContext } : {}),
       ...(modelRoute ? { modelRoute } : {}),
+      ...(workOrder !== undefined ? { workOrder: parseWorkOrderContract(workOrder) } : {}),
     };
   });
   return {
@@ -566,6 +571,8 @@ function toContinueInput(body: unknown): ContinueInput {
   const allowRespawnValue = value.allowRespawn ?? value.allow_respawn;
   const mcpSessionId = optionalString(value.mcpSessionId ?? value.mcp_session_id);
   const trustedThreadId = optionalString(value.trustedThreadId ?? value.trusted_thread_id);
+  const workOrder = value.workOrder ?? value.work_order;
+  const confirmedContractVersionValue = value.confirmedContractVersion ?? value.confirmed_contract_version;
   return {
     requestId: optionalString(value.requestId ?? value.request_id) ?? newId("request"),
     agentId: requiredString(value.agentId ?? value.agent_id, "agentId"),
@@ -580,6 +587,8 @@ function toContinueInput(body: unknown): ContinueInput {
     ...(allowRespawnValue === undefined ? {} : { allowRespawn: booleanValue(allowRespawnValue, "allowRespawn") }),
     ...(mcpSessionId ? { mcpSessionId } : {}),
     ...(trustedThreadId ? { trustedThreadId } : {}),
+    ...(workOrder !== undefined ? { workOrder: parseWorkOrderContract(workOrder) } : {}),
+    ...(confirmedContractVersionValue === undefined ? {} : { confirmedContractVersion: integerInRange(confirmedContractVersionValue, 1, 1_000_000, "confirmedContractVersion") }),
   };
 }
 

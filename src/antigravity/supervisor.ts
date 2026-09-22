@@ -457,6 +457,7 @@ export class AntigravitySupervisor {
       ...(effectiveParsed?.providerExecutionStatus ? { providerExecutionStatus: effectiveParsed.providerExecutionStatus } : {}),
       ...(effectiveParsed?.workerClaimedStatus ? { workerClaimedStatus: effectiveParsed.workerClaimedStatus } : {}),
       ...(effectiveParsed?.validationEvidence ? { validationEvidence: effectiveParsed.validationEvidence } : {}),
+      ...(effectiveParsed?.evidence ? { evidence: effectiveParsed.evidence } : {}),
       error: error ? redactSecrets(error) : null,
       completedAt: new Date().toISOString(),
       stdout,

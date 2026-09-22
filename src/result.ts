@@ -21,7 +21,10 @@ import type {
   WorkerClaims,
   WorkerUsageScope,
   WorkerUsageSource,
+  WorkOrderContractV1,
+  WorkOrderEvaluationV1,
 } from "./types.js";
+import { evaluateWorkOrder, parseWorkOrderContract } from "./work-order.js";
 
 const PROTOCOL_HEADINGS = [
   "STATUS",
@@ -36,6 +39,7 @@ const PROTOCOL_HEADINGS = [
   "ESCALATION_PROPOSAL",
   "ESCALATION",
   "EVIDENCE",
+  "WORK_ORDER_OUTCOMES_JSON",
 ];
 
 // A heading value runs until the next known protocol heading or the end of the
@@ -182,6 +186,7 @@ export async function persistAntigravityResult(
   job: JobRecord,
   result: AntigravityRunResult,
   maxLength: number,
+  options: { workOrder?: WorkOrderContractV1; confirmedPreviousContractVersion?: number } = {},
 ): Promise<{ envelope: ResultEnvelope; resultPath: string }> {
   const resultPath = path.join(dataDir, "results", job.id + ".json");
   const outputHash = computeOutputHash(result.summary, result.diffSummary);
@@ -197,6 +202,15 @@ export async function persistAntigravityResult(
     testsCount: result.tests.length,
     outputHash,
   });
+  const workOrder = options.workOrder ? parseWorkOrderContract(options.workOrder) : undefined;
+  const unboundedRawAssistantText = redactSecrets(extractAntigravityText(result));
+  const rawAssistantText = truncate(unboundedRawAssistantText, maxLength);
+  const persistedDiffSummary = truncate(redactSecrets(result.diffSummary), 10_000);
+  const resultTextTruncated = rawAssistantText.length < unboundedRawAssistantText.length ||
+    (typeof result.fullText === "string" && result.fullText.length >= 2_000_000);
+  // The Antigravity adapter currently supplies only diffSummary, never a literal Git patch.
+  // At the parser's 10,000-character cap, the summary may already have been truncated upstream.
+  const diffSummaryTruncated = result.diffSummary.length >= 10_000;
   const envelope: ResultEnvelope = {
     version: 1,
     agentId: redactSecrets(agent.id),
@@ -212,10 +226,11 @@ export async function persistAntigravityResult(
     tests: result.tests.slice(0, 100).map((value) => redactSecrets(value)),
     risks: result.risks.slice(0, 100).map((value) => redactSecrets(value)),
     unresolved: (result.unresolved ?? []).slice(0, 100).map((value) => redactSecrets(value)),
-    diffSummary: truncate(redactSecrets(result.diffSummary), 10_000),
+    diffSummary: persistedDiffSummary,
     fullResultPath: redactSecrets(resultPath),
     orchestratorInstruction: redactSecrets("Continue this agent only with subagents_continue after reviewing this result."),
     receipt,
+    ...(workOrder ? { workOrder } : {}),
     ...(result.providerExecutionStatus ? { providerExecutionStatus: result.providerExecutionStatus } : {}),
     ...(result.workerClaimedStatus ? { workerClaimedStatus: result.workerClaimedStatus } : {}),
     ...(result.validationEvidence ? (() => {
@@ -239,27 +254,46 @@ export async function persistAntigravityResult(
       return safe ? { escalation: safe } : {};
     })() : {}),
   };
-  const rawAssistantText = truncate(redactSecrets(extractAntigravityText(result)), maxLength);
+  const persistedArtifact: Record<string, unknown> = {
+    envelope,
+    rawAssistantText,
+    messages: [],
+    // Full local audit record: the compact transport projection is never a
+    // substitute for this file. Provider identity, usage semantics and the
+    // worker's own claim all stay persisted here.
+    diff: {
+      source: "antigravity",
+      runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200),
+      providerConversationId: result.conversationId ? truncate(redactSecrets(result.conversationId), 200) : null,
+      providerExecutionStatus: result.providerExecutionStatus ?? "unknown",
+      workerClaimedStatus: result.workerClaimedStatus ?? "unknown",
+      usage: result.usage ?? null,
+    },
+    savedAt: new Date().toISOString(),
+  };
+  if (workOrder) {
+    const diffAvailability = persistedDiffSummary.trim().length === 0 || persistedDiffSummary.trim() === "none"
+      ? "unavailable"
+      : "summary_only";
+    envelope.workOrderEvaluation = {
+      ...evaluateWorkOrder({
+        text: rawAssistantText,
+        workOrder,
+        resultHash: "",
+        ...(envelope.evidence ? { evidence: envelope.evidence } : {}),
+        ...(options.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: options.confirmedPreviousContractVersion }),
+        diffAvailability,
+        resultTextTruncated,
+        diffSummaryTruncated,
+      }),
+      resultHashVersion: 1,
+    };
+    envelope.workOrderEvaluation.resultHash = computeWorkOrderArtifactHash(persistedArtifact);
+  }
   await mkdir(path.dirname(resultPath), { recursive: true });
   await writePrivateFile(
     resultPath,
-    JSON.stringify({
-      envelope,
-      rawAssistantText,
-      messages: [],
-      // Full local audit record: the compact transport projection is never a
-      // substitute for this file. Provider identity, usage semantics and the
-      // worker's own claim all stay persisted here.
-      diff: {
-        source: "antigravity",
-        runId: result.runId === null ? null : truncate(redactSecrets(result.runId), 200),
-        providerConversationId: result.conversationId ? truncate(redactSecrets(result.conversationId), 200) : null,
-        providerExecutionStatus: result.providerExecutionStatus ?? "unknown",
-        workerClaimedStatus: result.workerClaimedStatus ?? "unknown",
-        usage: result.usage ?? null,
-      },
-      savedAt: new Date().toISOString(),
-    }, null, 2) + "\n",
+    JSON.stringify(persistedArtifact, null, 2) + "\n",
   );
   return { envelope, resultPath };
 }
@@ -344,7 +378,16 @@ function isAntigravityPersistedResult(value: Record<string, unknown>): boolean {
 export function sanitizePersistedResult(value: unknown, maxLength = 100_000): unknown {
   if (!isRecord(value)) return {};
   const output: Record<string, unknown> = {};
-  const envelope = projectSafeEnvelope(value.envelope);
+  const rawEnvelope = isRecord(value.envelope) ? value.envelope : undefined;
+  const hasVerifiableWorkOrderArtifact = Boolean(
+    rawEnvelope?.workOrder !== undefined &&
+    typeof value.rawAssistantText === "string" &&
+    isRecord(value.diff) && value.diff.source === "antigravity" &&
+    typeof value.savedAt === "string",
+  );
+  const expectedWorkOrderHash = hasVerifiableWorkOrderArtifact ? computeWorkOrderArtifactHash(value) : undefined;
+  const expectedDiffAvailability = hasVerifiableWorkOrderArtifact ? persistedDiffAvailability(rawEnvelope!, value.diff as Record<string, unknown>) : undefined;
+  const envelope = projectSafeEnvelope(value.envelope, expectedWorkOrderHash, expectedDiffAvailability);
   if (envelope) output.envelope = envelope;
   const messages = Array.isArray(value.messages) ? value.messages : null;
   if (messages) output.messages = projectSafeMessages(messages);
@@ -379,7 +422,11 @@ export function sanitizePersistedEnvelope(value: unknown): ResultEnvelope | null
   return envelope as unknown as ResultEnvelope;
 }
 
-function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
+function projectSafeEnvelope(
+  value: unknown,
+  expectedWorkOrderHash?: string,
+  expectedDiffAvailability?: WorkOrderEvaluationV1["diffAvailability"],
+): Record<string, unknown> | null {
   if (!isRecord(value)) return null;
   const output: Record<string, unknown> = {};
   for (const key of [
@@ -432,6 +479,117 @@ function projectSafeEnvelope(value: unknown): Record<string, unknown> | null {
     const esc = projectSafeEscalation(value.escalation);
     if (esc) output.escalation = esc;
   }
+  if (value.workOrder !== undefined) {
+    const workOrder = projectSafeWorkOrder(value.workOrder);
+    const receipt = output.receipt as ExecutionReceipt | undefined;
+    const evidence = output.evidence as EvidenceBundle | undefined;
+    if (!workOrder || !receipt || value.workOrderEvaluation === undefined || !expectedWorkOrderHash) return null;
+    const evaluation = projectSafeWorkOrderEvaluation(
+      value.workOrderEvaluation,
+      workOrder,
+      expectedWorkOrderHash,
+      expectedDiffAvailability,
+      evidence,
+    );
+    if (!evaluation) return null;
+    output.workOrder = workOrder;
+    output.workOrderEvaluation = evaluation;
+  } else if (value.workOrderEvaluation !== undefined) {
+    return null;
+  }
+  return output;
+}
+
+function projectSafeWorkOrder(value: unknown): WorkOrderContractV1 | null {
+  try {
+    const parsed = parseWorkOrderContract(value);
+    const clean = (text: string): string => redactSecrets(text);
+    return {
+      schemaVersion: 1,
+      contractVersion: parsed.contractVersion,
+      objective: clean(parsed.objective),
+      scope: parsed.scope.map(clean),
+      ownership: parsed.ownership.map(clean),
+      contextRefs: parsed.contextRefs.map(clean),
+      designDecisions: parsed.designDecisions.map(clean),
+      invariants: parsed.invariants.map(clean),
+      acceptanceCriteria: parsed.acceptanceCriteria.map((criterion) => ({
+        id: clean(criterion.id),
+        description: clean(criterion.description),
+        ...(criterion.requiresGitDiff ? { requiresGitDiff: true } : {}),
+      })),
+      validationCommands: parsed.validationCommands.map(clean),
+      escalationConditions: parsed.escalationConditions.map(clean),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function projectSafeWorkOrderEvaluation(
+  value: unknown,
+  workOrder: WorkOrderContractV1,
+  expectedWorkOrderHash: string,
+  expectedDiffAvailability: WorkOrderEvaluationV1["diffAvailability"],
+  evidence?: EvidenceBundle,
+): WorkOrderEvaluationV1 | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || value.source !== "worker_report") return null;
+  if (value.contractVersion !== workOrder.contractVersion || value.resultHash !== expectedWorkOrderHash || value.resultHashVersion !== 1 || typeof value.complete !== "boolean") return null;
+  if (!(value.diffAvailability === "unavailable" || value.diffAvailability === "summary_only" || value.diffAvailability === "literal_git_diff")) return null;
+  if (value.diffAvailability !== expectedDiffAvailability) return null;
+  if (value.gitDiffAvailable !== (value.diffAvailability === "literal_git_diff")) return null;
+  if (typeof value.resultTextTruncated !== "boolean" || typeof value.diffSummaryTruncated !== "boolean") return null;
+  if (!Array.isArray(value.criteria) || value.criteria.length !== workOrder.acceptanceCriteria.length || !Array.isArray(value.issues) || value.issues.length > 12) return null;
+  if (value.issues.some((item) => typeof item !== "string")) return null;
+  if (value.confirmedPreviousContractVersion !== undefined && (!Number.isInteger(value.confirmedPreviousContractVersion) || Number(value.confirmedPreviousContractVersion) < 1)) return null;
+  const allowed = new Set(workOrder.acceptanceCriteria.map((criterion) => criterion.id));
+  const criteria: WorkOrderEvaluationV1["criteria"] = [];
+  const seen = new Set<string>();
+  const evidenceCounts = new Map<string, number>();
+  for (const item of evidence?.items ?? []) {
+    if (typeof item.id === "string") evidenceCounts.set(item.id, (evidenceCounts.get(item.id) ?? 0) + 1);
+  }
+  for (const raw of value.criteria) {
+    if (!isRecord(raw) || typeof raw.id !== "string" || !allowed.has(raw.id) || seen.has(raw.id)) return null;
+    if (!(["satisfied", "not_satisfied", "blocked", "not_run", "unknown"] as unknown[]).includes(raw.outcome)) return null;
+    if (!Array.isArray(raw.evidenceRefs) || raw.evidenceRefs.length > 4 || raw.evidenceRefs.some((ref) => typeof ref !== "string" || ref.length > 64)) return null;
+    if (typeof raw.evidenceRefsResolved !== "boolean") return null;
+    if (raw.note !== undefined && typeof raw.note !== "string") return null;
+    const definition = workOrder.acceptanceCriteria.find((criterion) => criterion.id === raw.id);
+    if (value.resultTextTruncated === true && raw.outcome !== "unknown") return null;
+    if (definition?.requiresGitDiff && value.diffAvailability !== "literal_git_diff" && raw.outcome !== "blocked" && raw.outcome !== "unknown") return null;
+    const evidenceRefs = raw.evidenceRefs.map((ref) => redactSecrets(ref as string));
+    const actualResolved = evidenceRefs.length > 0 && evidenceRefs.every((ref) => evidenceCounts.get(ref) === 1);
+    if (raw.evidenceRefsResolved === true && !actualResolved) return null;
+    seen.add(raw.id);
+    criteria.push({
+      id: redactSecrets(raw.id),
+      outcome: raw.outcome as WorkOrderEvaluationV1["criteria"][number]["outcome"],
+      evidenceRefs,
+      evidenceRefsResolved: raw.evidenceRefsResolved && actualResolved,
+      ...(typeof raw.note === "string" ? { note: truncate(redactSecrets(raw.note), 1_000) } : {}),
+    });
+  }
+  if (criteria.some((item, index) => item.id !== workOrder.acceptanceCriteria[index]?.id)) return null;
+  const issues = value.issues.map((item) => truncate(redactSecrets(item as string), 100));
+  if (value.complete !== (issues.length === 0)) return null;
+  const output: WorkOrderEvaluationV1 = {
+    schemaVersion: 1,
+    contractVersion: workOrder.contractVersion,
+    resultHash: expectedWorkOrderHash,
+    resultHashVersion: 1,
+    diffAvailability: value.diffAvailability,
+    gitDiffAvailable: value.gitDiffAvailable,
+    resultTextTruncated: value.resultTextTruncated,
+    diffSummaryTruncated: value.diffSummaryTruncated,
+    source: "worker_report",
+    complete: value.complete,
+    criteria,
+    issues,
+    ...(Number.isInteger(value.confirmedPreviousContractVersion) && typeof value.confirmedPreviousContractVersion === "number"
+      ? { confirmedPreviousContractVersion: value.confirmedPreviousContractVersion }
+      : {}),
+  };
   return output;
 }
 
@@ -447,6 +605,37 @@ export function computeOutputHash(summary: string, diffSummary: string): string 
   return createHash("sha256")
     .update((summary || "").trim() + "\n---\n" + (diffSummary || "").trim())
     .digest("hex");
+}
+
+/**
+ * Hashes the exact persisted result document, including full visible text,
+ * diff data available to the bridge, evidence, and status. Only the hash field
+ * itself is omitted to avoid a self-reference. This does not create a Git diff
+ * when the provider supplied only diffSummary.
+ */
+export function computeWorkOrderArtifactHash(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  const copy: unknown = serialized === undefined ? null : JSON.parse(serialized);
+  if (isRecord(copy) && isRecord(copy.envelope) && isRecord(copy.envelope.workOrderEvaluation)) {
+    delete copy.envelope.workOrderEvaluation.resultHash;
+  }
+  return createHash("sha256").update(canonicalJson(copy)).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  const record = value as Record<string, unknown>;
+  return "{" + Object.keys(record).sort().map((key) => JSON.stringify(key) + ":" + canonicalJson(record[key])).join(",") + "}";
+}
+
+function persistedDiffAvailability(
+  envelope: Record<string, unknown>,
+  diff: Record<string, unknown>,
+): NonNullable<WorkOrderEvaluationV1["diffAvailability"]> {
+  if (diff.source === "bridge_git" && typeof diff.gitDiff === "string" && diff.gitDiff.length > 0) return "literal_git_diff";
+  const summary = typeof envelope.diffSummary === "string" ? envelope.diffSummary.trim() : "";
+  return summary.length > 0 && summary.toLowerCase() !== "none" ? "summary_only" : "unavailable";
 }
 
 export function createExecutionReceipt(input: {
@@ -952,6 +1141,29 @@ export function createCompactWorkerResult(
     detail: truncate(redactSecrets(item.detail), 600),
   }));
   const status = options.statusOverride ?? envelope.status;
+  const orderEvaluation = envelope.workOrderEvaluation;
+  const orderBlocked = Boolean(orderEvaluation && (
+    !orderEvaluation.complete || orderEvaluation.criteria.some((criterion) =>
+      criterion.outcome !== "satisfied" || !criterion.evidenceRefsResolved
+    )
+  ));
+  const workOrderEvaluation = orderEvaluation ? {
+    schemaVersion: orderEvaluation.schemaVersion,
+    contractVersion: orderEvaluation.contractVersion,
+    resultHash: orderEvaluation.resultHash,
+    ...(orderEvaluation.resultHashVersion === undefined ? {} : { resultHashVersion: orderEvaluation.resultHashVersion }),
+    ...(orderEvaluation.diffAvailability === undefined ? {} : { diffAvailability: orderEvaluation.diffAvailability }),
+    ...(orderEvaluation.gitDiffAvailable === undefined ? {} : { gitDiffAvailable: orderEvaluation.gitDiffAvailable }),
+    ...(orderEvaluation.resultTextTruncated === undefined ? {} : { resultTextTruncated: orderEvaluation.resultTextTruncated }),
+    ...(orderEvaluation.diffSummaryTruncated === undefined ? {} : { diffSummaryTruncated: orderEvaluation.diffSummaryTruncated }),
+    source: orderEvaluation.source,
+    complete: orderEvaluation.complete,
+    criteria: orderEvaluation.criteria.map(({ note: _note, ...criterion }) => criterion),
+    issues: orderEvaluation.issues,
+    ...(orderEvaluation.confirmedPreviousContractVersion === undefined
+      ? {}
+      : { confirmedPreviousContractVersion: orderEvaluation.confirmedPreviousContractVersion }),
+  } : undefined;
   const fullSummary = envelope.summary || "";
   const allFiles = envelope.files ?? [];
   const allTests = envelope.tests ?? [];
@@ -970,6 +1182,17 @@ export function createCompactWorkerResult(
       mandatoryDetailCount: mandatoryEvidence.length,
       mandatorySections: [...new Set(mandatoryEvidence.map((item) => item.kind))],
     });
+    if (envelope.workOrder) {
+      detailsRef.hasMoreDetails = true;
+      if (orderBlocked) detailsRef.exactSection = "work_order";
+    }
+    const baseDecisionReady = options.decisionReady ?? (!hasBlockingEvidence(mandatoryEvidence));
+    const decisionReady = baseDecisionReady && !orderBlocked;
+    const decisionReason = !baseDecisionReady
+      ? (options.decisionReason ?? (hasBlockingEvidence(mandatoryEvidence) ? "blocking_evidence_requires_action" : null))
+      : orderBlocked
+        ? (orderEvaluation && !orderEvaluation.complete ? "work_order_incomplete" : "work_order_requires_action")
+        : (options.decisionReason ?? null);
     return {
       version: 1,
       status,
@@ -997,9 +1220,10 @@ export function createCompactWorkerResult(
         usageSource: envelope.usage.usageSource,
         ...(envelope.usage.counterResetDetected ? { counterResetDetected: true } : {}),
       } : null),
-      decisionReady: options.decisionReady ?? (!hasBlockingEvidence(mandatoryEvidence)),
-      decisionReason: options.decisionReason ?? (hasBlockingEvidence(mandatoryEvidence) ? "blocking_evidence_requires_action" : null),
+      decisionReady,
+      decisionReason,
       detailsRef,
+      ...(workOrderEvaluation ? { workOrderEvaluation } : {}),
     };
   };
 
@@ -1089,7 +1313,25 @@ export function createCompactWorkerResult(
     const candidate = minimal(buildRefs(limit), dropReceipt, dropTokens);
     if (serializedBytes(candidate) <= options.maxBytes) return candidate;
   }
-  return minimal([], true, true);
+  const finalMinimal = minimal([], true, true);
+  if (serializedBytes(finalMinimal) <= options.maxBytes || !workOrderEvaluation) return finalMinimal;
+  // If the configured budget cannot carry every criterion and evidence ref,
+  // omit the structured block explicitly and point to its byte-paginated
+  // persisted section. Never return a partial criterion list as if complete.
+  const workOrderOverflow: CompactWorkerResultV1 = { ...finalMinimal };
+  delete workOrderOverflow.workOrderEvaluation;
+  Object.assign(workOrderOverflow, {
+    decisionReady: false,
+    decisionReason: "work_order_transport_overflow",
+    detailsRef: {
+      ...finalMinimal.detailsRef,
+      hasMoreDetails: true,
+      availableSections: [...new Set([...finalMinimal.detailsRef.availableSections, "work_order"])],
+      exactSection: "work_order",
+      cursor: { offset: 0, limitBytes: options.maxBytes },
+    },
+  });
+  return serializedBytes(workOrderOverflow) <= options.maxBytes ? workOrderOverflow : finalMinimal;
 }
 
 export function createCompactClaims(envelope: ResultEnvelope): WorkerClaims {
@@ -1129,14 +1371,15 @@ export function createDetailsRef(envelope: ResultEnvelope, options: DetailsRefOp
   const unresolvedAvailable = unresolvedTotal > 0;
   const mandatoryDetailCount = options.mandatoryDetailCount ?? (envelope.validationEvidence?.mandatory?.length ?? 0);
   const mandatoryOverflow = mandatoryDetailCount > 0 && Boolean(options.mandatorySections && options.mandatorySections.length > 0);
+  const workOrderAvailable = Boolean(envelope.workOrder || envelope.workOrderEvaluation);
 
   const hasMore = summaryTruncated || filesTruncated || testsTruncated || risksTruncated ||
-    diffAvailable || evidenceAvailable || unresolvedAvailable;
+    diffAvailable || evidenceAvailable || unresolvedAvailable || workOrderAvailable;
 
   return {
     resultPath: envelope.fullResultPath,
     hasMoreDetails: Boolean(hasMore),
-    availableSections: ["summary", "files", "tests", "risks", "diff", "evidence", "unresolved", "full"],
+    availableSections: ["summary", "files", "tests", "risks", "diff", "evidence", "unresolved", ...(workOrderAvailable ? ["work_order"] : []), "full"],
     summaryTruncated,
     filesTotal,
     testsTotal,

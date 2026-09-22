@@ -39,6 +39,8 @@ export interface AntigravityRunOptions {
   jobId?: string | undefined;
   requestId?: string | undefined;
   conversationId?: string | null | undefined;
+  workOrder?: AntigravityAttemptManifest["workOrder"];
+  confirmedPreviousContractVersion?: number | undefined;
   outputFormat?: "text" | "json" | "stream-json" | null | undefined;
   onHeartbeat?: ((heartbeat: AntigravityHeartbeat) => void | Promise<void>) | undefined;
   onProgress?: ((progress: AntigravityStreamProgress) => void | Promise<void>) | undefined;
@@ -186,6 +188,7 @@ export class AntigravityAdapter implements AntigravityProviderLike {
       ...(status.providerExecutionStatus ? { providerExecutionStatus: status.providerExecutionStatus } : {}),
       ...(status.workerClaimedStatus ? { workerClaimedStatus: status.workerClaimedStatus } : {}),
       ...(status.validationEvidence ? { validationEvidence: status.validationEvidence } : {}),
+      ...(status.evidence ? { evidence: status.evidence } : {}),
       model: manifest.modelId,
       modelDisplayName: "Antigravity · " + manifest.modelId,
       workspace: manifest.cwd,
@@ -226,6 +229,8 @@ export class AntigravityAdapter implements AntigravityProviderLike {
         addDirs: this.addDirs,
         dangerouslySkipPermissions: this.dangerouslySkipPermissions,
         conversationId: options.conversationId,
+        ...(options.workOrder ? { workOrder: options.workOrder } : {}),
+        ...(options.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: options.confirmedPreviousContractVersion }),
         outputFormat: options.outputFormat ?? "json",
       });
       return await this.runAttempt(manifest, options.signal, options.onHeartbeat, options.onProgress);

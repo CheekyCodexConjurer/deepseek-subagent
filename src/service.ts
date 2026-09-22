@@ -63,9 +63,18 @@ import type {
   WakeEnvelope,
   WakeOutboxRecord,
   WorkspaceStrategy,
+  WorkOrderContractV1,
 } from "./types.js";
+import { parseWorkOrderContract, sameWorkOrder, workOrderToWire } from "./work-order.js";
 
 export const RETENTION_INTERVAL_MS = 60 * 60_000;
+
+interface WorkOrderContinuationContext {
+  workOrder?: WorkOrderContractV1;
+  previousWorkOrder?: WorkOrderContractV1;
+  confirmedContractVersion?: number;
+  useDeltaPrompt: boolean;
+}
 
 function workerPromptOptions(
   config: BridgeConfig,
@@ -82,6 +91,11 @@ function workerPromptOptions(
     ...(allowedExternalFiles ? { allowedExternalFiles } : {}),
     ...(isContinuation ? { isContinuation: true } : {}),
   };
+}
+
+function confirmedWorkOrderVersionFor(input?: WorkerPromptInput): number | undefined {
+  if (!input || !("confirmedWorkOrderVersion" in input)) return undefined;
+  return input.confirmedWorkOrderVersion;
 }
 
 export interface ServiceDependencies {
@@ -729,6 +743,7 @@ export class BridgeService {
     this.requireRunning();
     if (!input.task.trim()) throw new InvalidRequestError("Task must not be empty");
     if (input.task.length > this.config.maxTaskLength) throw new InvalidRequestError("Task exceeds configured length limit");
+    const workOrder = input.workOrder ? parseWorkOrderContract(input.workOrder) : undefined;
     const requestId = input.requestId ?? newId("request");
     const op = await this.withRequestIdLock(requestId, async () => {
       const existing = input.requestId ? this.store.getJobByRequestId(input.requestId) : null;
@@ -766,6 +781,7 @@ export class BridgeService {
         workspaceStrategy: strategy,
         contextFiles,
         ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+        ...(workOrder ? { workOrder } : {}),
       };
       const prompt = strategy === "worktree"
         ? ""
@@ -878,6 +894,7 @@ export class BridgeService {
           throw new InvalidRequestError("Batch item exclusiveResources must be an array of non-empty strings");
         }
       }
+      if (item.workOrder !== undefined) parseWorkOrderContract(item.workOrder);
       if (item.requestId) {
         if (seenRequestIds.has(item.requestId)) {
           throw new InvalidRequestError("Duplicate requestId within batch: " + item.requestId);
@@ -978,6 +995,7 @@ export class BridgeService {
           : validatedContextFiles;
         const promptOptions = workerPromptOptions(this.config, true, allowedExternalFiles);
         const visualContext = item.visualContext ?? (typeof raw.visual_context === "string" ? raw.visual_context : undefined);
+        const workOrder = item.workOrder === undefined ? undefined : parseWorkOrderContract(item.workOrder);
         const promptWorkerInput: WorkerPromptInput = {
           topic,
           task: item.task,
@@ -985,6 +1003,7 @@ export class BridgeService {
           workspaceStrategy: strategy,
           contextFiles,
           ...(visualContext ? { visualContext } : {}),
+          ...(workOrder ? { workOrder } : {}),
         };
         const prompt = strategy === "worktree"
           ? ""
@@ -1367,7 +1386,7 @@ export class BridgeService {
         }
       }
       prompt = envelope.prompt;
-      workerInput = envelope.workerInput as WorkerPromptInput;
+      workerInput = envelope.workerInput as unknown as WorkerPromptInput;
       contextFiles = envelope.contextFiles;
     } else if (pending) {
       prompt = pending.prompt;
@@ -1502,6 +1521,68 @@ export class BridgeService {
     }
   }
 
+  private async resolveContinuationWorkOrder(agent: AgentRecord, input: ContinueInput): Promise<WorkOrderContinuationContext> {
+    const latest = this.store.getLatestJobForAgent(agent.id);
+    let previous: WorkOrderContractV1 | undefined;
+    if (latest?.resultPath) {
+      let persisted: unknown;
+      try {
+        persisted = JSON.parse(await readFile(latest.resultPath, "utf8"));
+      } catch (error) {
+        throw new ConflictError("The prior persisted result cannot confirm its work-order version: " + String(error));
+      }
+      const envelope = persisted && typeof persisted === "object"
+        ? (persisted as { envelope?: Record<string, unknown> }).envelope
+        : undefined;
+      if (envelope?.workOrder !== undefined) {
+        try {
+          previous = parseWorkOrderContract(envelope.workOrder);
+        } catch {
+          throw new ConflictError("The prior result contains an invalid work-order contract; continuation is blocked.");
+        }
+      }
+    }
+
+    const next = input.workOrder === undefined ? undefined : parseWorkOrderContract(input.workOrder);
+    const confirmed = input.confirmedContractVersion;
+    if (confirmed !== undefined && !previous) {
+      throw new ConflictError("confirmed_contract_version was supplied but the prior result has no work order to confirm.");
+    }
+    if (previous && confirmed !== undefined && confirmed !== previous.contractVersion) {
+      throw new ConflictError(
+        `confirmed_contract_version ${confirmed} does not match the prior result version ${previous.contractVersion}.`,
+      );
+    }
+    if (!previous && next && next.contractVersion !== 1) {
+      throw new ConflictError("A work order without a prior contract must start at contract_version 1.");
+    }
+    if (previous && next) {
+      if (confirmed !== previous.contractVersion) {
+        throw new ConflictError("A replacement work order must confirm the exact prior contract_version.");
+      }
+      const unchanged = sameWorkOrder(previous, next);
+      if (next.contractVersion === previous.contractVersion && !unchanged) {
+        throw new ConflictError("Changed work-order content must increment contract_version.");
+      }
+      if (next.contractVersion !== previous.contractVersion && next.contractVersion !== previous.contractVersion + 1) {
+        throw new ConflictError("A replacement work order must retain its version or increment it by exactly one.");
+      }
+    }
+
+    const workOrder = next ?? previous;
+    const useDeltaPrompt = Boolean(agent.providerConversationId) && (
+      !previous && !next
+        ? true
+        : Boolean(previous && confirmed === previous.contractVersion)
+    );
+    return {
+      ...(workOrder ? { workOrder } : {}),
+      ...(previous ? { previousWorkOrder: previous } : {}),
+      ...(confirmed === undefined ? {} : { confirmedContractVersion: confirmed }),
+      useDeltaPrompt,
+    };
+  }
+
   async continueJob(input: ContinueInput): Promise<AcceptedOperation> {
     this.requireRunning();
     if (!input.task.trim()) throw new InvalidRequestError("Task must not be empty");
@@ -1518,13 +1599,26 @@ export class BridgeService {
       if (active && active.status !== "needs_approval") throw new BridgeBusyError(active.id);
       if (agent.status === "closed" || agent.status === "aborted") {
         if (!input.allowRespawn) throw new ConflictError("Agent is not continuable", "not_continuable");
-        return this.respawnClosedAgent(agent, input);
+        const continuation = await this.resolveContinuationWorkOrder(agent, input);
+        return this.respawnClosedAgent(agent, input, continuation);
       }
-      const isContinuation = Boolean(agent.providerConversationId);
+      const continuation = await this.resolveContinuationWorkOrder(agent, input);
+      const isContinuation = continuation.useDeltaPrompt;
+      const workerInput: WorkerPromptInput = {
+        task: input.task,
+        relation: input.relation,
+        ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+        ...(continuation.workOrder ? { workOrder: continuation.workOrder } : {}),
+        ...(continuation.previousWorkOrder ? { previousWorkOrder: continuation.previousWorkOrder } : {}),
+        ...(continuation.confirmedContractVersion === undefined ? {} : { confirmedWorkOrderVersion: continuation.confirmedContractVersion }),
+      };
       const prompt = await buildWorkerPrompt({
         task: input.task,
         relation: input.relation,
         ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+        ...(continuation.workOrder ? { workOrder: continuation.workOrder } : {}),
+        ...(continuation.previousWorkOrder ? { previousWorkOrder: continuation.previousWorkOrder } : {}),
+        ...(continuation.confirmedContractVersion === undefined ? {} : { confirmedWorkOrderVersion: continuation.confirmedContractVersion }),
       }, agent.workspacePath, workerPromptOptions(this.config, agent.modelProviderId === "antigravity", undefined, isContinuation));
       if (active?.status === "needs_approval") {
         const message = "Antigravity jobs do not expose resumable provider approval sessions";
@@ -1536,11 +1630,6 @@ export class BridgeService {
       const exclusiveResources = priorJob?.exclusiveResources ?? [];
       const jobId = newId("job");
       const promptHash = hashPrompt(prompt);
-      const workerInput: WorkerPromptInput = {
-        task: input.task,
-        relation: input.relation,
-        ...(input.visualContext ? { visualContext: input.visualContext } : {}),
-      };
       const { job } = this.store.admitContinuation({
         job: {
           id: jobId,
@@ -1606,7 +1695,11 @@ export class BridgeService {
    * job with a persisted result, is busy, or when permission fields are
    * supplied (a closed agent has no pending approval to answer).
    */
-  private async respawnClosedAgent(agent: AgentRecord, input: ContinueInput): Promise<AcceptedOperation> {
+  private async respawnClosedAgent(
+    agent: AgentRecord,
+    input: ContinueInput,
+    continuation: WorkOrderContinuationContext,
+  ): Promise<AcceptedOperation> {
     if (!isActiveAntigravityAgent(agent)) {
       throw new ConflictError(RETIRED_PROVIDER_MESSAGE, "not_continuable");
     }
@@ -1630,6 +1723,8 @@ export class BridgeService {
       task: input.task,
       relation: input.relation ?? "followup",
       ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+      ...(continuation.workOrder ? { workOrder: continuation.workOrder } : {}),
+      ...(continuation.confirmedContractVersion === undefined ? {} : { confirmedWorkOrderVersion: continuation.confirmedContractVersion }),
     }, workspacePath, workerPromptOptions(this.config, true));
 
     const opencodeServerId = "antigravity";
@@ -1653,6 +1748,8 @@ export class BridgeService {
       task: input.task,
       relation: input.relation ?? "followup",
       ...(input.visualContext ? { visualContext: input.visualContext } : {}),
+      ...(continuation.workOrder ? { workOrder: continuation.workOrder } : {}),
+      ...(continuation.confirmedContractVersion === undefined ? {} : { confirmedWorkOrderVersion: continuation.confirmedContractVersion }),
     };
 
     const jobId = newId("job");
@@ -3034,6 +3131,13 @@ export class BridgeService {
             claimsCount: evidence?.claimsCount,
           });
         }
+        case "work_order": {
+          const workOrderDetails = JSON.stringify({
+            workOrder: envelope?.workOrder ?? null,
+            evaluation: envelope?.workOrderEvaluation ?? null,
+          }, null, 2);
+          return chunkedSection("work_order", workOrderDetails);
+        }
         case "raw": {
           // The complete worker text is never returned by an apparently compact
           // query; this explicitly named mode is still byte-bounded.
@@ -3991,7 +4095,10 @@ export class BridgeService {
         this.recordActivity(agent, current, "abort", "Antigravity process ended after the follow timeout; the timed-out job stays terminal");
         return;
       }
-      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength, {
+        ...(manifest.workOrder ? { workOrder: manifest.workOrder } : {}),
+        ...(manifest.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: manifest.confirmedPreviousContractVersion }),
+      });
       try {
         this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
         if (result.conversationId) {
@@ -4135,6 +4242,7 @@ export class BridgeService {
     fence?: number,
   ): Promise<void> {
     const capturedFence = fence ?? job.fence ?? 1;
+    const confirmedVersion = confirmedWorkOrderVersionFor(workerInput);
     try {
       const adapterTimeout = (this.antigravity as any)?.timeoutMs;
       const effectiveTimeoutMs: number | null = timeoutMs ?? (
@@ -4177,7 +4285,11 @@ export class BridgeService {
         requestId: job.requestId,
         timeoutMs: effectiveTimeoutMs,
         fence: capturedFence,
-        conversationId: agent.providerConversationId ?? undefined,
+        conversationId: workerInput?.workOrder && confirmedVersion === undefined
+          ? undefined
+          : agent.providerConversationId ?? undefined,
+        ...(workerInput?.workOrder ? { workOrder: workerInput.workOrder } : {}),
+        ...(confirmedVersion === undefined ? {} : { confirmedPreviousContractVersion: confirmedVersion }),
         onHeartbeat,
         onProgress,
       });
@@ -4191,7 +4303,10 @@ export class BridgeService {
         this.recordActivity(agent, current, "abort", "Antigravity process ended after the follow timeout; the timed-out job stays terminal");
         return;
       }
-      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+      const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength, {
+        ...(workerInput?.workOrder ? { workOrder: workerInput.workOrder } : {}),
+        ...(confirmedVersion === undefined ? {} : { confirmedPreviousContractVersion: confirmedVersion }),
+      });
       try {
         this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, capturedFence);
         if (result.conversationId) {
@@ -4691,17 +4806,27 @@ export class BridgeService {
         const result: AntigravityRunResult = {
           status: terminalStatus.status,
           runId: terminalStatus.runId,
+          ...(terminalStatus.fullText === undefined ? {} : { fullText: terminalStatus.fullText }),
           summary: terminalStatus.summary,
           files: terminalStatus.files,
           tests: terminalStatus.tests,
           risks: terminalStatus.risks,
+          ...(terminalStatus.unresolved === undefined ? {} : { unresolved: terminalStatus.unresolved }),
+          ...(terminalStatus.deniedActions === undefined ? {} : { deniedActions: terminalStatus.deniedActions }),
           diffSummary: terminalStatus.diffSummary,
+          ...(terminalStatus.providerExecutionStatus === undefined ? {} : { providerExecutionStatus: terminalStatus.providerExecutionStatus }),
+          ...(terminalStatus.workerClaimedStatus === undefined ? {} : { workerClaimedStatus: terminalStatus.workerClaimedStatus }),
+          ...(terminalStatus.validationEvidence === undefined ? {} : { validationEvidence: terminalStatus.validationEvidence }),
+          ...(terminalStatus.evidence === undefined ? {} : { evidence: terminalStatus.evidence }),
           model: latestAttempt.modelId,
           modelDisplayName: "Antigravity · " + latestAttempt.modelId,
           workspace: latestAttempt.cwd,
           rawOutput: terminalStatus.stdout,
         };
-        const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+        const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength, {
+          ...(latestAttempt.workOrder ? { workOrder: latestAttempt.workOrder } : {}),
+          ...(latestAttempt.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: latestAttempt.confirmedPreviousContractVersion }),
+        });
         const attemptFence = latestAttempt.fence ?? job.fence ?? 1;
         try {
           this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, attemptFence);
@@ -4869,6 +4994,8 @@ export class BridgeService {
       sandbox: latestAttempt.sandbox,
       addDirs: latestAttempt.addDirs,
       dangerouslySkipPermissions: latestAttempt.dangerouslySkipPermissions,
+      ...(latestAttempt.workOrder ? { workOrder: latestAttempt.workOrder } : {}),
+      ...(latestAttempt.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: latestAttempt.confirmedPreviousContractVersion }),
       parentAttemptId: latestAttempt.attemptId,
       maxOutputBytes: latestAttempt.maxOutputBytes,
       fence: nextFence,
@@ -4933,17 +5060,27 @@ export class BridgeService {
             const result: AntigravityRunResult = {
               status: status.status,
               runId: status.runId,
+              ...(status.fullText === undefined ? {} : { fullText: status.fullText }),
               summary: status.summary,
               files: status.files,
               tests: status.tests,
               risks: status.risks,
+              ...(status.unresolved === undefined ? {} : { unresolved: status.unresolved }),
+              ...(status.deniedActions === undefined ? {} : { deniedActions: status.deniedActions }),
               diffSummary: status.diffSummary,
+              ...(status.providerExecutionStatus === undefined ? {} : { providerExecutionStatus: status.providerExecutionStatus }),
+              ...(status.workerClaimedStatus === undefined ? {} : { workerClaimedStatus: status.workerClaimedStatus }),
+              ...(status.validationEvidence === undefined ? {} : { validationEvidence: status.validationEvidence }),
+              ...(status.evidence === undefined ? {} : { evidence: status.evidence }),
               model: manifest.modelId,
               modelDisplayName: "Antigravity · " + manifest.modelId,
               workspace: manifest.cwd,
               rawOutput: status.stdout,
             };
-            const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength);
+            const stored = await persistAntigravityResult(this.config.dataDir, agent, job, result, this.config.maxResultLength, {
+              ...(manifest.workOrder ? { workOrder: manifest.workOrder } : {}),
+              ...(manifest.confirmedPreviousContractVersion === undefined ? {} : { confirmedPreviousContractVersion: manifest.confirmedPreviousContractVersion }),
+            });
             const attemptFence = manifest.fence ?? job.fence ?? 1;
             try {
               this.store.setJobResult(job.id, stored.resultPath, stored.envelope.summary, attemptFence);
@@ -5081,6 +5218,8 @@ export function computeBatchHash(items: BatchItemInput[]): string {
 
     const rawFiles = (it.contextFiles ?? (Array.isArray(raw.context_files) ? raw.context_files : [])) as string[];
     const contextFiles = Array.from(new Set(rawFiles.map((f) => String(f).trim()).filter((f) => f.length > 0))).sort();
+    const workOrderInput = it.workOrder ?? raw.work_order;
+    const workOrder = workOrderInput === undefined ? null : workOrderToWire(parseWorkOrderContract(workOrderInput));
 
     return {
       requestId,
@@ -5098,6 +5237,7 @@ export function computeBatchHash(items: BatchItemInput[]): string {
       priority,
       exclusiveResources,
       contextFiles,
+      workOrder,
     };
   });
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");

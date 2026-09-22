@@ -68,6 +68,55 @@ export type AgentStatus =
 export type DeliveryMethod = "codex-steer" | "codex-start" | "inbox";
 export type DeliveryStatus = "pending" | "delivered" | "failed";
 
+/** Versioned task contract carried unchanged through dispatch and result review. */
+export interface WorkOrderContractV1 {
+  schemaVersion: 1;
+  contractVersion: number;
+  objective: string;
+  scope: string[];
+  ownership: string[];
+  contextRefs: string[];
+  designDecisions: string[];
+  invariants: string[];
+  acceptanceCriteria: Array<{ id: string; description: string; requiresGitDiff?: boolean }>;
+  validationCommands: string[];
+  escalationConditions: string[];
+}
+
+export type WorkOrderOutcome = "satisfied" | "not_satisfied" | "blocked" | "not_run" | "unknown";
+
+export interface WorkOrderCriterionOutcome {
+  id: string;
+  outcome: WorkOrderOutcome;
+  evidenceRefs: string[];
+  evidenceRefsResolved: boolean;
+  note?: string;
+}
+
+/** Worker-reported outcomes tied to the exact persisted result artifact hash. */
+export interface WorkOrderEvaluationV1 {
+  schemaVersion: 1;
+  contractVersion: number;
+  resultHash: string;
+  /** Hashes the persisted artifact with only this resultHash field omitted. */
+  resultHashVersion?: 1;
+  /** Antigravity currently persists diff summaries, not a literal Git diff. */
+  diffAvailability?: "unavailable" | "summary_only" | "literal_git_diff";
+  gitDiffAvailable?: boolean;
+  resultTextTruncated?: boolean;
+  diffSummaryTruncated?: boolean;
+  source: "worker_report";
+  complete: boolean;
+  criteria: WorkOrderCriterionOutcome[];
+  issues: string[];
+  confirmedPreviousContractVersion?: number;
+}
+
+/** Compact form omits optional notes but retains every criterion and reference. */
+export interface CompactWorkOrderEvaluationV1 extends Omit<WorkOrderEvaluationV1, "criteria"> {
+  criteria: Array<Omit<WorkOrderCriterionOutcome, "note">>;
+}
+
 export interface SpawnInput {
   requestId: string;
   topic: string;
@@ -84,6 +133,7 @@ export interface SpawnInput {
   trustedThreadId?: string;
   priority?: number;
   exclusiveResources?: string[];
+  workOrder?: WorkOrderContractV1;
 }
 
 export interface ContinueInput {
@@ -97,6 +147,9 @@ export interface ContinueInput {
   permissionId?: string;
   permissionReply?: "once" | "always" | "reject";
   permissionMessage?: string;
+  workOrder?: WorkOrderContractV1;
+  /** Exact prior work-order version reviewed by the caller before continuing. */
+  confirmedContractVersion?: number;
   mcpSessionId?: string;
   trustedThreadId?: string;
   /**
@@ -129,7 +182,7 @@ export interface AbortInput {
   reason?: string;
 }
 
-export type RecoverResultSection = "summary" | "files" | "tests" | "risks" | "unresolved" | "diff" | "evidence" | "full" | "raw";
+export type RecoverResultSection = "summary" | "files" | "tests" | "risks" | "unresolved" | "diff" | "evidence" | "work_order" | "full" | "raw";
 
 export interface RecoverResultInput {
   requestId?: string | undefined;
@@ -252,6 +305,7 @@ export interface BatchItemInput {
   mcpSessionId?: string;
   trustedThreadId?: string;
   modelRoute?: string;
+  workOrder?: WorkOrderContractV1;
 }
 
 export interface SpawnBatchInput {
@@ -569,6 +623,7 @@ export interface CompactWorkerResultV1 {
   decisionReady: boolean;
   decisionReason: string | null;
   detailsRef: ResultDetailsRef;
+  workOrderEvaluation?: CompactWorkOrderEvaluationV1;
 }
 
 export interface ResultDetailsRef {
@@ -757,6 +812,8 @@ export interface ResultEnvelope {
     providerConversationId?: string | null;
     counterResetDetected?: boolean;
   };
+  workOrder?: WorkOrderContractV1;
+  workOrderEvaluation?: WorkOrderEvaluationV1;
 }
 
 export interface BridgeConfig {

@@ -1,4 +1,4 @@
-import type { EarlyExitSignal, EscalationProposal, EvidenceBundle, ValidationEvidence, WorkerClaimedStatus, WorkerUsageScope, WorkerUsageSource } from "../types.js";
+import type { EarlyExitSignal, EscalationProposal, EvidenceBundle, ValidationEvidence, WorkOrderContractV1, WorkerClaimedStatus, WorkerUsageScope, WorkerUsageSource } from "../types.js";
 
 export type AntigravityResultStatus = "completed" | "completed_partial" | "timed_out" | "failed" | "aborted";
 
@@ -78,6 +78,8 @@ export interface AntigravityAttemptManifest {
   addDirs: string[];
   dangerouslySkipPermissions: boolean;
   conversationId?: string | null;
+  workOrder?: WorkOrderContractV1;
+  confirmedPreviousContractVersion?: number;
   outputFormat?: "text" | "json" | "stream-json" | null;
   attemptDir: string;
   stdoutPath: string;
@@ -138,6 +140,7 @@ export interface AntigravityAttemptStatus {
   providerExecutionStatus?: ProviderExecutionStatus;
   workerClaimedStatus?: WorkerClaimedStatus;
   validationEvidence?: ValidationEvidence;
+  evidence?: EvidenceBundle;
   error: string | null;
   completedAt: string;
   stdout: string;

@@ -74,6 +74,34 @@ switch (behavior) {
     process.stdout.write(JSON.stringify({ summary: "no status declared", runId: "run_nostatus" }) + "\n");
     process.exit(0);
     break;
+  case "work-order":
+  case "work-order-blocked": {
+    const blocked = process.env.AGY_FIXTURE === "work-order-blocked";
+    const response = [
+      "STATUS: completed",
+      blocked ? "SUMMARY: Validation was blocked by a denied command." : "SUMMARY: Work order acceptance criterion verified.",
+      "FILES: src/example.ts",
+      blocked ? "TESTS: npm test -> not run" : "TESTS: npm test -> 12 passed, 0 failed",
+      "RISKS: none",
+      "UNRESOLVED: none",
+      "WORK_ORDER_OUTCOMES_JSON:",
+      JSON.stringify({
+        contract_version: 1,
+        criteria: [{ id: "AC-01", outcome: blocked ? "not_run" : "satisfied", evidence_refs: ["ev_work_order_test"] }],
+      }),
+    ].join("\n");
+    process.stdout.write(JSON.stringify({
+      ...envelope,
+      conversationId: "conversation_work_order_fixture",
+      response,
+      evidence: {
+        items: [{ id: "ev_work_order_test", type: "test", claim: "npm test: 12 passed, 0 failed", source: "npm test" }],
+      },
+      ...(blocked ? { denied_actions: [{ action: "command", display_name: "RunCommand" }] } : {}),
+    }) + "\n");
+    process.exit(0);
+    break;
+  }
   case "big":
     process.stdout.write("x".repeat(4096) + "\n");
     process.exit(0);
